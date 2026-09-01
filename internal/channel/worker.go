@@ -411,7 +411,7 @@ func (w *Worker) runGeneration(ctx context.Context, generation int) error {
 		return err
 	}
 
-	proc, err := ffmpeg.Start(w.cfg.FFmpeg.Binary, args, w.log)
+	proc, err := ffmpeg.Start(w.cfg.FFmpeg.Binary, args, w.log, w.cam.StderrRedactor())
 	if err != nil {
 		return err
 	}
@@ -936,7 +936,10 @@ func (w *Worker) Cleanup() {
 	if err := os.RemoveAll(w.spoolDir); err != nil {
 		w.log.Warn("spool cleanup failed", "error", err)
 	}
-	w.reg.DropSeries(metrics.Label{Name: "camera_id", Value: w.cam.CameraID})
+	w.reg.DropSeries(
+		metrics.Label{Name: "center_id", Value: w.cam.CenterID},
+		metrics.Label{Name: "camera_id", Value: w.cam.CameraID},
+	)
 }
 
 func parseLocalIndex(name string) (int, bool) {

@@ -64,6 +64,12 @@ func (c *Coordinator) Store() storage.ObjectStore { return c.store }
 // failure simply overwrites identical bytes. Generating a fresh key per
 // attempt would leave orphaned objects that no manifest references.
 func (c *Coordinator) Put(ctx context.Context, obj storage.Object) error {
+	// Check cancellation before the semaphore. A select with both cases ready
+	// picks at random, so without this a shutdown could still issue a request
+	// that is certain to fail.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case c.sem <- struct{}{}:
 	case <-ctx.Done():
@@ -106,6 +112,9 @@ func (c *Coordinator) Put(ctx context.Context, obj storage.Object) error {
 // Get reads an object, retrying transient failures. ErrNotFound is returned
 // immediately: a missing key is an answer, not a fault.
 func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	select {
 	case c.sem <- struct{}{}:
 	case <-ctx.Done():

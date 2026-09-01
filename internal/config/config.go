@@ -8,6 +8,8 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -238,6 +240,13 @@ func Load(path string) (Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return cfg, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	// Anything after the first JSON document is a mistake that would
+	// otherwise be ignored, for instance a second copy of the config
+	// appended to the file.
+	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+		return cfg, fmt.Errorf("parse config %s: unexpected trailing content after the "+
+			"JSON object", path)
+	}
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
@@ -270,16 +279,43 @@ func (c *Config) Validate() error {
 			"so a segment is not deleted before it is uploaded",
 			c.Segment.LocalListSize, c.Segment.LiveWindow)
 	}
+	if c.Segment.MaxGOPSlack.Duration < 0 {
+		return fmt.Errorf("segment.max_gop_slack must not be negative")
+	}
 	switch c.FFmpeg.RTSPTransport {
 	case "tcp", "udp":
 	default:
 		return fmt.Errorf("ffmpeg.rtsp_transport must be tcp or udp, got %q", c.FFmpeg.RTSPTransport)
 	}
-	if c.FFmpeg.StallTimeout.Duration <= c.Segment.TargetDuration.Duration {
-		return fmt.Errorf("ffmpeg.stall_timeout must exceed segment.target_duration")
+	if c.FFmpeg.Binary == "" {
+		return fmt.Errorf("ffmpeg.binary must not be empty")
+	}
+	// The watchdog threshold has to clear the same allowance the health check
+	// uses, or a camera whose long GOP is explicitly tolerated by
+	// max_gop_slack would still be killed and relaunched forever.
+	gopAllowance := c.Segment.TargetDuration.Duration + c.Segment.MaxGOPSlack.Duration
+	if c.FFmpeg.StallTimeout.Duration <= gopAllowance {
+		return fmt.Errorf("ffmpeg.stall_timeout (%s) must exceed segment.target_duration + "+
+			"segment.max_gop_slack (%s), otherwise a camera whose GOP is within the "+
+			"configured slack is still killed by the watchdog",
+			c.FFmpeg.StallTimeout.Duration, gopAllowance)
+	}
+	if c.FFmpeg.StartupTimeout.Duration <= gopAllowance {
+		return fmt.Errorf("ffmpeg.startup_timeout (%s) must exceed segment.target_duration + "+
+			"segment.max_gop_slack (%s), otherwise the first segment never arrives in time",
+			c.FFmpeg.StartupTimeout.Duration, gopAllowance)
+	}
+	if c.FFmpeg.ShutdownGrace.Duration <= 0 {
+		return fmt.Errorf("ffmpeg.shutdown_grace must be > 0, otherwise SIGTERM is followed " +
+			"immediately by SIGKILL and the last segment is truncated")
 	}
 	if c.FFmpeg.ScanInterval.Duration <= 0 {
 		return fmt.Errorf("ffmpeg.scan_interval must be > 0")
+	}
+	if c.FFmpeg.ScanInterval.Duration >= c.Segment.TargetDuration.Duration {
+		return fmt.Errorf("ffmpeg.scan_interval (%s) must be shorter than "+
+			"segment.target_duration (%s) or finished segments sit in the spool",
+			c.FFmpeg.ScanInterval.Duration, c.Segment.TargetDuration.Duration)
 	}
 	switch c.Storage.Backend {
 	case "s3":
@@ -296,17 +332,56 @@ func (c *Config) Validate() error {
 	if c.Storage.ManifestName == "" {
 		return fmt.Errorf("storage.manifest_name must not be empty")
 	}
+	// The manifest name is joined onto the channel's key prefix, so it has to
+	// be a single path element: a separator or ".." would move the playlist
+	// out of the channel's own namespace.
+	if strings.ContainsAny(c.Storage.ManifestName, `/\`) || c.Storage.ManifestName == ".." ||
+		c.Storage.ManifestName == "." {
+		return fmt.Errorf("storage.manifest_name %q must be a single path element",
+			c.Storage.ManifestName)
+	}
 	if c.Upload.MaxAttempts < 1 {
 		return fmt.Errorf("upload.max_attempts must be >= 1")
 	}
 	if c.Upload.MaxConcurrent < 1 {
 		return fmt.Errorf("upload.max_concurrent must be >= 1")
 	}
+	if c.Upload.PutTimeout.Duration <= 0 {
+		return fmt.Errorf("upload.put_timeout must be > 0, otherwise every request is " +
+			"cancelled before it is sent")
+	}
+	if c.Upload.RetryBase.Duration < 0 {
+		return fmt.Errorf("upload.retry_base must not be negative")
+	}
+	// A negative or inverted cap makes the full-jitter computation feed a
+	// non-positive bound to rand.Int63n, which panics.
+	if c.Upload.RetryMax.Duration < c.Upload.RetryBase.Duration {
+		return fmt.Errorf("upload.retry_max (%s) must be >= upload.retry_base (%s)",
+			c.Upload.RetryMax.Duration, c.Upload.RetryBase.Duration)
+	}
+	if c.Reconnect.Base.Duration <= 0 {
+		return fmt.Errorf("reconnect.base must be > 0, otherwise a failing camera is " +
+			"retried in a tight loop")
+	}
 	if c.Reconnect.Factor < 1 {
 		return fmt.Errorf("reconnect.factor must be >= 1")
 	}
 	if c.Reconnect.Max.Duration < c.Reconnect.Base.Duration {
 		return fmt.Errorf("reconnect.max must be >= reconnect.base")
+	}
+	if c.Reconnect.ResetAfter.Duration <= 0 {
+		return fmt.Errorf("reconnect.reset_after must be > 0, otherwise the backoff resets " +
+			"on a camera that connects and immediately stalls")
+	}
+	if c.Cameras.PollInterval.Duration <= 0 {
+		return fmt.Errorf("cameras.poll_interval must be > 0")
+	}
+	if c.Cameras.RequestTimeout.Duration <= 0 {
+		return fmt.Errorf("cameras.request_timeout must be > 0, otherwise every roster " +
+			"load is cancelled before it starts")
+	}
+	if err := validateListenAddr(c.HTTPListen); err != nil {
+		return err
 	}
 	switch c.Cameras.Provider {
 	case "static":
@@ -320,5 +395,26 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("cameras.provider must be static or http, got %q", c.Cameras.Provider)
 	}
+	return nil
+}
+
+// validateListenAddr rejects an address net.Listen would either refuse or,
+// worse, silently accept as a wildcard on a default port.
+func validateListenAddr(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("http_listen must not be empty; use \"127.0.0.1:8080\" to keep " +
+			"the unauthenticated monitoring API on the loopback interface")
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("http_listen %q must be host:port: %w", addr, err)
+	}
+	if port == "" {
+		return fmt.Errorf("http_listen %q has no port", addr)
+	}
+	if _, err := net.LookupPort("tcp", port); err != nil {
+		return fmt.Errorf("http_listen %q has an invalid port: %w", addr, err)
+	}
+	_ = host // an empty host is a legitimate wildcard bind
 	return nil
 }

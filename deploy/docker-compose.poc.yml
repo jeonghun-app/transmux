@@ -147,11 +147,21 @@ services:
       AWS_SECRET_ACCESS_KEY: minioadmin
       AWS_REGION: us-east-1
     command: ["-config", "/etc/transmux/config.json", "-log-level", "debug"]
+    # Hardening. The process needs no capabilities at all: it opens outbound
+    # TCP, reads a config file and writes to tmpfs. Everything it writes is an
+    # explicit tmpfs mount, so the root filesystem can stay read-only.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
     # The spool is a tmpfs so segments never touch a disk. Size it from
     # local_list_size x bitrate x channels; see docs/capacity-model.md.
     tmpfs:
       - /run/transmux/spool:size=256m,mode=0750,uid=10001,gid=10001
       - /var/lib/transmux/state:size=16m,mode=0750,uid=10001,gid=10001
+      - /tmp:size=16m,mode=1777
     ports:
       - "127.0.0.1:8080:8080"
     ulimits:

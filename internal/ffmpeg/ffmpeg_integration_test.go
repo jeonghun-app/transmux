@@ -243,7 +243,7 @@ func TestProcessStopKillsProcessGroup(t *testing.T) {
 		"-nostdin", "-hide_banner", "-loglevel", "error",
 		"-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25",
 		"-f", "null", "-",
-	}, log)
+	}, log, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
