@@ -23,6 +23,13 @@ services:
   # A correctly configured camera: 2 s GOP at 25 fps.
   cam-shortgop:
     image: transmux:test
+    # Built here rather than assumed present: `make test-ffmpeg` is the only
+    # other target that produces this tag, so without a build key a fresh
+    # clone cannot bring the stack up.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: test
     container_name: transmux-cam-shortgop
     depends_on:
       - mediamtx
@@ -63,6 +70,13 @@ services:
   # mistaken for a fault.
   cam-longgop:
     image: transmux:test
+    # Built here rather than assumed present: `make test-ffmpeg` is the only
+    # other target that produces this tag, so without a build key a fresh
+    # clone cannot bring the stack up.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: test
     container_name: transmux-cam-longgop
     depends_on:
       - mediamtx
@@ -110,6 +124,13 @@ services:
   # The encoder parameters match the profiles in docs/capacity-model.md.
   cam-1080p:
     image: transmux:test
+    # Built here rather than assumed present: `make test-ffmpeg` is the only
+    # other target that produces this tag, so without a build key a fresh
+    # clone cannot bring the stack up.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: test
     container_name: transmux-cam-1080p
     profiles: ["capacity"]
     depends_on:
@@ -149,6 +170,13 @@ services:
   # Typical surveillance D1.
   cam-d1:
     image: transmux:test
+    # Built here rather than assumed present: `make test-ffmpeg` is the only
+    # other target that produces this tag, so without a build key a fresh
+    # clone cannot bring the stack up.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: test
     container_name: transmux-cam-d1
     profiles: ["capacity"]
     depends_on:
@@ -187,6 +215,13 @@ services:
 
   cam-720p:
     image: transmux:test
+    # Built here rather than assumed present: `make test-ffmpeg` is the only
+    # other target that produces this tag, so without a build key a fresh
+    # clone cannot bring the stack up.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: test
     container_name: transmux-cam-720p
     profiles: ["capacity"]
     depends_on:
@@ -302,6 +337,13 @@ services:
   # Long-lived helper so `make poc-verify` can exec into it.
   verifier:
     image: transmux:test
+    # Built here rather than assumed present: `make test-ffmpeg` is the only
+    # other target that produces this tag, so without a build key a fresh
+    # clone cannot bring the stack up.
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: test
     container_name: transmux-verifier
     depends_on:
       transmuxd:

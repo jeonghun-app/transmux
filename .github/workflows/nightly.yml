@@ -1,0 +1,52 @@
+# The end-to-end stack is too slow and too timing-sensitive to gate every
+# push, but it is the only check that proves the whole pipeline works, so it
+# runs on a schedule and on demand.
+name: nightly
+
+on:
+  schedule:
+    # 18:00 UTC = 03:00 KST.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  poc:
+    name: end-to-end PoC stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - run: make poc-up
+      # The verifier waits for transmuxd's healthcheck, but segments only
+      # exist after a couple of GOPs have elapsed.
+      - name: let both channels reach steady state
+        run: sleep 60
+      - run: make poc-verify
+      - name: transmuxd logs
+        if: always()
+        run: docker compose -f deploy/docker-compose.poc.yml logs --no-color transmuxd
+      - name: tear down
+        if: always()
+        run: make poc-down
+
+  vuln:
+    name: dependency and module checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go mod verify
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+# Not here, deliberately: scripts/measure-capacity.sh and
+# scripts/measure-cpu.sh. They report absolute memory and CPU per channel and
+# extrapolate to a production host. A shared 2-4 vCPU hosted runner produces
+# numbers dominated by contention, and publishing a wrong capacity figure is
+# worse than publishing none. Run them on a dedicated host; see
+# docs/capacity-model.md for the environment the current figures came from.

@@ -91,8 +91,9 @@ libavcodec/libavformat 텍스트 페이지를 공유하기 때문이다. 용량 
 **4. FD는 채널당 약 7.5개.**
 
 50채널에서 373개. 625채널이면 약 4,700개다. 기본 `nofile=1024`로는 부족하니
-컨테이너에 65535를 설정해야 한다(`docker-compose.poc.yml`, ECS task
-definition의 `ulimits`에 반영되어 있다).
+컨테이너에 65535를 설정해야 한다(`deploy/docker-compose.poc.yml`의 `ulimits`
+참고. 프로덕션 오케스트레이터의 task/pod 정의에도 같은 값을 넣어야 하며, 이
+리포지토리에는 오케스트레이터 매니페스트가 포함되어 있지 않다).
 
 **5. 프로세스는 채널당 1개 + 고정 5개.**
 
