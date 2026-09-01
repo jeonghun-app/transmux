@@ -80,6 +80,14 @@ libavcodec/libavformat 텍스트 페이지를 공유하기 때문이다. 용량 
 필요가 없다. 다만 S3 장애 시에는 ffmpeg의 `delete_segments`가 반환할 때까지
 `local_list_size` 개까지 쌓일 수 있으므로 그 최댓값으로 사이징해야 한다.
 
+장애 시 실측: 1.5Mbps 채널 하나에서 오브젝트 스토어를 35초 끊었을 때 스풀이
+9파일 7.0MB까지 찼다(`local_list_size` 10, GOP 2초). 즉 최악값은 대략
+`local_list_size × 세그먼트 길이 × 비트레이트`이고, 4Mbps·625채널이면 약
+`10 × 4초 × 4Mbps ≈ 20MB/채널`로 tmpfs 12GB가 필요해진다 — 8GB 컨테이너에서는
+현실적으로 `local_list_size`를 줄이거나 채널 수를 낮춰야 한다. 운영 중에는
+`transmux_channel_spool_bytes`와 `transmux_channel_spool_oldest_seconds`를 합산해
+실제 헤드룸을 보면 된다.
+
 **4. FD는 채널당 약 7.5개.**
 
 50채널에서 373개. 625채널이면 약 4,700개다. 기본 `nofile=1024`로는 부족하니
@@ -96,6 +104,11 @@ definition의 `ulimits`에 반영되어 있다).
 0.5% 수준에서는 대부분 노이즈다. `scripts/measure-cpu.sh`는 컨테이너의 cgroup v2
 `cpu.stat` `usage_usec` 카운터 증분을 실제 경과 시간으로 나눈다. 이것은 소비된
 CPU 시간 그 자체다. 워밍업 45초, 측정 창 60초.
+
+`d1`·`hd720`·`hd` 프로파일은 `make poc-up-capacity`로 해당 소스를 띄워야 한다.
+`deploy/mediamtx.yml`에 경로만 선언돼 있어도 publisher가 없으면 RTSP는 오류 없이
+무음을 흘리므로, 스크립트가 측정 전에 스트림을 프로브해 거부한다. 1채널 재측정
+검증값: `--profile hd` 1채널에서 0.82% 코어로, 아래 표의 0.827%와 일치한다.
 
 ### 결과
 

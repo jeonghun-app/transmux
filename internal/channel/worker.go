@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path"
@@ -79,6 +80,12 @@ type Worker struct {
 	// manifestRetryAfter rate limits manifest-only retries so a store outage
 	// does not turn the scan interval into a log storm.
 	manifestRetryAfter time.Time
+	// lastManifestAt is when a manifest was last stored successfully. Guarded
+	// by mu because the scrape-time collector reads it.
+	lastManifestAt time.Time
+	// spoolStatsAt rate limits the spool directory scan behind the spool
+	// gauges, which would otherwise run on every tick for every channel.
+	spoolStatsAt time.Time
 
 	// prevGen carries the previous generation's drain bookkeeping so its
 	// spool can be flushed once more before it is discarded.
@@ -91,20 +98,34 @@ type Worker struct {
 	mLost         *metrics.Metric
 	mReconnects   *metrics.Metric
 	mUploadFail   *metrics.Metric
+	mSegmentFail  *metrics.Metric
+	mManifestFail *metrics.Metric
 	mLastSegTS    *metrics.Metric
 	mGapSeconds   *metrics.Metric
 	mGapAlarm     *metrics.Metric
 	mSegDuration  *metrics.Metric
 	mLastSeenTS   *metrics.Metric
 	mManifestTS   *metrics.Metric
+	mManifestLag  *metrics.Metric
+	mMissingPDT   *metrics.Metric
+	mFailed       *metrics.Metric
+	mDrainFail    *metrics.Metric
+	mSpoolFiles   *metrics.Metric
+	mSpoolBytes   *metrics.Metric
+	mSpoolOldest  *metrics.Metric
 }
 
 // ObjectClient is the subset of the upload coordinator the worker needs.
 //
-// Get is required for sequence recovery: on startup a worker with no usable
-// local checkpoint reads its own published manifest to learn where to resume.
+// Get is required for sequence recovery: on startup a worker reads its own
+// published manifest to learn where to resume.
+//
+// PutFile exists so the segment body is read only once a concurrency slot has
+// been granted. Reading in the worker and then queueing would make resident
+// segment bytes scale with channel count instead of with upload concurrency.
 type ObjectClient interface {
 	Put(ctx context.Context, obj storage.Object) error
+	PutFile(ctx context.Context, obj storage.Object, srcPath string) (int64, error)
 	Get(ctx context.Context, key string) ([]byte, error)
 }
 
@@ -137,21 +158,50 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 			"Times the ffmpeg pipeline was restarted for this channel.", labels...),
 		mUploadFail: reg.Counter("transmux_channel_upload_failures_total",
 			"Segment or manifest uploads that failed after all retries.", labels...),
+		mSegmentFail: reg.Counter("transmux_channel_segment_upload_failures_total",
+			"Segment uploads that failed after all retries.", labels...),
+		mManifestFail: reg.Counter("transmux_channel_manifest_upload_failures_total",
+			"Manifest uploads that failed after all retries. Segments keep arriving in "+
+				"this state but none of them are visible to players.", labels...),
 		mLastSegTS: reg.Gauge("transmux_channel_last_segment_timestamp_seconds",
 			"Unix timestamp of the most recently published segment.", labels...),
-		mGapSeconds: reg.Gauge("transmux_channel_seconds_since_segment",
-			"Seconds since the most recently published segment.", labels...),
-		mGapAlarm: reg.Gauge("transmux_channel_segment_gap_alarm",
-			"1 when a receiving channel has exceeded its allowed segment gap.", labels...),
+		mSegDuration: reg.Gauge("transmux_channel_last_segment_duration_seconds",
+			"Actual EXTINF duration of the most recent segment, which is set by the camera GOP.", labels...),
 		mLastSeenTS: reg.Gauge("transmux_channel_last_ffmpeg_segment_timestamp_seconds",
 			"Unix timestamp when ffmpeg last finished a segment, before upload. "+
 				"Compare with the published timestamp to tell a camera fault from a store fault.", labels...),
-		mSegDuration: reg.Gauge("transmux_channel_last_segment_duration_seconds",
-			"Actual EXTINF duration of the most recent segment, which is set by the camera GOP.", labels...),
 		mManifestTS: reg.Gauge("transmux_channel_last_manifest_timestamp_seconds",
 			"Unix timestamp of the last successfully stored manifest. A segment is only "+
 				"visible to players once this advances past it.", labels...),
+		mMissingPDT: reg.Counter("transmux_channel_missing_pdt_total",
+			"Segments ffmpeg produced with no EXT-X-PROGRAM-DATE-TIME, which forces the "+
+				"date directory to fall back to upload time.", labels...),
+		mFailed: reg.Counter("transmux_channel_failed_total",
+			"Times this channel entered the terminal failed state. It does not recover "+
+				"without operator action.", labels...),
+		mDrainFail: reg.Counter("transmux_channel_final_drain_failures_total",
+			"Post-exit flushes that did not complete, meaning spooled segments were "+
+				"discarded or left behind.", labels...),
+		mSpoolFiles: reg.Gauge("transmux_channel_spool_files",
+			"Segment files currently waiting on the spool.", labels...),
+		mSpoolBytes: reg.Gauge("transmux_channel_spool_bytes",
+			"Bytes currently waiting on the spool. Sum across channels to size the tmpfs.", labels...),
+		mSpoolOldest: reg.Gauge("transmux_channel_spool_oldest_seconds",
+			"Age of the oldest segment waiting on the spool. It approaches "+
+				"local_list_size x segment length when the object store is failing, and "+
+				"segments are reclaimed after that.", labels...),
 	}
+	// Values that decay with wall-clock time are computed at scrape time.
+	// Stored gauges for these went stale during reconnect backoff and in the
+	// failed state, which is exactly when an operator reads them.
+	w.mGapSeconds = reg.GaugeFunc("transmux_channel_seconds_since_segment",
+		"Seconds since the most recently published segment.", w.secondsSinceSegment, labels...)
+	w.mGapAlarm = reg.GaugeFunc("transmux_channel_segment_gap_alarm",
+		"1 when a receiving channel has exceeded its allowed segment gap.", w.gapAlarm, labels...)
+	w.mManifestLag = reg.GaugeFunc("transmux_channel_seconds_since_manifest",
+		"Seconds since the last successfully stored manifest. Unlike the segment gap "+
+			"this covers the publish step, so it rises when only the manifest PUT fails.",
+		w.secondsSinceManifest, labels...)
 	w.snap = Snapshot{
 		CenterID:  cam.CenterID,
 		CameraID:  cam.CameraID,
@@ -266,6 +316,43 @@ func (w *Worker) recover(ctx context.Context) error {
 	return nil
 }
 
+// secondsSinceSegment, gapAlarm and secondsSinceManifest are the scrape-time
+// collectors. They take the read lock themselves and must never be called
+// while it is already held.
+func (w *Worker) secondsSinceSegment() float64 {
+	w.mu.RLock()
+	last := w.snap.LastSegmentAt
+	w.mu.RUnlock()
+	if last == nil {
+		return 0
+	}
+	return time.Since(*last).Seconds()
+}
+
+func (w *Worker) gapAlarm() float64 {
+	w.mu.RLock()
+	state := w.snap.State
+	last := w.snap.LastSegmentAt
+	w.mu.RUnlock()
+	if last == nil || state != StateReceiving {
+		return 0
+	}
+	if time.Since(*last) > w.gapAllowance() {
+		return 1
+	}
+	return 0
+}
+
+func (w *Worker) secondsSinceManifest() float64 {
+	w.mu.RLock()
+	last := w.lastManifestAt
+	w.mu.RUnlock()
+	if last.IsZero() {
+		return 0
+	}
+	return time.Since(last).Seconds()
+}
+
 func (w *Worker) Camera() camera.Camera { return w.cam }
 
 // Snapshot returns the current channel view for the health API.
@@ -330,6 +417,7 @@ func (w *Worker) Run(ctx context.Context) {
 			w.log.Error("channel disabled: cannot establish a safe starting sequence", "error", err)
 			w.setError(err)
 			w.setState(StateFailed)
+			w.mFailed.Inc()
 			<-ctx.Done()
 			return
 		}
@@ -492,7 +580,7 @@ func (w *Worker) runGeneration(ctx context.Context, generation int) error {
 				w.finalDrain(gen)
 				return errStalled
 			}
-			w.refreshGapMetrics()
+			w.refreshSpoolMetrics()
 		}
 	}
 }
@@ -506,6 +594,7 @@ func (w *Worker) finalDrain(gen *drainState) {
 	// does not apply.
 	w.manifestRetryAfter = time.Time{}
 	if res, err := w.drain(ctx, gen); err != nil {
+		w.mDrainFail.Inc()
 		w.log.Warn("final drain incomplete", "uploaded", res.Uploaded,
 			"manifest_pending", w.manifestDirty, "error", err)
 	} else if res.Uploaded > 0 {
@@ -666,6 +755,14 @@ func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error
 		if !ok {
 			continue
 		}
+		// The playlist is a file on disk; treat its contents as untrusted
+		// input rather than joining an arbitrary string onto the spool path.
+		if !ffmpeg.ValidSegmentName(seg.Name) {
+			w.log.Error("ignoring a playlist entry that is not a segment name",
+				"name", seg.Name)
+			gen.processed[seg.Name] = true
+			continue
+		}
 		// Detect segments that ffmpeg created and then reclaimed before we
 		// got to them. This is real data loss and must be visible.
 		if gen.lastLocalIndex >= 0 && idx > gen.lastLocalIndex+1 {
@@ -675,10 +772,10 @@ func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error
 				"count", missed, "from_index", gen.lastLocalIndex+1, "to_index", idx-1)
 		}
 
-		body, err := os.ReadFile(filepath.Join(w.spoolDir, seg.Name))
-		if err != nil {
-			if os.IsNotExist(err) {
-				// Already reclaimed by ffmpeg's delete_segments.
+		if err := w.publishSegment(ctx, seg); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				// Already reclaimed by ffmpeg's delete_segments between the
+				// playlist being written and the upload slot being granted.
 				gen.processed[seg.Name] = true
 				if idx > gen.lastLocalIndex {
 					gen.lastLocalIndex = idx
@@ -686,13 +783,6 @@ func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error
 				w.recordLost(1)
 				continue
 			}
-			if firstErr == nil {
-				firstErr = err
-			}
-			break
-		}
-
-		if err := w.publishSegment(ctx, seg, body); err != nil {
 			// Leave it unprocessed so the next tick retries while the file
 			// still exists. The manifest is not advanced past it.
 			if firstErr == nil {
@@ -736,7 +826,11 @@ func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error
 }
 
 // publishSegment uploads one segment and appends it to the live window.
-func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment, body []byte) error {
+//
+// The body is not read here: PutFile reads it after taking an upload slot, so
+// the number of segments resident in memory is bounded by upload concurrency
+// rather than by channel count.
+func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment) error {
 	w.mu.Lock()
 	seqNo := w.lastSequence + 1
 	// A discontinuity comes from either side: the supervisor knows about
@@ -748,7 +842,14 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment, body 
 
 	pdt := seg.ProgramDateTime
 	if pdt.IsZero() {
+		// ffmpeg is asked for program_date_time, so this should not happen.
+		// Falling back to now breaks the documented rule that the date
+		// directory follows capture time, and makes the object key change
+		// between retries, so it is recorded rather than passed over.
 		pdt = time.Now().UTC()
+		w.mMissingPDT.Inc()
+		w.log.Warn("segment has no EXT-X-PROGRAM-DATE-TIME, filing it under the current time",
+			"segment", seg.Name, "sequence", seqNo)
 	}
 	// The date directory comes from the segment's own wall-clock anchor, not
 	// from time.Now at upload time, so a slow upload near midnight still
@@ -757,9 +858,8 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment, body 
 		fmt.Sprintf("seg-%09d-%d.ts", seqNo, pdt.UTC().UnixMilli()))
 	key := w.objectKey(relURI)
 
-	if err := w.uploader.Put(ctx, storage.Object{
+	size, err := w.uploader.PutFile(ctx, storage.Object{
 		Key:         key,
-		Body:        body,
 		ContentType: hls.ContentTypeSegment,
 		// Segments are immutable, so they can be cached indefinitely.
 		CacheControl: "public, max-age=31536000, immutable",
@@ -775,8 +875,12 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment, body 
 			"center-id":     w.cam.CenterID,
 			"camera-id":     w.cam.CameraID,
 		},
-	}); err != nil {
-		w.recordUploadFailure(err)
+	}, filepath.Join(w.spoolDir, seg.Name))
+	if err != nil {
+		// A vanished file is loss, not an upload failure; the caller counts it.
+		if !errors.Is(err, fs.ErrNotExist) {
+			w.recordSegmentFailure(err)
+		}
 		return err
 	}
 
@@ -786,7 +890,7 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment, body 
 		Duration:        seg.Duration,
 		ProgramDateTime: pdt,
 		Discontinuity:   disc,
-		Bytes:           int64(len(body)),
+		Bytes:           size,
 	}
 
 	now := time.Now().UTC()
@@ -804,7 +908,7 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment, body 
 		w.window = w.window[1:]
 	}
 	w.snap.SegmentsPublished++
-	w.snap.BytesPublished += int64(len(body))
+	w.snap.BytesPublished += size
 	w.snap.LastSequence = seqNo
 	w.snap.LastSegmentAt = &now
 	w.mu.Unlock()
@@ -813,12 +917,12 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment, body 
 	w.manifestDirty = true
 
 	w.mSegments.Inc()
-	w.mSegBytes.Add(float64(len(body)))
+	w.mSegBytes.Add(float64(size))
 	w.mLastSegTS.Set(float64(now.Unix()))
 	w.mSegDuration.Set(seg.Duration.Seconds())
 
 	w.log.Debug("segment published",
-		"sequence", seqNo, "key", key, "bytes", len(body),
+		"sequence", seqNo, "key", key, "bytes", size,
 		"duration_s", seg.Duration.Seconds(), "discontinuity", disc)
 	return nil
 }
@@ -842,13 +946,17 @@ func (w *Worker) publishManifest(ctx context.Context) error {
 		// browser, otherwise viewers stall on a stale window.
 		CacheControl: "no-cache, max-age=0",
 	}); err != nil {
-		w.recordUploadFailure(err)
+		w.recordManifestFailure(err)
 		return err
 	}
 	// Every segment currently in the window is now referenced by a stored
 	// manifest.
 	w.manifestDirty = false
-	w.mManifestTS.Set(float64(time.Now().Unix()))
+	now := time.Now()
+	w.mu.Lock()
+	w.lastManifestAt = now
+	w.mu.Unlock()
+	w.mManifestTS.Set(float64(now.Unix()))
 
 	if err := saveCheckpoint(w.statePath, checkpoint{
 		LastSequence:          lastSeq,
@@ -879,9 +987,6 @@ func (w *Worker) setState(s State) {
 	w.snap.State = s
 	w.mu.Unlock()
 	w.mState.Set(stateCode(s))
-	if s != StateReceiving {
-		w.mGapAlarm.Set(0)
-	}
 }
 
 func (w *Worker) setError(err error) {
@@ -902,6 +1007,20 @@ func (w *Worker) recordLost(n int) {
 	w.mu.Unlock()
 }
 
+// recordSegmentFailure and recordManifestFailure both feed the combined
+// counter so existing alarms keep working, and a specific one so an operator
+// can tell a media backlog from a channel whose segments are stored but
+// invisible.
+func (w *Worker) recordSegmentFailure(err error) {
+	w.mSegmentFail.Inc()
+	w.recordUploadFailure(err)
+}
+
+func (w *Worker) recordManifestFailure(err error) {
+	w.mManifestFail.Inc()
+	w.recordUploadFailure(err)
+}
+
 func (w *Worker) recordUploadFailure(err error) {
 	w.mUploadFail.Inc()
 	w.mu.Lock()
@@ -910,23 +1029,43 @@ func (w *Worker) recordUploadFailure(err error) {
 	w.setError(err)
 }
 
-// refreshGapMetrics updates the missing-segment alarm gauge.
-func (w *Worker) refreshGapMetrics() {
-	w.mu.RLock()
-	state := w.snap.State
-	last := w.snap.LastSegmentAt
-	w.mu.RUnlock()
-	if last == nil {
-		w.mGapSeconds.Set(0)
-		w.mGapAlarm.Set(0)
+// refreshSpoolMetrics reports what is waiting on the spool.
+//
+// Rate limited to one scan per target duration: a readdir plus a stat per file
+// on every tick, for every channel, is real work for a number that cannot
+// change faster than segments are produced.
+func (w *Worker) refreshSpoolMetrics() {
+	if time.Since(w.spoolStatsAt) < w.cfg.Segment.TargetDuration.Duration {
 		return
 	}
-	gap := time.Since(*last)
-	w.mGapSeconds.Set(gap.Seconds())
-	if state == StateReceiving && gap > w.gapAllowance() {
-		w.mGapAlarm.Set(1)
+	w.spoolStatsAt = time.Now()
+
+	entries, err := os.ReadDir(w.spoolDir)
+	if err != nil {
+		return
+	}
+	var files, bytes int64
+	oldest := time.Time{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ts") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files++
+		bytes += info.Size()
+		if oldest.IsZero() || info.ModTime().Before(oldest) {
+			oldest = info.ModTime()
+		}
+	}
+	w.mSpoolFiles.Set(float64(files))
+	w.mSpoolBytes.Set(float64(bytes))
+	if oldest.IsZero() {
+		w.mSpoolOldest.Set(0)
 	} else {
-		w.mGapAlarm.Set(0)
+		w.mSpoolOldest.Set(time.Since(oldest).Seconds())
 	}
 }
 

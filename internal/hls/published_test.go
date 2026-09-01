@@ -119,3 +119,58 @@ func TestParsePublishedRejectsEmptyAndGarbage(t *testing.T) {
 		}
 	}
 }
+
+// TestParsePublishedRejectsAForeignPath is the ownership check. Recovery uses
+// this manifest to decide it may keep publishing into the same key, so a
+// playlist that only happens to contain a similar filename, or one pointing at
+// another host, must not qualify.
+func TestParsePublishedRejectsAForeignPath(t *testing.T) {
+	cases := map[string]string{
+		"absolute url": "https://cdn.example/2026/08/31/seg-000000001-1.ts",
+		"leading slash": "/2026/08/31/seg-000000001-1.ts",
+		"bare basename": "seg-000000001-1.ts",
+		"wrong depth":   "2026/08/seg-000000001-1.ts",
+		"query string":  "2026/08/31/seg-000000001-1.ts?token=abc",
+		"dot segment":   "2026/08/../08/31/seg-000000001-1.ts",
+		"non numeric date": "yyyy/mm/dd/seg-000000001-1.ts",
+	}
+	for name, uri := range cases {
+		body := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:1\n#EXTINF:4.000,\n" + uri + "\n"
+		if _, err := ParsePublished([]byte(body)); err == nil {
+			t.Errorf("%s (%q): expected rejection", name, uri)
+		}
+	}
+}
+
+// TestParsePublishedRejectsANonContiguousWindow guards the resume point. A gap
+// in the sequence means the playlist is not a window this daemon rendered, and
+// resuming from its maximum could reissue a key inside the hole.
+func TestParsePublishedRejectsANonContiguousWindow(t *testing.T) {
+	body := strings.Join([]string{
+		"#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-MEDIA-SEQUENCE:10",
+		"#EXTINF:4.000,", "2026/08/31/seg-000000010-1.ts",
+		"#EXTINF:4.000,", "2026/08/31/seg-000000012-2.ts",
+		"",
+	}, "\n")
+	if _, err := ParsePublished([]byte(body)); err == nil {
+		t.Fatal("expected a non-contiguous window to be rejected")
+	}
+}
+
+func TestParsePublishedRejectsMismatchedMediaSequence(t *testing.T) {
+	body := strings.Join([]string{
+		"#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-MEDIA-SEQUENCE:99",
+		"#EXTINF:4.000,", "2026/08/31/seg-000000010-1.ts",
+		"",
+	}, "\n")
+	if _, err := ParsePublished([]byte(body)); err == nil {
+		t.Fatal("EXT-X-MEDIA-SEQUENCE must agree with the first segment")
+	}
+}
+
+func TestParsePublishedRequiresMediaSequence(t *testing.T) {
+	body := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000,\n2026/08/31/seg-000000010-1.ts\n"
+	if _, err := ParsePublished([]byte(body)); err == nil {
+		t.Fatal("every manifest this daemon writes has EXT-X-MEDIA-SEQUENCE")
+	}
+}

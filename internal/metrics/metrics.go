@@ -33,9 +33,16 @@ type Label struct {
 
 // Metric is a single time series handle. Callers hold onto it so the hot
 // path performs an atomic add rather than a map lookup.
+//
+// A series is either a stored value, updated with Add or Set, or computed at
+// scrape time from collect. The second form exists for values that decay with
+// wall-clock time: a stored "seconds since the last segment" is only correct
+// while something keeps writing it, and goes stale exactly when the channel
+// stops working, which is when it matters.
 type Metric struct {
-	labels []Label
-	bits   atomic.Uint64 // float64 bits
+	labels  []Label
+	bits    atomic.Uint64 // float64 bits
+	collect func() float64
 }
 
 // Add increments a counter.
@@ -56,7 +63,12 @@ func (m *Metric) Inc() { m.Add(1) }
 func (m *Metric) Set(v float64) { m.bits.Store(floatBits(v)) }
 
 // Value reads the current value.
-func (m *Metric) Value() float64 { return bitsFloat(m.bits.Load()) }
+func (m *Metric) Value() float64 {
+	if m.collect != nil {
+		return m.collect()
+	}
+	return bitsFloat(m.bits.Load())
+}
 
 type family struct {
 	name   string
@@ -79,12 +91,23 @@ func NewRegistry() *Registry {
 // Counter returns the counter series for the given name and labels,
 // creating it if needed.
 func (r *Registry) Counter(name, help string, labels ...Label) *Metric {
-	return r.metric(kindCounter, name, help, labels)
+	return r.metric(kindCounter, name, help, labels, nil)
 }
 
 // Gauge returns the gauge series for the given name and labels.
 func (r *Registry) Gauge(name, help string, labels ...Label) *Metric {
-	return r.metric(kindGauge, name, help, labels)
+	return r.metric(kindGauge, name, help, labels, nil)
+}
+
+// GaugeFunc registers a gauge whose value is computed when the registry is
+// rendered. Use it for anything that depends on the current time.
+//
+// A stored gauge for a decaying value is only correct while something keeps
+// writing it, and goes stale exactly when the channel stops working. collect
+// is called while the registry read lock is held, so it must not block or
+// register new metrics.
+func (r *Registry) GaugeFunc(name, help string, collect func() float64, labels ...Label) *Metric {
+	return r.metric(kindGauge, name, help, labels, collect)
 }
 
 // DropSeries removes every series carrying all of the given labels. Used when
@@ -124,7 +147,7 @@ func hasAllLabels(have, want []Label) bool {
 	return true
 }
 
-func (r *Registry) metric(k kind, name, help string, labels []Label) *Metric {
+func (r *Registry) metric(k kind, name, help string, labels []Label, collect func() float64) *Metric {
 	sorted := make([]Label, len(labels))
 	copy(sorted, labels)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
@@ -151,7 +174,9 @@ func (r *Registry) metric(k kind, name, help string, labels []Label) *Metric {
 	if m, ok := f.series[key]; ok {
 		return m
 	}
-	m := &Metric{labels: sorted}
+	// collect is assigned under the lock so a concurrent render cannot
+	// observe a half-initialised series.
+	m := &Metric{labels: sorted, collect: collect}
 	f.series[key] = m
 	return m
 }

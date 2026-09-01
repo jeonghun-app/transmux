@@ -3,17 +3,21 @@ package hls
 import (
 	"bufio"
 	"fmt"
-	"path"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// publishedURIPattern matches the segment URIs this daemon writes, of the
-// form YYYY/MM/DD/seg-{sequence}-{unixms}.ts. The sequence is embedded in the
-// name precisely so it can be recovered from a manifest alone.
-var publishedURIPattern = regexp.MustCompile(`^seg-(\d+)-(\d+)\.ts$`)
+// publishedURIPattern matches the segment URIs this daemon writes, relative to
+// the manifest: YYYY/MM/DD/seg-{sequence}-{unixms}.ts. The sequence is
+// embedded in the name precisely so it can be recovered from a manifest alone.
+//
+// The whole relative path is matched, not just the basename. Recovery decides
+// whether the daemon owns a manifest and may keep publishing into it, so a
+// playlist that merely happens to contain a similar filename, or one that
+// points at an absolute URL on another host, must not qualify.
+var publishedURIPattern = regexp.MustCompile(`^\d{4}/\d{2}/\d{2}/seg-(\d+)-(\d+)\.ts$`)
 
 // Published is the state recovered from a manifest already in the object
 // store.
@@ -47,6 +51,8 @@ func ParsePublished(data []byte) (Published, error) {
 		havePendingInf bool
 		sawHeader      bool
 		count          int
+		mediaSeq       uint64
+		sawMediaSeq    bool
 	)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -60,6 +66,20 @@ func ParsePublished(data []byte) (Published, error) {
 			seq, err := sequenceFromURI(line)
 			if err != nil {
 				return Published{}, err
+			}
+			// Sequences must advance by exactly one. A gap or a repeat means
+			// the playlist is not a window this daemon rendered, and resuming
+			// from its maximum could reissue a key in the hole.
+			if count > 0 {
+				prev := out.Window[count-1].Sequence
+				if seq != prev+1 {
+					return Published{}, fmt.Errorf(
+						"segment sequence jumps from %d to %d; the playlist is not one of ours",
+						prev, seq)
+				}
+			} else if sawMediaSeq && seq != mediaSeq {
+				return Published{}, fmt.Errorf(
+					"EXT-X-MEDIA-SEQUENCE is %d but the first segment is %d", mediaSeq, seq)
 			}
 			pending.Sequence = seq
 			pending.URI = line
@@ -93,6 +113,13 @@ func ParsePublished(data []byte) (Published, error) {
 			}
 		case line == "#EXT-X-DISCONTINUITY":
 			pending.Discontinuity = true
+		case strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"):
+			v := strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:")
+			n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+			if err != nil {
+				return Published{}, fmt.Errorf("invalid EXT-X-MEDIA-SEQUENCE %q: %w", line, err)
+			}
+			mediaSeq, sawMediaSeq = n, true
 		case strings.HasPrefix(line, "#EXT-X-DISCONTINUITY-SEQUENCE:"):
 			v := strings.TrimPrefix(line, "#EXT-X-DISCONTINUITY-SEQUENCE:")
 			n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
@@ -111,12 +138,24 @@ func ParsePublished(data []byte) (Published, error) {
 	if count == 0 {
 		return Published{}, fmt.Errorf("playlist references no segments")
 	}
+	if !sawMediaSeq {
+		return Published{}, fmt.Errorf("playlist has no EXT-X-MEDIA-SEQUENCE; " +
+			"every manifest this daemon writes has one")
+	}
 	return out, nil
 }
 
 // sequenceFromURI extracts the media sequence encoded in a segment URI.
+//
+// The URI must be relative and match the daemon's own layout exactly. A
+// scheme, a host, a leading slash, a query or a dot segment all mean the entry
+// was not written by this code path.
 func sequenceFromURI(uri string) (uint64, error) {
-	m := publishedURIPattern.FindStringSubmatch(path.Base(uri))
+	if strings.ContainsAny(uri, "?#\\") || strings.HasPrefix(uri, "/") ||
+		strings.Contains(uri, "//") || strings.Contains(uri, "..") {
+		return 0, fmt.Errorf("segment URI %q is not a plain relative path", uri)
+	}
+	m := publishedURIPattern.FindStringSubmatch(uri)
 	if m == nil {
 		return 0, fmt.Errorf("segment URI %q does not match this daemon's naming scheme", uri)
 	}

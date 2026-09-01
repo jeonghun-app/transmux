@@ -35,6 +35,10 @@ type fakeStore struct {
 func (f *fakeStore) Put(_ context.Context, obj storage.Object) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	return f.putLocked(obj)
+}
+
+func (f *fakeStore) putLocked(obj storage.Object) error {
 	if f.failKey != nil {
 		if err := f.failKey(obj.Key); err != nil {
 			return err
@@ -48,6 +52,22 @@ func (f *fakeStore) Put(_ context.Context, obj storage.Object) error {
 	}
 	f.objects[obj.Key] = cp.Body
 	return nil
+}
+
+// PutFile mirrors the coordinator: the file is read as part of the upload, so
+// a vanished segment surfaces as fs.ErrNotExist rather than a store error.
+func (f *fakeStore) PutFile(_ context.Context, obj storage.Object, srcPath string) (int64, error) {
+	body, err := os.ReadFile(srcPath)
+	if err != nil {
+		return 0, err
+	}
+	obj.Body = body
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.putLocked(obj); err != nil {
+		return 0, err
+	}
+	return int64(len(body)), nil
 }
 
 func (f *fakeStore) Get(_ context.Context, key string) ([]byte, error) {
@@ -1110,4 +1130,216 @@ func TestSegmentsSpanningMidnightUseTheirCaptureDate(t *testing.T) {
 	if !before || !after {
 		t.Errorf("segments must be filed by capture date on both sides of midnight, got %v", store.keys())
 	}
+}
+
+// TestSegmentReclaimedDuringUploadCountsAsLost covers the window between the
+// playlist naming a segment and the upload slot being granted. ffmpeg's
+// delete_segments can remove the file in between, and that is data loss, not
+// an object-store failure: counting it as the latter would hide a real gap
+// behind a retry that can never succeed.
+func TestSegmentReclaimedDuringUploadCountsAsLost(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	writeSpool(t, w.spoolDir, []spoolEntry{
+		{name: "seg-000000000.ts", duration: 4 * time.Second, pdt: basePDT, absent: true},
+	})
+
+	res, err := w.drain(context.Background(), newDrainState())
+	if err != nil {
+		t.Fatalf("a vanished segment is loss, not an error to retry: %v", err)
+	}
+	if res.Uploaded != 0 {
+		t.Errorf("Uploaded = %d, want 0", res.Uploaded)
+	}
+	if got := w.Snapshot().SegmentsLost; got != 1 {
+		t.Errorf("SegmentsLost = %d, want 1", got)
+	}
+	if got := w.Snapshot().UploadFailures; got != 0 {
+		t.Errorf("UploadFailures = %d, want 0: the store was never at fault", got)
+	}
+}
+
+// TestDrainIgnoresAPlaylistEntryThatIsNotASegmentName treats the playlist as
+// untrusted input. Its entries are joined onto the spool path, so a crafted
+// name must not be able to reach another directory.
+func TestDrainIgnoresAPlaylistEntryThatIsNotASegmentName(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	outside := filepath.Join(t.TempDir(), "secret.ts")
+	if err := os.WriteFile(outside, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	playlist := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000,\n" +
+		"../../" + filepath.Base(filepath.Dir(outside)) + "/secret.ts\n"
+	if err := os.WriteFile(filepath.Join(w.spoolDir, ffmpeg.LocalPlaylistName),
+		[]byte(playlist), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := w.drain(context.Background(), newDrainState()); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	for _, k := range store.keys() {
+		if strings.Contains(k, "secret") {
+			t.Fatalf("a playlist entry escaped the spool: %s", k)
+		}
+	}
+	if w.lastSequence != 0 {
+		t.Errorf("lastSequence = %d, want 0: nothing legitimate was published", w.lastSequence)
+	}
+}
+
+// TestMissingProgramDateTimeIsCounted makes the fallback visible. Without
+// ffmpeg's timestamp the date directory silently follows upload time, which
+// breaks the documented rule and changes the object key between retries.
+func TestMissingProgramDateTimeIsCounted(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	// A playlist with EXTINF but no EXT-X-PROGRAM-DATE-TIME.
+	playlist := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000,\nseg-000000000.ts\n"
+	if err := os.WriteFile(filepath.Join(w.spoolDir, "seg-000000000.ts"),
+		[]byte("a"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(w.spoolDir, ffmpeg.LocalPlaylistName),
+		[]byte(playlist), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := w.drain(context.Background(), newDrainState()); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.mMissingPDT.Value(); got != 1 {
+		t.Errorf("missing_pdt_total = %v, want 1", got)
+	}
+	// It is still published: dropping the segment would be worse than filing
+	// it under the wrong second.
+	if w.lastSequence != 1 {
+		t.Errorf("lastSequence = %d, want 1", w.lastSequence)
+	}
+}
+
+// TestGapMetricsAreComputedAtScrapeTime is the staleness fix. The gap gauges
+// used to be written only while a generation was running, so they froze during
+// reconnect backoff and in the failed state, which is exactly when an operator
+// looks at them.
+func TestGapMetricsAreComputedAtScrapeTime(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	writeSpool(t, w.spoolDir, []spoolEntry{
+		{name: "seg-000000000.ts", duration: 4 * time.Second, pdt: basePDT, body: []byte("a")},
+	})
+	if _, err := w.drain(context.Background(), newDrainState()); err != nil {
+		t.Fatal(err)
+	}
+	w.setState(StateReceiving)
+
+	first := w.mGapSeconds.Value()
+	time.Sleep(20 * time.Millisecond)
+	second := w.mGapSeconds.Value()
+	if !(second > first) {
+		t.Errorf("seconds_since_segment did not advance without a write: %v then %v", first, second)
+	}
+	if w.mManifestLag.Value() <= 0 {
+		t.Error("seconds_since_manifest should be positive after publishing")
+	}
+
+	// The alarm only applies to a channel that claims to be receiving.
+	w.setState(StateReconnecting)
+	if got := w.mGapAlarm.Value(); got != 0 {
+		t.Errorf("gap alarm = %v while reconnecting, want 0", got)
+	}
+}
+
+func TestGapMetricsAreZeroBeforeTheFirstSegment(t *testing.T) {
+	w := newTestWorker(t, &fakeStore{})
+	if got := w.mGapSeconds.Value(); got != 0 {
+		t.Errorf("seconds_since_segment = %v before any segment, want 0", got)
+	}
+	if got := w.mManifestLag.Value(); got != 0 {
+		t.Errorf("seconds_since_manifest = %v before any manifest, want 0", got)
+	}
+}
+
+// TestSpoolMetricsReportTheBacklog gives the operator the number that decides
+// whether a store outage is about to turn into loss.
+func TestSpoolMetricsReportTheBacklog(t *testing.T) {
+	w := newTestWorker(t, &fakeStore{})
+	for _, name := range []string{"seg-000000000.ts", "seg-000000001.ts"} {
+		if err := os.WriteFile(filepath.Join(w.spoolDir, name), []byte("12345"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	w.refreshSpoolMetrics()
+	if got := w.mSpoolFiles.Value(); got != 2 {
+		t.Errorf("spool_files = %v, want 2", got)
+	}
+	if got := w.mSpoolBytes.Value(); got != 10 {
+		t.Errorf("spool_bytes = %v, want 10", got)
+	}
+	if got := w.mSpoolOldest.Value(); got < 0 {
+		t.Errorf("spool_oldest_seconds = %v, want >= 0", got)
+	}
+
+	// The scan is rate limited, so an immediate second call must not run it.
+	if err := os.WriteFile(filepath.Join(w.spoolDir, "seg-000000002.ts"),
+		[]byte("12345"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w.refreshSpoolMetrics()
+	if got := w.mSpoolFiles.Value(); got != 2 {
+		t.Errorf("spool_files = %v, want the rate-limited value 2", got)
+	}
+}
+
+// TestSegmentAndManifestFailuresAreCountedSeparately is what lets an operator
+// tell "nothing is being stored" from "everything is stored but invisible".
+func TestSegmentAndManifestFailuresAreCountedSeparately(t *testing.T) {
+	store := &fakeStore{failKey: func(key string) error {
+		if strings.HasSuffix(key, ".m3u8") {
+			return errors.New("manifest put failed")
+		}
+		return nil
+	}}
+	w := newTestWorker(t, store)
+	writeSpool(t, w.spoolDir, []spoolEntry{
+		{name: "seg-000000000.ts", duration: 4 * time.Second, pdt: basePDT, body: []byte("a")},
+	})
+	if _, err := w.drain(context.Background(), newDrainState()); err == nil {
+		t.Fatal("expected the manifest failure to surface")
+	}
+	if got := w.mManifestFail.Value(); got != 1 {
+		t.Errorf("manifest failures = %v, want 1", got)
+	}
+	if got := w.mSegmentFail.Value(); got != 0 {
+		t.Errorf("segment failures = %v, want 0: the segment stored fine", got)
+	}
+	if got := w.mUploadFail.Value(); got != 1 {
+		t.Errorf("combined failures = %v, want 1 so existing alarms keep working", got)
+	}
+}
+
+func TestFailedStateIsCounted(t *testing.T) {
+	store := &fakeStore{getErr: errors.New("s3 unreachable")}
+	w := newTestWorker(t, store)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Run(ctx)
+	}()
+	deadline := time.After(3 * time.Second)
+	for w.Snapshot().State != StateFailed {
+		select {
+		case <-deadline:
+			t.Fatalf("state = %q, want failed", w.Snapshot().State)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	if got := w.mFailed.Value(); got != 1 {
+		t.Errorf("failed_total = %v, want 1", got)
+	}
+	cancel()
+	<-done
 }
