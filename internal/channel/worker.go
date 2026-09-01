@@ -59,9 +59,30 @@ type Worker struct {
 	// pendingDiscontinuity marks the next published segment as the start of
 	// a new continuity domain, which is the case after every reconnect.
 	pendingDiscontinuity bool
-	// needsRecovery is set when no usable local checkpoint was found, so the
-	// starting sequence has to come from the published manifest.
+	// needsRecovery is cleared once the starting sequence has been
+	// established from the published manifest. It starts true on every
+	// worker: the manifest is always consulted, checkpoint or not.
 	needsRecovery bool
+	// checkpointFloor is the highest sequence a local checkpoint claims was
+	// published. It is a lower bound, never an authority: the checkpoint is
+	// written after the manifest PUT succeeds and so can lag the durable
+	// record, but it can never be ahead of what was actually used.
+	checkpointFloor uint64
+
+	// manifestDirty means segments were uploaded and appended to the window
+	// but the manifest that references them has not been stored yet. It must
+	// be retried on later scans even when no new segment arrives, otherwise
+	// stored segments stay invisible forever.
+	//
+	// Only the Run goroutine touches it, via drain and publishManifest.
+	manifestDirty bool
+	// manifestRetryAfter rate limits manifest-only retries so a store outage
+	// does not turn the scan interval into a log storm.
+	manifestRetryAfter time.Time
+
+	// prevGen carries the previous generation's drain bookkeeping so its
+	// spool can be flushed once more before it is discarded.
+	prevGen *drainState
 
 	// metrics handles, resolved once.
 	mState        *metrics.Metric
@@ -75,6 +96,7 @@ type Worker struct {
 	mGapAlarm     *metrics.Metric
 	mSegDuration  *metrics.Metric
 	mLastSeenTS   *metrics.Metric
+	mManifestTS   *metrics.Metric
 }
 
 // ObjectClient is the subset of the upload coordinator the worker needs.
@@ -105,7 +127,8 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 		mState: reg.Gauge("transmux_channel_state",
 			"Channel state: 1 starting, 2 receiving, 3 disconnected, 4 reconnecting, 5 stopping, 6 stopped, 7 failed.", labels...),
 		mSegments: reg.Counter("transmux_channel_segments_published_total",
-			"Segments successfully uploaded and referenced by the published manifest.", labels...),
+			"Segment objects successfully stored. A segment becomes visible to players "+
+				"only when transmux_channel_last_manifest_timestamp_seconds advances.", labels...),
 		mSegBytes: reg.Counter("transmux_channel_segment_bytes_total",
 			"Total segment bytes uploaded for this channel.", labels...),
 		mLost: reg.Counter("transmux_channel_segments_lost_total",
@@ -125,6 +148,9 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 				"Compare with the published timestamp to tell a camera fault from a store fault.", labels...),
 		mSegDuration: reg.Gauge("transmux_channel_last_segment_duration_seconds",
 			"Actual EXTINF duration of the most recent segment, which is set by the camera GOP.", labels...),
+		mManifestTS: reg.Gauge("transmux_channel_last_manifest_timestamp_seconds",
+			"Unix timestamp of the last successfully stored manifest. A segment is only "+
+				"visible to players once this advances past it.", labels...),
 	}
 	w.snap = Snapshot{
 		CenterID:  cam.CenterID,
@@ -135,48 +161,69 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 	}
 	w.mState.Set(stateCode(StateStarting))
 
+	// The published manifest is consulted on every startup, even when a local
+	// checkpoint exists. The checkpoint is written only after the manifest
+	// PUT succeeds, so it can legitimately lag the durable record; trusting
+	// it on its own would rewind EXT-X-MEDIA-SEQUENCE after a crash between
+	// those two writes. It is kept as a floor instead, because both sources
+	// are lower bounds on what was actually published.
+	w.needsRecovery = true
 	if cp, err := loadCheckpoint(w.statePath); err != nil {
 		// A corrupt checkpoint must not silently restart the sequence at
 		// zero: that would rewind EXT-X-MEDIA-SEQUENCE and overwrite object
-		// keys that players and CDN edges have already cached. Defer to
-		// manifest recovery in Run instead.
-		w.log.Error("checkpoint unreadable, will recover from the published manifest", "error", err)
+		// keys that players and CDN edges have already cached. Manifest
+		// recovery in Run decides instead.
+		w.log.Error("checkpoint unreadable, recovering from the published manifest", "error", err)
 		w.setError(err)
-		w.needsRecovery = true
-	} else if cp.LastSequence == 0 {
-		// No local checkpoint. This is either a brand new channel or a
-		// replaced container; only the object store can tell us which.
-		w.needsRecovery = true
-	} else {
+	} else if cp.LastSequence > 0 {
+		w.checkpointFloor = cp.LastSequence
 		w.lastSequence = cp.LastSequence
 		w.discontinuitySequence = cp.DiscontinuitySequence
 		w.window = cp.toSegments()
 		w.snap.LastSequence = cp.LastSequence
-		w.log.Info("resumed from checkpoint", "last_sequence", cp.LastSequence)
+		w.log.Info("checkpoint loaded, pending validation against the published manifest",
+			"last_sequence", cp.LastSequence)
 	}
 	return w
 }
 
-// recover establishes the starting media sequence when no usable local
-// checkpoint exists.
+// recover establishes the starting media sequence before anything is
+// published.
 //
 // The published manifest in the object store is the durable record. The local
-// checkpoint is only a fast path; it lives on the instance and does not
-// survive an ECS or EKS task replacement. Three outcomes:
+// checkpoint is only a floor; it lives on the instance, does not survive an
+// ECS or EKS task replacement, and is written after the manifest so it can be
+// one publish behind. Four outcomes:
 //
-//	manifest found      resume from its highest sequence, plus a discontinuity
-//	manifest absent     genuinely new channel, start at zero
-//	read failed         fail closed; the history is unknown and starting at
-//	                    zero could overwrite live segments
+//	manifest found      resume from max(manifest, checkpoint), plus a
+//	                    discontinuity
+//	manifest absent     new channel; if a checkpoint exists its sequence
+//	                    still stands, because those keys were used
+//	read failed         fail closed; the history is unknown and starting
+//	                    below it could overwrite live segments
+//	manifest foreign    fail closed; it belongs to another writer
 func (w *Worker) recover(ctx context.Context) error {
 	key := w.objectKey(w.cfg.Storage.ManifestName)
 	body, err := w.uploader.Get(ctx, key)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			w.log.Info("no published manifest, starting a new channel at sequence 0", "key", key)
 			w.mu.Lock()
+			floor := w.checkpointFloor
+			// The window came from the checkpoint and no manifest references
+			// it any more. Republishing it could point players at objects a
+			// lifecycle rule has already removed, so start the window empty
+			// and keep only the sequence floor.
+			w.window = nil
+			w.pendingDiscontinuity = floor > 0
 			w.needsRecovery = false
 			w.mu.Unlock()
+			if floor > 0 {
+				w.log.Warn("no published manifest but a local checkpoint exists; "+
+					"resuming above the checkpoint so used object keys are not reissued",
+					"key", key, "last_sequence", floor)
+			} else {
+				w.log.Info("no published manifest, starting a new channel at sequence 0", "key", key)
+			}
 			return nil
 		}
 		return fmt.Errorf("recover sequence from %s: %w", key, err)
@@ -193,15 +240,27 @@ func (w *Worker) recover(ctx context.Context) error {
 	w.lastSequence = pub.MaxSequence
 	w.discontinuitySequence = pub.DiscontinuitySequence
 	w.window = pub.Window
-	w.snap.LastSequence = pub.MaxSequence
+	if w.checkpointFloor > pub.MaxSequence {
+		// The checkpoint is ahead of the manifest, so a sequence was used
+		// that the manifest never recorded. Never publish at or below it.
+		// The recovered window is dropped as well: keeping it would leave a
+		// numbering gap inside a single published playlist.
+		w.log.Warn("local checkpoint is ahead of the published manifest, resuming from the checkpoint",
+			"manifest_sequence", pub.MaxSequence, "checkpoint_sequence", w.checkpointFloor)
+		w.lastSequence = w.checkpointFloor
+		w.window = nil
+	}
+	w.snap.LastSequence = w.lastSequence
 	// Everything before the restart belongs to a different continuity domain.
 	w.pendingDiscontinuity = true
 	w.needsRecovery = false
+	resumed := w.lastSequence
 	w.mu.Unlock()
 
 	w.log.Info("recovered sequence from published manifest",
 		"key", key,
-		"last_sequence", pub.MaxSequence,
+		"last_sequence", resumed,
+		"manifest_sequence", pub.MaxSequence,
 		"discontinuity_sequence", pub.DiscontinuitySequence,
 		"window", len(pub.Window))
 	return nil
@@ -332,6 +391,13 @@ func (w *Worker) lastRunProducedFor(d time.Duration) bool {
 
 // runGeneration runs one ffmpeg process to completion.
 func (w *Worker) runGeneration(ctx context.Context, generation int) error {
+	// The previous generation's spool is about to be destroyed. Try once more
+	// to flush it: the reconnect backoff has just elapsed, which is enough
+	// time for a brief object-store outage to have cleared.
+	w.flushPreviousGeneration(ctx)
+	if err := w.accountDiscardedSpool(); err != nil {
+		w.log.Warn("could not account for discarded spool files", "error", err)
+	}
 	if err := ffmpeg.EnsureSpool(w.spoolDir); err != nil {
 		return err
 	}
@@ -363,8 +429,11 @@ func (w *Worker) runGeneration(ctx context.Context, generation int) error {
 		"source", w.cam.SafeURL(), "transport", w.cfg.FFmpeg.RTSPTransport)
 
 	// gen tracks per-generation drain state. ffmpeg restarts its local
-	// numbering at zero, so this must not persist across generations.
+	// numbering at zero, so this must not persist across generations. It is
+	// handed to the next generation only so leftovers can be flushed before
+	// the spool is cleared.
 	gen := newDrainState()
+	w.prevGen = gen
 
 	ticker := time.NewTicker(w.cfg.FFmpeg.ScanInterval.Duration)
 	defer ticker.Stop()
@@ -431,13 +500,82 @@ func (w *Worker) runGeneration(ctx context.Context, generation int) error {
 // finalDrain flushes the spool after ffmpeg has exited, on a bounded context
 // so shutdown cannot hang on a slow object store.
 func (w *Worker) finalDrain(gen *drainState) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), finalDrainTimeout)
 	defer cancel()
+	// This is the last chance to publish, so the manifest retry rate limit
+	// does not apply.
+	w.manifestRetryAfter = time.Time{}
 	if res, err := w.drain(ctx, gen); err != nil {
-		w.log.Warn("final drain incomplete", "uploaded", res.Uploaded, "error", err)
+		w.log.Warn("final drain incomplete", "uploaded", res.Uploaded,
+			"manifest_pending", w.manifestDirty, "error", err)
 	} else if res.Uploaded > 0 {
 		w.log.Info("final drain flushed segments", "count", res.Uploaded)
 	}
+}
+
+// finalDrainTimeout bounds the post-exit flush. A fresh context is used
+// rather than the parent because on SIGTERM the parent is already cancelled
+// and every upload would fail instantly.
+const finalDrainTimeout = 15 * time.Second
+
+// flushPreviousGeneration retries the previous generation's spool one last
+// time before it is cleared.
+//
+// The final drain after ffmpeg exited may have failed because the object
+// store was unavailable. By the time the next generation starts, the
+// reconnect backoff has elapsed, so a transient outage has had time to clear
+// and those segments can still be saved.
+func (w *Worker) flushPreviousGeneration(ctx context.Context) {
+	if w.prevGen == nil {
+		return
+	}
+	gen := w.prevGen
+	w.prevGen = nil
+	if ctx.Err() != nil {
+		return
+	}
+	drainCtx, cancel := context.WithTimeout(ctx, finalDrainTimeout)
+	defer cancel()
+	res, err := w.drain(drainCtx, gen)
+	if err != nil {
+		w.log.Warn("carry-over drain incomplete, spooled segments will be discarded",
+			"uploaded", res.Uploaded, "error", err)
+		return
+	}
+	if res.Uploaded > 0 {
+		w.log.Info("carry-over drain rescued segments from the previous generation",
+			"count", res.Uploaded)
+	}
+}
+
+// accountDiscardedSpool counts segments that are about to be destroyed with
+// the spool so the loss is visible instead of silent.
+//
+// EnsureSpool wipes the directory before every generation because a leftover
+// segment's sequence belongs to a dead generation and its duration lives in a
+// playlist that is being replaced. That is the right call, but the segments
+// were real and must show up in segments_lost_total.
+func (w *Worker) accountDiscardedSpool() error {
+	entries, err := os.ReadDir(w.spoolDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	discarded := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ts") {
+			continue
+		}
+		discarded++
+	}
+	if discarded > 0 {
+		w.recordLost(discarded)
+		w.log.Error("discarding spooled segments that were never stored",
+			"count", discarded, "spool", w.spoolDir)
+	}
+	return nil
 }
 
 // drainState is per-generation bookkeeping for the spool scanner.
@@ -572,8 +710,18 @@ func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error
 		_ = os.Remove(filepath.Join(w.spoolDir, seg.Name))
 	}
 
-	if res.Uploaded > 0 {
+	// Publish whenever the window has segments the stored manifest does not
+	// reference yet. Keying this off res.Uploaded would strand a failed
+	// manifest forever: the segments are already uploaded and deleted from
+	// the spool, so a later scan sees no new upload and would never retry.
+	//
+	// A pure retry is rate limited to one target duration. Scanning runs
+	// every few hundred milliseconds, and several hundred channels retrying
+	// a manifest at that rate through a store outage is a log and metric
+	// storm that tells an operator nothing new.
+	if w.manifestDirty && (res.Uploaded > 0 || !time.Now().Before(w.manifestRetryAfter)) {
 		if err := w.publishManifest(ctx); err != nil {
+			w.manifestRetryAfter = time.Now().Add(w.cfg.Segment.TargetDuration.Duration)
 			if firstErr == nil {
 				firstErr = err
 			}
@@ -591,7 +739,11 @@ func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error
 func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment, body []byte) error {
 	w.mu.Lock()
 	seqNo := w.lastSequence + 1
-	disc := w.pendingDiscontinuity
+	// A discontinuity comes from either side: the supervisor knows about
+	// reconnects and restarts, and ffmpeg reports the ones it saw inside a
+	// single run. Dropping ffmpeg's would leave players without a timeline
+	// reset across a mid-run parameter-set or timestamp change.
+	disc := w.pendingDiscontinuity || seg.Discontinuity
 	w.mu.Unlock()
 
 	pdt := seg.ProgramDateTime
@@ -657,6 +809,9 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment, body 
 	w.snap.LastSegmentAt = &now
 	w.mu.Unlock()
 
+	// The segment is stored but no manifest references it yet.
+	w.manifestDirty = true
+
 	w.mSegments.Inc()
 	w.mSegBytes.Add(float64(len(body)))
 	w.mLastSegTS.Set(float64(now.Unix()))
@@ -690,14 +845,19 @@ func (w *Worker) publishManifest(ctx context.Context) error {
 		w.recordUploadFailure(err)
 		return err
 	}
+	// Every segment currently in the window is now referenced by a stored
+	// manifest.
+	w.manifestDirty = false
+	w.mManifestTS.Set(float64(time.Now().Unix()))
 
 	if err := saveCheckpoint(w.statePath, checkpoint{
 		LastSequence:          lastSeq,
 		DiscontinuitySequence: discSeq,
 		Window:                windowToCheckpoint(window),
 	}); err != nil {
-		// Non-fatal: losing the checkpoint only costs sequence continuity
-		// across a process restart, not the current stream.
+		// Genuinely non-fatal: the published manifest is the authority on
+		// startup and the checkpoint is only a floor, so losing it costs a
+		// manifest GET at the next start and nothing else.
 		w.log.Warn("checkpoint write failed", "error", err)
 	}
 	return nil

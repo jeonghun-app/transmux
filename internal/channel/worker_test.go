@@ -766,3 +766,348 @@ func TestSegmentCarriesIndexingMetadata(t *testing.T) {
 // verify the fake satisfies the interface the worker depends on
 var _ ObjectClient = (*fakeStore)(nil)
 var _ = hls.ContentTypeSegment
+
+// restartWorker builds a fresh worker for the same camera, config and state
+// directory, which is what a daemon restart produces.
+func restartWorker(t *testing.T, prev *Worker, store ObjectClient) *Worker {
+	t.Helper()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	return NewWorker(prev.cam, prev.cfg, store, metrics.NewRegistry(), log)
+}
+
+// TestStaleCheckpointDoesNotRewindSequence is the crash window between the
+// two writes that publish a segment: the manifest PUT succeeds and the
+// checkpoint write does not. The checkpoint is then one publish behind the
+// durable record, so trusting it would rewind EXT-X-MEDIA-SEQUENCE and reuse
+// object keys that are already cached.
+func TestStaleCheckpointDoesNotRewindSequence(t *testing.T) {
+	store := &fakeStore{}
+	first := newTestWorker(t, store)
+	writeSpool(t, first.spoolDir, []spoolEntry{
+		{name: "seg-000000.ts", duration: 4 * time.Second, pdt: basePDT, body: []byte("a")},
+		{name: "seg-000001.ts", duration: 4 * time.Second, pdt: basePDT.Add(4 * time.Second), body: []byte("b")},
+	})
+	if _, err := first.drain(context.Background(), newDrainState()); err != nil {
+		t.Fatal(err)
+	}
+	if first.lastSequence != 2 {
+		t.Fatalf("precondition: lastSequence = %d, want 2", first.lastSequence)
+	}
+
+	// Rewind only the checkpoint, leaving the published manifest at 2.
+	if err := saveCheckpoint(first.statePath, checkpoint{LastSequence: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := restartWorker(t, first, store)
+	if second.checkpointFloor != 1 {
+		t.Fatalf("checkpointFloor = %d, want 1", second.checkpointFloor)
+	}
+	if !second.needsRecovery {
+		t.Fatal("the manifest must be consulted even when a checkpoint exists")
+	}
+	if err := second.recover(context.Background()); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if second.lastSequence != 2 {
+		t.Errorf("resumed lastSequence = %d, want 2 from the published manifest", second.lastSequence)
+	}
+
+	// Publishing again must not reuse a key that sequence 2 already used.
+	writeSpool(t, second.spoolDir, []spoolEntry{
+		{name: "seg-000000.ts", duration: 4 * time.Second, pdt: basePDT.Add(time.Minute), body: []byte("c")},
+	})
+	if _, err := second.drain(context.Background(), newDrainState()); err != nil {
+		t.Fatal(err)
+	}
+	if second.lastSequence != 3 {
+		t.Errorf("lastSequence = %d, want 3", second.lastSequence)
+	}
+	seen := map[string]int{}
+	for _, k := range store.keys() {
+		if strings.HasSuffix(k, ".ts") {
+			seen[k]++
+		}
+	}
+	for k, n := range seen {
+		if n > 1 {
+			t.Errorf("segment key %q reused %d times across the restart", k, n)
+		}
+	}
+}
+
+// TestCheckpointAheadOfManifestWins covers the opposite skew: a sequence was
+// used but no manifest recorded it. The higher of the two sources must win,
+// because both are lower bounds on what was published.
+func TestCheckpointAheadOfManifestWins(t *testing.T) {
+	store := &fakeStore{}
+	first := newTestWorker(t, store)
+	writeSpool(t, first.spoolDir, []spoolEntry{
+		{name: "seg-000000.ts", duration: 4 * time.Second, pdt: basePDT, body: []byte("a")},
+	})
+	if _, err := first.drain(context.Background(), newDrainState()); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCheckpoint(first.statePath, checkpoint{LastSequence: 9}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := restartWorker(t, first, store)
+	if err := second.recover(context.Background()); err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if second.lastSequence != 9 {
+		t.Errorf("lastSequence = %d, want 9 from the checkpoint floor", second.lastSequence)
+	}
+	// The recovered window is dropped in this case: mixing it with a higher
+	// sequence would leave a numbering gap inside one published playlist.
+	if len(second.window) != 0 {
+		t.Errorf("window = %d entries, want 0 when the checkpoint is ahead", len(second.window))
+	}
+}
+
+// TestRecoverFailsClosedEvenWithCheckpoint is the fail-closed property. A
+// checkpoint is not evidence that the manifest says the same thing, so an
+// unreadable object store must still disable the channel.
+func TestRecoverFailsClosedEvenWithCheckpoint(t *testing.T) {
+	store := &fakeStore{}
+	first := newTestWorker(t, store)
+	if err := saveCheckpoint(first.statePath, checkpoint{LastSequence: 4}); err != nil {
+		t.Fatal(err)
+	}
+
+	broken := &fakeStore{getErr: errors.New("s3 unreachable")}
+	second := restartWorker(t, first, broken)
+	if second.checkpointFloor != 4 {
+		t.Fatalf("checkpointFloor = %d, want 4", second.checkpointFloor)
+	}
+	if err := second.recover(context.Background()); err == nil {
+		t.Fatal("a checkpoint must not license publishing while the store is unreadable")
+	}
+	if !second.needsRecovery {
+		t.Error("a failed recovery must leave the worker unpublishable")
+	}
+}
+
+// TestRecoverFailsClosedOnForeignManifestWithCheckpoint covers the other
+// fail-closed trigger: the manifest exists but belongs to another writer.
+func TestRecoverFailsClosedOnForeignManifestWithCheckpoint(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	if err := saveCheckpoint(w.statePath, checkpoint{LastSequence: 4}); err != nil {
+		t.Fatal(err)
+	}
+	foreign := "#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000,\nsomeone-elses-segment.ts\n"
+	if err := store.Put(context.Background(), storage.Object{
+		Key:  w.objectKey(w.cfg.Storage.ManifestName),
+		Body: []byte(foreign),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	second := restartWorker(t, w, store)
+	if err := second.recover(context.Background()); err == nil {
+		t.Fatal("a foreign manifest must not be overwritten just because a checkpoint exists")
+	}
+}
+
+// TestCheckpointPathsDoNotCollide guards the flat-filename bug: identifiers
+// may contain underscores, so joining them with one would let two different
+// cameras share a checkpoint and overwrite each other's sequence.
+func TestCheckpointPathsDoNotCollide(t *testing.T) {
+	dir := t.TempDir()
+	a := checkpointPath(dir, "a_b", "c")
+	b := checkpointPath(dir, "a", "b_c")
+	if a == b {
+		t.Fatalf("distinct cameras share a checkpoint path: %q", a)
+	}
+	if err := saveCheckpoint(a, checkpoint{LastSequence: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCheckpoint(b, checkpoint{LastSequence: 3}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadCheckpoint(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastSequence != 7 {
+		t.Errorf("checkpoint for a_b/c = %d, want 7: it was overwritten", got.LastSequence)
+	}
+}
+
+// TestManifestIsRetriedWithoutANewSegment is the stranded-manifest case. The
+// segment is stored, deleted from the spool and counted, but the manifest PUT
+// that makes it visible fails. If the retry were gated on a new upload, a
+// camera that stops right then would leave those segments referenced by
+// nothing, forever.
+func TestManifestIsRetriedWithoutANewSegment(t *testing.T) {
+	store := &fakeStore{failKey: func(key string) error {
+		if strings.HasSuffix(key, ".m3u8") {
+			return errors.New("manifest put failed")
+		}
+		return nil
+	}}
+	w := newTestWorker(t, store)
+	gen := newDrainState()
+	writeSpool(t, w.spoolDir, []spoolEntry{
+		{name: "seg-000000.ts", duration: 4 * time.Second, pdt: basePDT, body: []byte("a")},
+	})
+
+	res, err := w.drain(context.Background(), gen)
+	if err == nil {
+		t.Fatal("expected the manifest failure to be reported")
+	}
+	if res.Uploaded != 1 {
+		t.Fatalf("Uploaded = %d, want 1: the segment itself stored fine", res.Uploaded)
+	}
+	if !w.manifestDirty {
+		t.Fatal("a failed manifest must be remembered as pending")
+	}
+	if store.lastManifest() != "" {
+		t.Fatal("precondition: no manifest should be stored yet")
+	}
+
+	// The store recovers. No new segment arrives: the playlist is unchanged
+	// and the segment file is already gone from the spool.
+	store.mu.Lock()
+	store.failKey = nil
+	store.mu.Unlock()
+
+	// A manifest-only retry is rate limited, so an immediate rescan must not
+	// re-issue it.
+	if _, err := w.drain(context.Background(), gen); err != nil {
+		t.Fatalf("rate-limited drain should not surface an error: %v", err)
+	}
+	if store.lastManifest() != "" {
+		t.Error("manifest retry should be rate limited within one target duration")
+	}
+
+	// Once the limit has elapsed the retry goes through with no new segment.
+	w.manifestRetryAfter = time.Time{}
+	res, err = w.drain(context.Background(), gen)
+	if err != nil {
+		t.Fatalf("retry drain: %v", err)
+	}
+	if res.Uploaded != 0 {
+		t.Fatalf("Uploaded = %d, want 0: nothing new was produced", res.Uploaded)
+	}
+	if w.manifestDirty {
+		t.Error("manifest should be clean after a successful retry")
+	}
+	if m := store.lastManifest(); !strings.Contains(m, "seg-000000001-") {
+		t.Errorf("the retried manifest must reference the stored segment\n%s", m)
+	}
+}
+
+// TestFFmpegDiscontinuityIsPublished covers a discontinuity ffmpeg reports
+// inside a single run, which the supervisor knows nothing about.
+func TestFFmpegDiscontinuityIsPublished(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	writeSpool(t, w.spoolDir, []spoolEntry{
+		{name: "seg-000000.ts", duration: 4 * time.Second, pdt: basePDT, body: []byte("a")},
+		{name: "seg-000001.ts", duration: 4 * time.Second, pdt: basePDT.Add(4 * time.Second),
+			body: []byte("b"), discontinuity: true},
+	})
+	if _, err := w.drain(context.Background(), newDrainState()); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := store.lastManifest()
+	if !strings.Contains(manifest, "#EXT-X-DISCONTINUITY\n") {
+		t.Errorf("ffmpeg's discontinuity was dropped\n%s", manifest)
+	}
+	var second *storage.Object
+	for i := range store.puts {
+		if strings.Contains(store.puts[i].Key, "seg-000000002-") {
+			second = &store.puts[i]
+		}
+	}
+	if second == nil {
+		t.Fatal("second segment was not uploaded")
+	}
+	if got := second.Metadata["discontinuity"]; got != "true" {
+		t.Errorf("segment metadata discontinuity = %q, want true", got)
+	}
+}
+
+// TestDiscardedSpoolIsCountedAsLost makes the spool wipe before each ffmpeg
+// generation visible. The wipe itself is correct, but the segments were real
+// and must not vanish from the loss counter.
+func TestDiscardedSpoolIsCountedAsLost(t *testing.T) {
+	w := newTestWorker(t, &fakeStore{})
+	for _, name := range []string{"seg-000000.ts", "seg-000001.ts"} {
+		if err := os.WriteFile(filepath.Join(w.spoolDir, name), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := w.accountDiscardedSpool(); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.Snapshot().SegmentsLost; got != 2 {
+		t.Errorf("SegmentsLost = %d, want 2", got)
+	}
+}
+
+// TestCarryOverDrainRescuesPreviousGeneration is the avoidable-loss case: the
+// object store was down when ffmpeg died, and the reconnect backoff gives it
+// time to come back before the spool is destroyed.
+func TestCarryOverDrainRescuesPreviousGeneration(t *testing.T) {
+	store := &fakeStore{failKey: func(string) error { return errors.New("store down") }}
+	w := newTestWorker(t, store)
+	gen := newDrainState()
+	writeSpool(t, w.spoolDir, []spoolEntry{
+		{name: "seg-000000.ts", duration: 4 * time.Second, pdt: basePDT, body: []byte("a")},
+	})
+	if _, err := w.drain(context.Background(), gen); err == nil {
+		t.Fatal("precondition: the drain should have failed")
+	}
+	w.prevGen = gen
+
+	store.mu.Lock()
+	store.failKey = nil
+	store.mu.Unlock()
+
+	w.flushPreviousGeneration(context.Background())
+	if w.prevGen != nil {
+		t.Error("the previous generation must be released after the flush")
+	}
+	if w.lastSequence != 1 {
+		t.Errorf("lastSequence = %d, want 1: the spooled segment should have been rescued", w.lastSequence)
+	}
+	if store.lastManifest() == "" {
+		t.Error("the rescued segment must be published in a manifest")
+	}
+	if got := w.Snapshot().SegmentsLost; got != 0 {
+		t.Errorf("SegmentsLost = %d, want 0: nothing was actually lost", got)
+	}
+}
+
+// TestSegmentsSpanningMidnightUseTheirCaptureDate pins the date-directory
+// rule: the day comes from the segment's own wall clock, not from upload time,
+// so a slow upload does not file a segment under the wrong day.
+func TestSegmentsSpanningMidnightUseTheirCaptureDate(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	// basePDT is 2026-08-31T23:59:55Z, so the second segment lands on 09-01.
+	writeSpool(t, w.spoolDir, []spoolEntry{
+		{name: "seg-000000.ts", duration: 4 * time.Second, pdt: basePDT, body: []byte("a")},
+		{name: "seg-000001.ts", duration: 4 * time.Second, pdt: basePDT.Add(6 * time.Second), body: []byte("b")},
+	})
+	if _, err := w.drain(context.Background(), newDrainState()); err != nil {
+		t.Fatal(err)
+	}
+	var before, after bool
+	for _, k := range store.keys() {
+		if strings.Contains(k, "2026/08/31/") {
+			before = true
+		}
+		if strings.Contains(k, "2026/09/01/") {
+			after = true
+		}
+	}
+	if !before || !after {
+		t.Errorf("segments must be filed by capture date on both sides of midnight, got %v", store.keys())
+	}
+}

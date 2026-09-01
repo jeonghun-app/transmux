@@ -68,7 +68,7 @@ transmuxd -config /etc/transmux/config.json -validate   # 설정만 검사
 | `max_channels` | 이 샤드가 받을 최대 채널 수 | 검증된 용량 이상으로 밀려들지 않게 하는 상한 |
 | `segment.target_duration` | `-hls_time` 값 | **목표이자 하한.** 실제 길이는 카메라 GOP가 결정한다 |
 | `segment.live_window` | 발행 매니페스트에 유지할 세그먼트 수 | |
-| `segment.local_list_size` | ffmpeg `-hls_list_size` | 업로드 유예 시간 = 이 값 × target_duration. `live_window`보다 커야 하며 검증에서 강제된다 |
+| `segment.local_list_size` | ffmpeg `-hls_list_size` | 스풀에 세그먼트가 남아 있는 개수. `live_window`보다 커야 하며 검증에서 강제된다. 유예 시간은 이 값 × **실제** 세그먼트 길이(=카메라 GOP)이므로 target_duration으로 계산하면 과대평가된다 |
 | `segment.max_gop_slack` | 누락 판정에 더하는 여유 | GOP가 긴 카메라를 고장으로 오인하지 않게 한다 |
 | `ffmpeg.stall_timeout` | 세그먼트 미생성 시 ffmpeg 종료 임계 | 버전 독립적인 주 단절 감지기 |
 | `ffmpeg.input_args` | `-i` 앞에 넣을 추가 인자 | 버전별 소켓 타임아웃 옵션을 넣는 자리 |
@@ -78,10 +78,12 @@ transmuxd -config /etc/transmux/config.json -validate   # 설정만 검사
 자격증명: 프로덕션은 ECS task role 또는 EKS IRSA를 쓴다.
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`는 MinIO 개발용으로만 읽는다.
 
-필요한 S3 권한은 ingest prefix에 대한 `s3:PutObject`와, 재시작 시 시퀀스 복구를
-위한 매니페스트 키의 `s3:GetObject`다. `state_dir`에 영속 볼륨은 **필요하지 않다** —
-체크포인트가 없으면 발행 매니페스트에서 복구한다. 영속 볼륨이 있으면 기동이 조금
-빠를 뿐이다.
+필요한 S3 권한은 ingest prefix에 대한 `s3:PutObject`와, 시퀀스 복구를 위한
+매니페스트 키의 `s3:GetObject`다. `state_dir`에 영속 볼륨은 **필요하지 않다** —
+기동할 때마다 발행 매니페스트를 읽어 시퀀스를 확정하며, 로컬 체크포인트는
+"이 값 이하로는 절대 내려가지 않는다"는 하한으로만 쓴다. 체크포인트는 매니페스트
+PUT이 성공한 **뒤에** 기록되므로 그 사이에 죽으면 매니페스트보다 뒤처질 수 있고,
+따라서 단독 권위가 될 수 없다. 두 값 중 큰 쪽을 채택한다.
 
 ## 객체 레이아웃
 
@@ -107,7 +109,7 @@ s3://bucket/{prefix}/{center_id}/{camera_id}/index.m3u8
 | 엔드포인트 | 용도 |
 |---|---|
 | `GET /livez` | 프로세스 생존만. 카메라나 S3 장애에 영향받지 않는다 |
-| `GET /readyz` | 로스터 로드 완료 + 과반 채널 정상 |
+| `GET /readyz` | 로스터 로드 완료 + 정상 채널이 절반 이상 (degraded가 과반이면 실패) |
 | `GET /healthz` | Zabbix/WhaTap용 집계. 항상 200이며 본문 필드로 알람 |
 | `GET /channels` | 전체 채널 인벤토리 |
 | `GET /channels/{center_id}/{camera_id}` | 개별 채널 |
@@ -135,10 +137,17 @@ S3 일시 장애로 liveness를 실패시키면 오케스트레이터가 컨테�
 | 세그먼트 누락 | `transmux_channel_segment_gap_alarm` = 1 |
 | 세그먼트 유실(업로드 전 회수) | `transmux_channel_segments_lost_total` 증가 |
 | S3 장애 | `transmux_channel_upload_failures_total` 증가 + `state` = 2(receiving) |
+| 세그먼트는 저장됐지만 재생에 안 보임 | `segments_published_total`은 오르는데 `last_manifest_timestamp`가 정지 |
 | 카메라 장애와 S3 장애 구분 | `last_ffmpeg_segment_timestamp` vs `last_segment_timestamp` |
 
 마지막 항목이 중요하다. ffmpeg은 세그먼트를 만들고 있는데 발행 시각만
 멈춰 있으면 오브젝트 스토어 장애다. 둘 다 멈췄으면 카메라 장애다.
+
+`segments_published_total`은 **세그먼트 객체 저장 성공** 시점에 오른다. 그
+세그먼트가 플레이어에 보이려면 매니페스트가 갱신되어야 하고, 그 시각은
+`transmux_channel_last_manifest_timestamp_seconds`가 알려준다. 세그먼트 PUT은
+되는데 매니페스트 PUT만 실패하는 상태가 실제로 존재하므로 두 신호를 분리해서
+본다.
 
 ## 알려진 제약과 미구현
 
@@ -171,16 +180,17 @@ PoC 스택에서 실제로 확인한 항목이다.
   세그먼트가 존재함
 - 발행된 스트림이 재생 가능하며 코덱이 h264 그대로임
 - GOP 8초 카메라가 4초 목표에서 8초 세그먼트를 내놓고, 정상으로 판정됨
-- 카메라 단절 시 1/2/4/8/16초 backoff로 재연결, 시퀀스 되돌림 없음,
-  `EXT-X-DISCONTINUITY` 삽입, 유실 0
+- 카메라 단절 시 지수 backoff(full jitter, `[base/2, min(base×factor^n, max)]`)로
+  재연결, 시퀀스 되돌림 없음, `EXT-X-DISCONTINUITY` 삽입, 유실 0
 - 오브젝트 스토어 30초 장애 중 ffmpeg 재시작 없음, 복구 후 스풀에 남은
   세그먼트 전부 업로드, 유실 0
-- SIGTERM 시 남은 세그먼트 flush 후 종료, 좀비 프로세스 0, exit code 0
+- SIGTERM 시 남은 세그먼트를 최대 15초 동안 flush 후 종료(그 안에 스토어가
+  응답하지 않으면 남은 것은 유실로 로깅된다), 좀비 프로세스 0, exit code 0
 - 카메라가 전혀 없는 상태에서 25채널을 띄워도 크래시 없음
 - 컨테이너를 삭제·재생성해 로컬 체크포인트를 잃어도 발행 매니페스트에서 시퀀스를
   복구하고 되돌아가지 않음 (16 → 22, 중복 객체 키 0)
 - 오브젝트 스토어를 읽을 수 없으면 채널이 `failed`로 fail closed 되고 ffmpeg을
-  띄우지 않음
+  띄우지 않음 (로컬 체크포인트가 남아 있어도 동일하다)
 - 채널당 CPU 0.37~0.83% 코어(0.5~4Mbps 실측 4점), 75채널까지 선형 확장,
   ffmpeg 81~84% / supervisor 16~19%
 - 채널당 메모리 13.4~14.3 MiB로 비트레이트에 무관(0.5Mbps와 4Mbps가 동일)

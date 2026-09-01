@@ -63,8 +63,13 @@ func windowToCheckpoint(segs []hls.PublishedSegment) []checkpointEntry {
 	return out
 }
 
+// checkpointPath places each camera under its own center directory.
+//
+// A flat "{center}_{camera}.json" name is not safe: identifiers may contain
+// underscores, so center "a_b" camera "c" and center "a" camera "b_c" would
+// collide on one file and overwrite each other's sequence.
 func checkpointPath(stateDir, centerID, cameraID string) string {
-	return filepath.Join(stateDir, centerID+"_"+cameraID+".json")
+	return filepath.Join(stateDir, centerID, cameraID+".json")
 }
 
 // loadCheckpoint returns a zero checkpoint when none exists. A corrupt file
