@@ -1,0 +1,66 @@
+{
+  "shard_id": "poc-shard-0",
+  "max_channels": 8,
+
+  "spool_dir": "/run/transmux/spool",
+  "state_dir": "/var/lib/transmux/state",
+  "http_listen": ":8080",
+
+  "segment": {
+    "target_duration": "4s",
+    "live_window": 4,
+    "local_list_size": 10,
+    "max_gop_slack": "10s"
+  },
+
+  "ffmpeg": {
+    "binary": "ffmpeg",
+    "rtsp_transport": "tcp",
+    "stall_timeout": "20s",
+    "startup_timeout": "20s",
+    "shutdown_grace": "5s",
+    "scan_interval": "500ms"
+  },
+
+  "storage": {
+    "backend": "s3",
+    "bucket": "transmux-poc",
+    "region": "us-east-1",
+    "endpoint": "http://minio:9000",
+    "force_path_style": true,
+    "manifest_name": "index.m3u8"
+  },
+
+  "upload": {
+    "max_attempts": 3,
+    "retry_base": "200ms",
+    "retry_max": "5s",
+    "max_concurrent": 16,
+    "put_timeout": "15s"
+  },
+
+  "reconnect": {
+    "base": "1s",
+    "max": "30s",
+    "factor": 2.0,
+    "reset_after": "30s"
+  },
+
+  "cameras": {
+    "provider": "static",
+    "poll_interval": "30s",
+    "request_timeout": "10s",
+    "static": [
+      {
+        "center_id": "center-01",
+        "camera_id": "cam-shortgop",
+        "rtsp_url": "rtsp://mediamtx:8554/cam-shortgop"
+      },
+      {
+        "center_id": "center-01",
+        "camera_id": "cam-longgop",
+        "rtsp_url": "rtsp://mediamtx:8554/cam-longgop"
+      }
+    ]
+  }
+}

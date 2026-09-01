@@ -1,0 +1,15 @@
+# Build output. The Makefile builds inside a container and writes to /tmp,
+# so nothing should land here, but keep the guard.
+/transmuxd
+*.test
+*.out
+
+# Local configuration and scratch files produced by the measurement scripts.
+/configs/local*.json
+/tmp/
+
+# Editor and OS noise.
+.DS_Store
+*.swp
+.idea/
+.vscode/

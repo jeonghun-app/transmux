@@ -1,0 +1,176 @@
+# Local PoC stack. Nothing here is production configuration.
+#
+#   cam-shortgop ─┐                              ┌─ MinIO (S3 stand-in)
+#   cam-longgop  ─┴─> MediaMTX (RTSP) ─> transmuxd ─┘
+#
+# The two fake cameras differ in keyframe interval on purpose: cam-shortgop
+# has a 2 s GOP so it can honour the 4 s target, cam-longgop has an 8 s GOP so
+# it cannot. Both must stream correctly.
+
+name: transmux-poc
+
+services:
+  mediamtx:
+    image: bluenviron/mediamtx:1.9.3
+    container_name: transmux-mediamtx
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
+    # No healthcheck: the MediaMTX image is scratch-based and has no shell or
+    # wget to run one with. Dependents use service_started and tolerate the
+    # RTSP server not being ready yet, which is what they must do in
+    # production anyway.
+
+  # A correctly configured camera: 2 s GOP at 25 fps.
+  cam-shortgop:
+    image: transmux:test
+    container_name: transmux-cam-shortgop
+    depends_on:
+      - mediamtx
+    entrypoint: ["ffmpeg"]
+    command:
+      - -hide_banner
+      - -loglevel
+      - warning
+      - -re
+      - -f
+      - lavfi
+      - -i
+      - testsrc2=size=640x360:rate=25
+      - -c:v
+      - libx264
+      - -preset
+      - ultrafast
+      - -tune
+      - zerolatency
+      - -b:v
+      - "1500k"
+      - -g
+      - "50"
+      - -keyint_min
+      - "50"
+      - -sc_threshold
+      - "0"
+      - -an
+      - -f
+      - rtsp
+      - -rtsp_transport
+      - tcp
+      - rtsp://mediamtx:8554/cam-shortgop
+    restart: unless-stopped
+
+  # A badly configured camera: 8 s GOP, so segments come out at ~8 s no
+  # matter what target_duration says. This is the case that must not be
+  # mistaken for a fault.
+  cam-longgop:
+    image: transmux:test
+    container_name: transmux-cam-longgop
+    depends_on:
+      - mediamtx
+    entrypoint: ["ffmpeg"]
+    command:
+      - -hide_banner
+      - -loglevel
+      - warning
+      - -re
+      - -f
+      - lavfi
+      - -i
+      - testsrc2=size=640x360:rate=25
+      - -c:v
+      - libx264
+      - -preset
+      - ultrafast
+      - -tune
+      - zerolatency
+      - -b:v
+      - "1500k"
+      - -g
+      - "200"
+      - -keyint_min
+      - "200"
+      - -sc_threshold
+      - "0"
+      - -an
+      - -f
+      - rtsp
+      - -rtsp_transport
+      - tcp
+      - rtsp://mediamtx:8554/cam-longgop
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    container_name: transmux-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  minio-init:
+    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+    container_name: transmux-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      # Anonymous download is enabled so the verifier can fetch the playlist
+      # with plain HTTP. This is a test-harness convenience only; a real
+      # bucket stays private and is fronted by CloudFront with OAC.
+      - |
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb --ignore-existing local/transmux-poc &&
+        mc anonymous set download local/transmux-poc &&
+        echo "bucket ready"
+
+  transmuxd:
+    image: transmux:latest
+    container_name: transmux-transmuxd
+    depends_on:
+      mediamtx:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - ../configs/poc.json:/etc/transmux/config.json:ro
+    environment:
+      # MinIO credentials. Production uses the ECS task role or EKS IRSA and
+      # leaves these unset.
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_REGION: us-east-1
+    command: ["-config", "/etc/transmux/config.json", "-log-level", "debug"]
+    # The spool is a tmpfs so segments never touch a disk. Size it from
+    # local_list_size x bitrate x channels; see docs/capacity-model.md.
+    tmpfs:
+      - /run/transmux/spool:size=256m,mode=0750,uid=10001,gid=10001
+      - /var/lib/transmux/state:size=16m,mode=0750,uid=10001,gid=10001
+    ports:
+      - "127.0.0.1:8080:8080"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/livez"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Long-lived helper so `make poc-verify` can exec into it.
+  verifier:
+    image: transmux:test
+    container_name: transmux-verifier
+    depends_on:
+      transmuxd:
+        condition: service_healthy
+    volumes:
+      - ./verify.sh:/verify.sh:ro
+    entrypoint: ["sh", "-c", "sleep infinity"]

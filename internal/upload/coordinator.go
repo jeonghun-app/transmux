@@ -1,0 +1,162 @@
+// Package upload puts objects into the store with bounded concurrency and
+// full-jitter retry.
+package upload
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"math/rand"
+	"time"
+
+	"github.com/jeonghun-app/transmux/internal/config"
+	"github.com/jeonghun-app/transmux/internal/metrics"
+	"github.com/jeonghun-app/transmux/internal/storage"
+)
+
+// ErrGaveUp reports that every attempt failed.
+var ErrGaveUp = errors.New("upload exhausted all attempts")
+
+// Coordinator serialises access to the object store.
+//
+// It owns a global semaphore rather than a per-channel one: with several
+// hundred channels, unbounded concurrent PutObject calls would exhaust file
+// descriptors and sockets long before S3 pushed back.
+type Coordinator struct {
+	store storage.ObjectStore
+	cfg   config.UploadConfig
+	sem   chan struct{}
+	reg   *metrics.Registry
+
+	putTotal    *metrics.Metric
+	putFailures *metrics.Metric
+	putRetries  *metrics.Metric
+	putBytes    *metrics.Metric
+	inFlight    *metrics.Metric
+}
+
+func NewCoordinator(store storage.ObjectStore, cfg config.UploadConfig, reg *metrics.Registry) *Coordinator {
+	return &Coordinator{
+		store: store,
+		cfg:   cfg,
+		sem:   make(chan struct{}, cfg.MaxConcurrent),
+		reg:   reg,
+		putTotal: reg.Counter("transmux_object_put_total",
+			"Successful object store PUT operations."),
+		putFailures: reg.Counter("transmux_object_put_failures_total",
+			"Object store PUT operations that failed after all attempts."),
+		putRetries: reg.Counter("transmux_object_put_retries_total",
+			"Individual PUT attempts that failed and were retried."),
+		putBytes: reg.Counter("transmux_object_put_bytes_total",
+			"Total bytes written to the object store."),
+		inFlight: reg.Gauge("transmux_object_put_in_flight",
+			"Object store PUT operations currently in flight."),
+	}
+}
+
+// Store exposes the backing store description for health output.
+func (c *Coordinator) Store() storage.ObjectStore { return c.store }
+
+// Put uploads one object, retrying with full jitter.
+//
+// The same key is reused across attempts so a retry after an ambiguous
+// failure simply overwrites identical bytes. Generating a fresh key per
+// attempt would leave orphaned objects that no manifest references.
+func (c *Coordinator) Put(ctx context.Context, obj storage.Object) error {
+	select {
+	case c.sem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-c.sem }()
+
+	c.inFlight.Add(1)
+	defer c.inFlight.Add(-1)
+
+	var lastErr error
+	for attempt := 1; attempt <= c.cfg.MaxAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.PutTimeout.Duration)
+		err := c.store.Put(attemptCtx, obj)
+		cancel()
+		if err == nil {
+			c.putTotal.Inc()
+			c.putBytes.Add(float64(len(obj.Body)))
+			return nil
+		}
+		lastErr = err
+		// A cancelled parent context means shutdown, not a transient fault.
+		if ctx.Err() != nil {
+			c.putFailures.Inc()
+			return fmt.Errorf("upload %s cancelled: %w", obj.Key, ctx.Err())
+		}
+		if attempt < c.cfg.MaxAttempts {
+			c.putRetries.Inc()
+			if !sleepCtx(ctx, c.backoff(attempt)) {
+				c.putFailures.Inc()
+				return fmt.Errorf("upload %s cancelled: %w", obj.Key, ctx.Err())
+			}
+		}
+	}
+	c.putFailures.Inc()
+	return fmt.Errorf("%w after %d attempts for %s: %v",
+		ErrGaveUp, c.cfg.MaxAttempts, obj.Key, lastErr)
+}
+
+// Get reads an object, retrying transient failures. ErrNotFound is returned
+// immediately: a missing key is an answer, not a fault.
+func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
+	select {
+	case c.sem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-c.sem }()
+
+	var lastErr error
+	for attempt := 1; attempt <= c.cfg.MaxAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.PutTimeout.Duration)
+		body, err := c.store.Get(attemptCtx, key)
+		cancel()
+		if err == nil {
+			return body, nil
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, err
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if attempt < c.cfg.MaxAttempts {
+			if !sleepCtx(ctx, c.backoff(attempt)) {
+				return nil, ctx.Err()
+			}
+		}
+	}
+	return nil, fmt.Errorf("%w after %d attempts for %s: %v",
+		ErrGaveUp, c.cfg.MaxAttempts, key, lastErr)
+}
+
+// backoff returns a full-jitter delay. Full jitter rather than plain
+// exponential matters here: several hundred channels failing at the same
+// instant would otherwise retry in lockstep.
+func (c *Coordinator) backoff(attempt int) time.Duration {
+	base := float64(c.cfg.RetryBase.Duration)
+	capped := math.Min(base*math.Pow(2, float64(attempt-1)), float64(c.cfg.RetryMax.Duration))
+	return time.Duration(rand.Int63n(int64(capped) + 1))
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}

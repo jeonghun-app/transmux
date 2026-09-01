@@ -1,0 +1,31 @@
+# MediaMTX stands in for the IP cameras. The fake camera containers publish
+# to it over RTSP and transmuxd pulls from it, so the RTSP leg of the
+# pipeline is genuinely exercised without any hardware.
+logLevel: info
+# The key is "protocols" in MediaMTX 1.9.x; it was renamed to
+# "rtspTransports" in later releases, so this file tracks the pinned image.
+protocols: [tcp, udp]
+rtspAddress: :8554
+
+# No HLS, WebRTC or SRT: transmuxd is the only consumer and leaving the other
+# servers on would confuse what is under test.
+hls: no
+webrtc: no
+srt: no
+rtmp: no
+api: yes
+apiAddress: :9997
+
+paths:
+  # publishUser/publishPass are omitted deliberately: this stack is local
+  # only and never exposed. Production cameras use credentials, which
+  # transmuxd redacts from all logs and API output.
+  cam-shortgop:
+  cam-longgop:
+  # Used by scripts/measure-capacity.sh to check how per-channel memory
+  # scales with bitrate.
+  cam-1080p:
+  # Wildcard so scripts/measure-cpu.sh can create one independent RTSP
+  # session per fake camera, which is closer to real cameras than many
+  # readers sharing a single published stream.
+  all_others:
