@@ -87,6 +87,17 @@ type Worker struct {
 	// gauges, which would otherwise run on every tick for every channel.
 	spoolStatsAt time.Time
 
+	// manifestETag is the version of the published manifest this worker last
+	// wrote or fenced. Every manifest write is conditional on it, so a worker
+	// that has been taken over discovers it on its next publish instead of
+	// clobbering the new owner's timeline.
+	manifestETag string
+	// lease is this worker's claim on the camera. It gates starting ffmpeg;
+	// the manifest ETag is what actually fences writes.
+	lease *leaseHolder
+	// session identifies this process incarnation for lease ownership.
+	session string
+
 	// prevGen carries the previous generation's drain bookkeeping so its
 	// spool can be flushed once more before it is discarded.
 	prevGen *drainState
@@ -113,24 +124,35 @@ type Worker struct {
 	mSpoolFiles   *metrics.Metric
 	mSpoolBytes   *metrics.Metric
 	mSpoolOldest  *metrics.Metric
+
+	mLeaseHeld        *metrics.Metric
+	mLeaseContended   *metrics.Metric
+	mLeaseAcquireFail *metrics.Metric
+	mLeaseRenewFail   *metrics.Metric
+	mLeaseLost        *metrics.Metric
+	mLeaseReleaseFail *metrics.Metric
+	mManifestConflict *metrics.Metric
+	mSegmentConflict  *metrics.Metric
 }
 
 // ObjectClient is the subset of the upload coordinator the worker needs.
 //
-// Get is required for sequence recovery: on startup a worker reads its own
-// published manifest to learn where to resume.
+// Get returns the ETag as well as the body because the ETag is the token that
+// makes the next write conditional, which is how a stale writer is fenced out
+// of a channel it no longer owns.
 //
 // PutFile exists so the segment body is read only once a concurrency slot has
 // been granted. Reading in the worker and then queueing would make resident
 // segment bytes scale with channel count instead of with upload concurrency.
 type ObjectClient interface {
-	Put(ctx context.Context, obj storage.Object) error
-	PutFile(ctx context.Context, obj storage.Object, srcPath string) (int64, error)
-	Get(ctx context.Context, key string) ([]byte, error)
+	Put(ctx context.Context, obj storage.Object) (string, error)
+	PutFile(ctx context.Context, obj storage.Object, srcPath string) (int64, string, error)
+	Get(ctx context.Context, key string) ([]byte, string, error)
+	Head(ctx context.Context, key string) (storage.ObjectInfo, error)
 }
 
 // NewWorker constructs a worker. It does not start anything.
-func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metrics.Registry, log *slog.Logger) *Worker {
+func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metrics.Registry, log *slog.Logger, session string) *Worker {
 	labels := []metrics.Label{
 		{Name: "center_id", Value: cam.CenterID},
 		{Name: "camera_id", Value: cam.CameraID},
@@ -138,6 +160,7 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 	w := &Worker{
 		cam:       cam,
 		cfg:       cfg,
+		session:   session,
 		log:       log.With("center_id", cam.CenterID, "camera_id", cam.CameraID),
 		uploader:  up,
 		reg:       reg,
@@ -186,6 +209,26 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 			"Segment files currently waiting on the spool.", labels...),
 		mSpoolBytes: reg.Gauge("transmux_channel_spool_bytes",
 			"Bytes currently waiting on the spool. Sum across channels to size the tmpfs.", labels...),
+		mLeaseHeld: reg.Gauge("transmux_channel_lease_held",
+			"1 while this shard owns the camera and may publish.", labels...),
+		mLeaseContended: reg.Counter("transmux_channel_lease_contended_total",
+			"Times another shard was found holding a live lease. Expected during a "+
+				"rolling deploy; sustained growth means two shards want the same camera.", labels...),
+		mLeaseAcquireFail: reg.Counter("transmux_channel_lease_acquire_failures_total",
+			"Ownership could not be determined because the object store did not answer.", labels...),
+		mLeaseRenewFail: reg.Counter("transmux_channel_lease_renew_failures_total",
+			"Lease renewals that failed transiently and were retried.", labels...),
+		mLeaseLost: reg.Counter("transmux_channel_lease_lost_total",
+			"Times this shard lost the camera to another owner, or ran past its own "+
+				"lease deadline. The channel stops publishing.", labels...),
+		mLeaseReleaseFail: reg.Counter("transmux_channel_lease_release_failures_total",
+			"Clean releases that failed; the lease expires on its own instead.", labels...),
+		mManifestConflict: reg.Counter("transmux_channel_manifest_conflicts_total",
+			"Manifest writes refused because another writer had changed it. Any nonzero "+
+				"value means two processes tried to publish this camera.", labels...),
+		mSegmentConflict: reg.Counter("transmux_channel_segment_conflicts_total",
+			"Segment keys that already held another writer's object. This is the "+
+				"cache-poisoning case the ownership protocol exists to prevent.", labels...),
 		mSpoolOldest: reg.Gauge("transmux_channel_spool_oldest_seconds",
 			"Age of the oldest segment waiting on the spool. It approaches "+
 				"local_list_size x segment length when the object store is failing, and "+
@@ -234,6 +277,12 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 		w.log.Info("checkpoint loaded, pending validation against the published manifest",
 			"last_sequence", cp.LastSequence)
 	}
+	w.lease = newLeaseHolder(up, w.objectKey(LeaseObjectName), cam.Key(), cfg.ShardID, session,
+		leaseTuning{
+			TTL:           cfg.Lease.TTL.Duration,
+			RenewInterval: cfg.Lease.RenewInterval.Duration,
+			MaxClockSkew:  cfg.Lease.MaxClockSkew.Duration,
+		})
 	return w
 }
 
@@ -249,15 +298,17 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 //	                    discontinuity
 //	manifest absent     new channel; if a checkpoint exists its sequence
 //	                    still stands, because those keys were used
-//	read failed         fail closed; the history is unknown and starting
-//	                    below it could overwrite live segments
-//	manifest foreign    fail closed; it belongs to another writer
+//	read failed         nothing published yet, so retry; the channel waits
+//	                    rather than failing permanently
+//	manifest foreign    fail closed; it belongs to another writer and only an
+//	                    operator can decide what that means
 func (w *Worker) recover(ctx context.Context) error {
 	key := w.objectKey(w.cfg.Storage.ManifestName)
-	body, err := w.uploader.Get(ctx, key)
+	body, etag, err := w.uploader.Get(ctx, key)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			w.mu.Lock()
+			w.manifestETag = ""
 			floor := w.checkpointFloor
 			// The window came from the checkpoint and no manifest references
 			// it any more. Republishing it could point players at objects a
@@ -276,7 +327,11 @@ func (w *Worker) recover(ctx context.Context) error {
 			}
 			return nil
 		}
-		return fmt.Errorf("recover sequence from %s: %w", key, err)
+		// The store did not answer. Ownership and history are both unknown,
+		// but nothing has been published, so this is safe to retry: a
+		// transient outage at startup must not permanently disable every
+		// channel on the shard and require an operator.
+		return fmt.Errorf("%w: recover sequence from %s: %v", ErrLeaseUnavailable, key, err)
 	}
 
 	pub, err := hls.ParsePublished(body)
@@ -287,6 +342,7 @@ func (w *Worker) recover(ctx context.Context) error {
 	}
 
 	w.mu.Lock()
+	w.manifestETag = etag
 	w.lastSequence = pub.MaxSequence
 	w.discontinuitySequence = pub.DiscontinuitySequence
 	w.window = pub.Window
@@ -401,31 +457,41 @@ func (w *Worker) Run(ctx context.Context) {
 		w.log.Info("channel stopped")
 	}()
 
-	// Establish the starting sequence before any ffmpeg runs. Publishing with
-	// an unknown sequence risks overwriting segments that are already live.
-	w.mu.RLock()
-	need := w.needsRecovery
-	w.mu.RUnlock()
-	if need {
-		if err := w.recover(ctx); err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			// Fail closed. One silent channel is recoverable by an operator;
-			// a rewound sequence corrupts the stream for every viewer and is
-			// not.
-			w.log.Error("channel disabled: cannot establish a safe starting sequence", "error", err)
-			w.setError(err)
-			w.setState(StateFailed)
-			w.mFailed.Inc()
-			<-ctx.Done()
-			return
-		}
+	// Ownership first, then sequence, then ffmpeg. Each step is a gate:
+	//
+	//	1. Take the lease, so a second shard does not start a second ffmpeg
+	//	   for this camera.
+	//	2. Read the manifest to learn where to resume.
+	//	3. Fence: rewrite the manifest conditionally on the version just read.
+	//	   This is the step that actually revokes a previous owner's ability to
+	//	   write, and it is why the lease alone is not enough -- acquiring a
+	//	   lease cannot stop a frozen process from waking up and writing.
+	//	4. Only now start ffmpeg.
+	if !w.takeOwnership(ctx) {
+		return
 	}
+
+	// The renewal goroutine outlives individual ffmpeg generations: ownership
+	// belongs to the worker, not to a single pipeline run. Losing it cancels
+	// ownedCtx, which unwinds everything below.
+	ownedCtx, ownershipLost := context.WithCancel(ctx)
+	defer ownershipLost()
+	go w.runLeaseRenewal(ownedCtx, ownershipLost)
+	defer w.releaseLease()
 
 	generation := 0
 	for {
 		if ctx.Err() != nil {
+			return
+		}
+		if ownedCtx.Err() != nil {
+			// Ownership is gone. Do not reconnect, do not drain: another shard
+			// is publishing this camera now and our spool belongs to a
+			// timeline that is no longer authoritative.
+			w.log.Error("channel disabled: ownership of the published stream was lost")
+			w.setState(StateFailed)
+			w.mFailed.Inc()
+			<-ctx.Done()
 			return
 		}
 		generation++
@@ -439,8 +505,16 @@ func (w *Worker) Run(ctx context.Context) {
 			w.mu.Unlock()
 		}
 
-		err := w.runGeneration(ctx, generation)
+		err := w.runGeneration(ownedCtx, generation)
 		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, ErrLeaseLost) {
+			w.log.Error("channel disabled: another shard owns the published stream", "error", err)
+			w.setError(err)
+			w.setState(StateFailed)
+			w.mFailed.Inc()
+			<-ctx.Done()
 			return
 		}
 		if err != nil {
@@ -462,6 +536,209 @@ func (w *Worker) Run(ctx context.Context) {
 		w.log.Info("reconnecting", "delay", delay.String(), "attempt", w.bo.Attempt())
 		if !sleepCtx(ctx, delay) {
 			return
+		}
+	}
+}
+
+// takeOwnership runs the acquire-recover-fence sequence, retrying while the
+// camera is legitimately held elsewhere. It reports whether the worker may
+// proceed to start ffmpeg.
+func (w *Worker) takeOwnership(ctx context.Context) bool {
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		err := w.claim(ctx)
+		switch {
+		case err == nil:
+			return true
+
+		case errors.Is(err, ErrLeaseHeld):
+			// Expected during a rolling deploy: the previous task still owns
+			// the camera and is still serving it. Waiting is correct, and this
+			// is not an operator's problem, so it must not be StateFailed.
+			w.mLeaseContended.Inc()
+			w.setState(StateWaitingOwnership)
+			w.log.Info("camera owned by another shard, waiting", "error", err)
+			if !sleepCtx(ctx, w.cfg.Lease.RenewInterval.Duration) {
+				return false
+			}
+
+		case ctx.Err() != nil:
+			return false
+
+		case errors.Is(err, ErrLeaseUnavailable):
+			// The store could not be consulted, so ownership is unknown. No
+			// publication has been attempted, so retrying is safe -- unlike a
+			// foreign manifest, nothing has been assumed about history.
+			w.mLeaseAcquireFail.Inc()
+			w.setState(StateWaitingOwnership)
+			w.setError(err)
+			w.log.Error("cannot establish camera ownership, retrying", "error", err)
+			if !sleepCtx(ctx, w.cfg.Lease.RenewInterval.Duration) {
+				return false
+			}
+
+		default:
+			// Fail closed. One silent channel is recoverable by an operator;
+			// a rewound sequence or a contested manifest corrupts the stream
+			// for every viewer and is not.
+			w.log.Error("channel disabled: cannot establish safe ownership of the published stream",
+				"error", err)
+			w.setError(err)
+			w.setState(StateFailed)
+			w.mFailed.Inc()
+			<-ctx.Done()
+			return false
+		}
+	}
+}
+
+// releaseLease hands the camera back so a successor need not wait out the TTL.
+// A fresh context is used because the worker's own is already cancelled by the
+// time this runs, and failure is tolerable: expiry is the fallback.
+func (w *Worker) releaseLease() {
+	ctx, cancel := context.WithTimeout(context.Background(), w.cfg.Lease.OperationTimeout.Duration)
+	defer cancel()
+	if err := w.lease.Release(ctx); err != nil {
+		w.mLeaseReleaseFail.Inc()
+		w.log.Warn("lease release failed; it will expire on its own", "error", err)
+	}
+	w.mLeaseHeld.Set(0)
+}
+
+// ErrLeaseUnavailable reports that ownership could not be determined because
+// the object store did not answer. It is retryable; not knowing is different
+// from knowing someone else owns the camera.
+var ErrLeaseUnavailable = errors.New("camera ownership could not be determined")
+
+// claim acquires the lease, recovers the sequence, and fences the manifest.
+func (w *Worker) claim(ctx context.Context) error {
+	leaseCtx, cancel := context.WithTimeout(ctx, w.cfg.Lease.OperationTimeout.Duration)
+	err := w.lease.Acquire(leaseCtx)
+	cancel()
+	switch {
+	case errors.Is(err, ErrLeaseHeld):
+		return err
+	case err != nil:
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("%w: %v", ErrLeaseUnavailable, err)
+	}
+	w.mLeaseHeld.Set(1)
+	w.log.Info("camera lease acquired", "key", w.objectKey(LeaseObjectName))
+
+	w.mu.RLock()
+	need := w.needsRecovery
+	w.mu.RUnlock()
+	if need {
+		if err := w.recover(ctx); err != nil {
+			return err
+		}
+	}
+	return w.fenceManifest(ctx)
+}
+
+// fenceManifest is what actually transfers publication ownership.
+//
+// A lease says who should be publishing; it cannot stop a process that froze
+// with a valid compare-and-swap token from waking up and using it. Consider
+// two shards that both read manifest version E: A stalls, its lease expires,
+// B acquires the lease and reads E. If B simply started publishing, A could
+// wake and write conditionally on E successfully, and B's own write would then
+// be the one rejected -- the stale writer would have fenced the live one.
+//
+// So the new owner rewrites the manifest first, conditional on the exact
+// version it recovered from. The body carries a fresh write ID, which
+// guarantees a different ETag even when the playlist entries are unchanged.
+// Once that write lands, E is spent: every write A still has queued fails.
+// ffmpeg does not start until this succeeds.
+func (w *Worker) fenceManifest(ctx context.Context) error {
+	w.mu.RLock()
+	window := make([]hls.PublishedSegment, len(w.window))
+	copy(window, w.window)
+	discSeq := w.discontinuitySequence
+	expected := w.manifestETag
+	w.mu.RUnlock()
+
+	etag, err := w.writeManifest(ctx, window, discSeq, manifestPrecondition(expected))
+	if err != nil {
+		if errors.Is(err, storage.ErrPreconditionFailed) {
+			// Someone published between our read and our fence. Their write is
+			// now the authority: re-read and fence again rather than assuming
+			// anything about the sequence.
+			w.mManifestConflict.Inc()
+			w.log.Warn("manifest changed under us while fencing, re-reading")
+			w.mu.Lock()
+			w.needsRecovery = true
+			w.mu.Unlock()
+			return fmt.Errorf("%w: manifest changed while fencing", ErrLeaseUnavailable)
+		}
+		return fmt.Errorf("fence manifest: %w", err)
+	}
+	w.mu.Lock()
+	w.manifestETag = etag
+	w.mu.Unlock()
+	w.log.Info("published stream fenced, this shard is now the writer")
+	return nil
+}
+
+// manifestPrecondition never yields an unconditional write.
+//
+// An empty expected ETag means "no manifest existed when we looked", so the
+// write must claim the key rather than overwrite whatever appeared since. An
+// unconditional manifest write is precisely the bug this protocol removes, so
+// there is no code path that produces one.
+func manifestPrecondition(expected string) storage.Preconditions {
+	if expected == "" {
+		return storage.Preconditions{IfNoneMatch: true}
+	}
+	return storage.Preconditions{IfMatch: expected}
+}
+
+// runLeaseRenewal keeps the lease alive for as long as the worker owns the
+// camera. It signals loss by cancelling lost.
+func (w *Worker) runLeaseRenewal(ctx context.Context, lost context.CancelFunc) {
+	t := time.NewTicker(w.cfg.Lease.RenewInterval.Duration)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			opCtx, cancel := context.WithTimeout(ctx, w.cfg.Lease.OperationTimeout.Duration)
+			err := w.lease.Renew(opCtx)
+			cancel()
+			switch {
+			case err == nil:
+				continue
+			case errors.Is(err, ErrLeaseLost):
+				// Another shard took over. Stop immediately; the manifest
+				// fence would reject our writes anyway, but ffmpeg must not
+				// keep running and spooling for a camera we do not own.
+				w.mLeaseLost.Inc()
+				w.mLeaseHeld.Set(0)
+				w.setError(err)
+				w.log.Error("camera lease lost to another owner, stopping", "error", err)
+				lost()
+				return
+			case ctx.Err() != nil:
+				return
+			default:
+				// Transient. Keep trying, but only while we are still inside
+				// our own safety deadline: publishing past it would risk two
+				// live owners.
+				w.mLeaseRenewFail.Inc()
+				w.log.Warn("lease renewal failed, will retry", "error", err)
+				if w.lease.Expired() {
+					w.mLeaseLost.Inc()
+					w.mLeaseHeld.Set(0)
+					w.log.Error("lease deadline passed without a successful renewal, stopping")
+					lost()
+					return
+				}
+			}
 		}
 	}
 }
@@ -505,7 +782,12 @@ func (w *Worker) runGeneration(ctx context.Context, generation int) error {
 	}
 	// Stop is idempotent and safe after a natural exit, so this covers both
 	// the cancellation path and the error paths below.
-	defer proc.Stop(w.cfg.FFmpeg.ShutdownGrace.Duration)
+	defer func() {
+		proc.Stop(w.cfg.FFmpeg.ShutdownGrace.Duration)
+		w.mu.Lock()
+		w.snap.PID = 0
+		w.mu.Unlock()
+	}()
 
 	w.mu.Lock()
 	w.snap.State = StateStarting
@@ -549,6 +831,12 @@ func (w *Worker) runGeneration(ctx context.Context, generation int) error {
 		case <-ticker.C:
 			res, err := w.drain(ctx, gen)
 			if err != nil {
+				if errors.Is(err, ErrLeaseLost) {
+					// Not a transient upload fault: someone else is the
+					// writer. Stop the pipeline instead of retrying forever.
+					proc.Stop(w.cfg.FFmpeg.ShutdownGrace.Duration)
+					return err
+				}
 				w.log.Warn("drain error", "error", err)
 				w.setError(err)
 			}
@@ -588,6 +876,11 @@ func (w *Worker) runGeneration(ctx context.Context, generation int) error {
 // finalDrain flushes the spool after ffmpeg has exited, on a bounded context
 // so shutdown cannot hang on a slow object store.
 func (w *Worker) finalDrain(gen *drainState) {
+	if w.lease.Expired() {
+		// Publishing here would race whoever took the camera over.
+		w.log.Warn("skipping final drain: this shard no longer owns the channel")
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalDrainTimeout)
 	defer cancel()
 	// This is the last chance to publish, so the manifest retry rate limit
@@ -620,7 +913,7 @@ func (w *Worker) flushPreviousGeneration(ctx context.Context) {
 	}
 	gen := w.prevGen
 	w.prevGen = nil
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || w.lease.Expired() {
 		return
 	}
 	drainCtx, cancel := context.WithTimeout(ctx, finalDrainTimeout)
@@ -858,7 +1151,14 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment) error
 		fmt.Sprintf("seg-%09d-%d.ts", seqNo, pdt.UTC().UnixMilli()))
 	key := w.objectKey(relURI)
 
-	size, err := w.uploader.PutFile(ctx, storage.Object{
+	// The write identity must be stable across retries of the same segment,
+	// or a store hiccup would make our own landed write look like a foreign
+	// one and fail the channel closed. It is derived from the owner session
+	// and the sequence, both of which are fixed for a given segment: a retry
+	// recomputes the same sequence because a failed publish does not advance
+	// it, while a different owner necessarily has a different session.
+	putID := w.session + ":" + strconv.FormatUint(seqNo, 10)
+	size, _, err := w.uploader.PutFile(ctx, storage.Object{
 		Key:         key,
 		ContentType: hls.ContentTypeSegment,
 		// Segments are immutable, so they can be cached indefinitely.
@@ -867,6 +1167,9 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment) error
 		// re-reading every object. The duration in particular cannot be
 		// recovered from the key: inferring it from the next segment's
 		// timestamp is wrong across a camera disconnect.
+		//
+		// put-id identifies the writer and sequence, so an ambiguous timeout
+		// can be resolved without overwriting a segment somebody else stored.
 		Metadata: map[string]string{
 			"sequence":      strconv.FormatUint(seqNo, 10),
 			"pdt-ms":        strconv.FormatInt(pdt.UTC().UnixMilli(), 10),
@@ -874,14 +1177,31 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment) error
 			"discontinuity": strconv.FormatBool(disc),
 			"center-id":     w.cam.CenterID,
 			"camera-id":     w.cam.CameraID,
+			"put-id":        putID,
 		},
+		// Create-only. A segment key is immutable and cached for a year, so
+		// overwriting one is cache poisoning rather than a correction. If the
+		// key already exists, either this is our own retry after an ambiguous
+		// success, or another writer produced a different body under the same
+		// key -- and those must not be confused.
+		Preconditions: storage.Preconditions{IfNoneMatch: true},
 	}, filepath.Join(w.spoolDir, seg.Name))
 	if err != nil {
 		// A vanished file is loss, not an upload failure; the caller counts it.
-		if !errors.Is(err, fs.ErrNotExist) {
-			w.recordSegmentFailure(err)
+		if errors.Is(err, fs.ErrNotExist) {
+			return err
 		}
-		return err
+		if errors.Is(err, storage.ErrPreconditionFailed) {
+			resolved, rerr := w.resolveSegmentConflict(ctx, key, putID)
+			if rerr != nil {
+				w.recordSegmentFailure(rerr)
+				return rerr
+			}
+			size = resolved
+		} else {
+			w.recordSegmentFailure(err)
+			return err
+		}
 	}
 
 	published := hls.PublishedSegment{
@@ -927,25 +1247,60 @@ func (w *Worker) publishSegment(ctx context.Context, seg hls.LocalSegment) error
 	return nil
 }
 
+// resolveSegmentConflict decides what a refused create means.
+//
+// Two cases produce it and they demand opposite responses. If the stored
+// object carries our own put-id, our earlier attempt landed and only the
+// response was lost: adopt it. If it carries anything else, a different writer
+// put different bytes under a key we consider ours, which means two shards are
+// publishing the same camera. That is the failure the whole ownership protocol
+// exists to prevent, and continuing would put a segment in the manifest that
+// is not the one we produced.
+func (w *Worker) resolveSegmentConflict(ctx context.Context, key, putID string) (int64, error) {
+	info, err := w.uploader.Head(ctx, key)
+	if err != nil {
+		return 0, fmt.Errorf("segment %s already exists and could not be inspected: %w", key, err)
+	}
+	if info.Metadata["put-id"] == putID {
+		w.log.Warn("segment upload reported a conflict but our own write had landed",
+			"key", key, "bytes", info.Size)
+		return info.Size, nil
+	}
+	w.mSegmentConflict.Inc()
+	return 0, fmt.Errorf("%w: segment %s was written by another owner (put-id %q)",
+		ErrLeaseLost, key, info.Metadata["put-id"])
+}
+
 // publishManifest renders and uploads the live playlist, then checkpoints.
+//
+// The write is conditional on the manifest version this worker last wrote or
+// fenced. That condition is the ownership check on the hot path: if another
+// shard has taken the channel over, this write is refused and the worker knows
+// to stop rather than overwrite the new owner's timeline.
 func (w *Worker) publishManifest(ctx context.Context) error {
 	w.mu.RLock()
 	window := make([]hls.PublishedSegment, len(w.window))
 	copy(window, w.window)
 	discSeq := w.discontinuitySequence
 	lastSeq := w.lastSequence
+	expected := w.manifestETag
 	w.mu.RUnlock()
 
-	body := hls.RenderLive(window, discSeq)
-	key := w.objectKey(w.cfg.Storage.ManifestName)
-	if err := w.uploader.Put(ctx, storage.Object{
-		Key:         key,
-		Body:        body,
-		ContentType: hls.ContentTypeManifest,
-		// The manifest is mutable and must never be cached by a CDN or
-		// browser, otherwise viewers stall on a stale window.
-		CacheControl: "no-cache, max-age=0",
-	}); err != nil {
+	// Refuse to publish past our own ownership deadline. If the store has
+	// stopped answering renewals, another shard may already have taken over.
+	if w.lease.Expired() {
+		err := fmt.Errorf("%w: refusing to publish past the lease deadline", ErrLeaseLost)
+		w.recordManifestFailure(err)
+		return err
+	}
+
+	etag, err := w.writeManifest(ctx, window, discSeq, manifestPrecondition(expected))
+	if err != nil {
+		if errors.Is(err, storage.ErrPreconditionFailed) {
+			w.mManifestConflict.Inc()
+			w.recordManifestFailure(err)
+			return fmt.Errorf("%w: manifest was overwritten by another writer", ErrLeaseLost)
+		}
 		w.recordManifestFailure(err)
 		return err
 	}
@@ -954,6 +1309,7 @@ func (w *Worker) publishManifest(ctx context.Context) error {
 	w.manifestDirty = false
 	now := time.Now()
 	w.mu.Lock()
+	w.manifestETag = etag
 	w.lastManifestAt = now
 	w.mu.Unlock()
 	w.mManifestTS.Set(float64(now.Unix()))
@@ -969,6 +1325,48 @@ func (w *Worker) publishManifest(ctx context.Context) error {
 		w.log.Warn("checkpoint write failed", "error", err)
 	}
 	return nil
+}
+
+// writeManifest renders and stores one manifest version, resolving an
+// ambiguous outcome by reading back rather than retrying.
+//
+// A conditional write cannot be retried blindly: if the first attempt landed
+// and only the response was lost, the retry sees its own precondition already
+// consumed and reports a conflict that never happened. The write ID in the
+// body is what distinguishes "my write landed" from "someone else wrote".
+func (w *Worker) writeManifest(ctx context.Context, window []hls.PublishedSegment,
+	discSeq uint64, pre storage.Preconditions) (string, error) {
+
+	writeID := newID()
+	body := hls.RenderLive(window, discSeq, writeID)
+	key := w.objectKey(w.cfg.Storage.ManifestName)
+
+	etag, err := w.uploader.Put(ctx, storage.Object{
+		Key:         key,
+		Body:        body,
+		ContentType: hls.ContentTypeManifest,
+		// The manifest is mutable and must never be cached by a CDN or
+		// browser, otherwise viewers stall on a stale window.
+		CacheControl:  "no-cache, max-age=0",
+		Preconditions: pre,
+	})
+	if err == nil {
+		return etag, nil
+	}
+	if errors.Is(err, storage.ErrPreconditionFailed) || ctx.Err() != nil {
+		return "", err
+	}
+	// Ambiguous. Read back: if the stored manifest carries our write ID, the
+	// write landed and we own the resulting version.
+	stored, storedETag, gerr := w.uploader.Get(ctx, key)
+	if gerr != nil {
+		return "", err
+	}
+	if pub, perr := hls.ParsePublished(stored); perr == nil && pub.WriteID == writeID {
+		w.log.Warn("manifest write reported an error but landed; adopting it", "error", err)
+		return storedETag, nil
+	}
+	return "", err
 }
 
 // objectKey builds the full key from the configured prefix and the spec's

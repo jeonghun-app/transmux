@@ -23,6 +23,13 @@ const (
 	// safely, for example when its starting media sequence is unknown. It
 	// requires operator intervention and is never retried automatically.
 	StateFailed State = "failed"
+	// StateWaitingOwnership means another shard currently owns this camera, or
+	// ownership could not be determined. ffmpeg is not running.
+	//
+	// It is deliberately not StateFailed: during a rolling deploy the outgoing
+	// task legitimately still owns the camera and is still serving it, so this
+	// resolves on its own and needs no operator.
+	StateWaitingOwnership State = "waiting_ownership"
 )
 
 // stateCode maps a state to a numeric value for the metrics gauge, since
@@ -43,6 +50,8 @@ func stateCode(s State) float64 {
 		return 6
 	case StateFailed:
 		return 7
+	case StateWaitingOwnership:
+		return 8
 	default:
 		return 0
 	}
@@ -71,10 +80,10 @@ type Snapshot struct {
 
 	LastSequence uint64 `json:"last_sequence"`
 
-	LastSegmentAt      *time.Time `json:"last_segment_at,omitempty"`
-	SecondsSinceSegment *float64  `json:"seconds_since_segment,omitempty"`
-	LastErrorAt        *time.Time `json:"last_error_at,omitempty"`
-	LastError          string     `json:"last_error,omitempty"`
+	LastSegmentAt       *time.Time `json:"last_segment_at,omitempty"`
+	SecondsSinceSegment *float64   `json:"seconds_since_segment,omitempty"`
+	LastErrorAt         *time.Time `json:"last_error_at,omitempty"`
+	LastError           string     `json:"last_error,omitempty"`
 
 	StartedAt time.Time `json:"started_at"`
 }

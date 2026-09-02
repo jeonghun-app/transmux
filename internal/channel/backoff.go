@@ -15,9 +15,9 @@ import (
 // otherwise reset the backoff on every attempt and reconnect in a tight
 // loop.
 type backoff struct {
-	cfg      config.ReconnectConfig
-	attempt  int
-	rng      *rand.Rand
+	cfg     config.ReconnectConfig
+	attempt int
+	rng     *rand.Rand
 }
 
 func newBackoff(cfg config.ReconnectConfig, seed int64) *backoff {

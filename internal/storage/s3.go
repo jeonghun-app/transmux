@@ -74,9 +74,9 @@ func NewS3Store(ctx context.Context, cfg config.StorageConfig) (*S3Store, error)
 
 func (s *S3Store) Describe() string { return s.describe }
 
-func (s *S3Store) Put(ctx context.Context, obj Object) error {
+func (s *S3Store) Put(ctx context.Context, obj Object) (string, error) {
 	if err := validateKey(obj.Key); err != nil {
-		return err
+		return "", err
 	}
 	in := &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
@@ -93,10 +93,33 @@ func (s *S3Store) Put(ctx context.Context, obj Object) error {
 	if len(obj.Metadata) > 0 {
 		in.Metadata = obj.Metadata
 	}
-	if _, err := s.client.PutObject(ctx, in); err != nil {
-		return fmt.Errorf("s3 put %s: %w", obj.Key, redactRequestID(err))
+	// Conditional writes are what make single-writer ownership enforceable.
+	// If-None-Match claims a key that must not already exist; If-Match is a
+	// compare-and-swap against the version this caller last observed.
+	if obj.Preconditions.IfNoneMatch {
+		in.IfNoneMatch = aws.String("*")
+	} else if obj.Preconditions.IfMatch != "" {
+		in.IfMatch = aws.String(obj.Preconditions.IfMatch)
 	}
-	return nil
+	out, err := s.client.PutObject(ctx, in)
+	if err != nil {
+		if isPreconditionFailed(err) {
+			return "", fmt.Errorf("%w: %s", ErrPreconditionFailed, obj.Key)
+		}
+		return "", fmt.Errorf("s3 put %s: %w", obj.Key, redactRequestID(err))
+	}
+	return aws.ToString(out.ETag), nil
+}
+
+// isPreconditionFailed recognises a refused conditional write. The typed error
+// differs between S3 and S3-compatible gateways, so the HTTP status is the
+// reliable signal.
+func isPreconditionFailed(err error) bool {
+	var respErr *awshttp.ResponseError
+	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == 412 {
+		return true
+	}
+	return false
 }
 
 // Get reads an object, mapping a missing key to ErrNotFound.
@@ -105,35 +128,65 @@ func (s *S3Store) Put(ctx context.Context, obj Object) error {
 // sequence from the manifest already in the store. Without it, a container
 // replacement that loses the local checkpoint would restart the sequence at
 // zero, rewinding EXT-X-MEDIA-SEQUENCE and breaking every player.
-func (s *S3Store) Get(ctx context.Context, key string) ([]byte, error) {
+//
+// The ETag is returned because it is the token the caller needs to write the
+// next version conditionally, which is how a stale writer is fenced out.
+func (s *S3Store) Get(ctx context.Context, key string) ([]byte, string, error) {
 	if err := validateKey(key); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	out, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		var nsk *s3types.NoSuchKey
-		var nf *s3types.NotFound
-		if errors.As(err, &nsk) || errors.As(err, &nf) {
-			return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
+		if isNotFound(err) {
+			return nil, "", fmt.Errorf("%w: %s", ErrNotFound, key)
 		}
-		// MinIO and some gateways answer a missing key with a bare 404
-		// rather than a typed error.
-		var respErr *awshttp.ResponseError
-		if errors.As(err, &respErr) && respErr.HTTPStatusCode() == 404 {
-			return nil, fmt.Errorf("%w: %s", ErrNotFound, key)
-		}
-		return nil, fmt.Errorf("s3 get %s: %w", key, redactRequestID(err))
+		return nil, "", fmt.Errorf("s3 get %s: %w", key, redactRequestID(err))
 	}
 	defer out.Body.Close()
 	// Manifests are small; cap the read so a wrong key cannot exhaust memory.
 	body, err := io.ReadAll(io.LimitReader(out.Body, 8<<20))
 	if err != nil {
-		return nil, fmt.Errorf("s3 get %s body: %w", key, err)
+		return nil, "", fmt.Errorf("s3 get %s body: %w", key, err)
 	}
-	return body, nil
+	return body, aws.ToString(out.ETag), nil
+}
+
+// Head resolves an ambiguous conditional write: it says what is at the key
+// now, and whose write put it there, without transferring the body.
+func (s *S3Store) Head(ctx context.Context, key string) (ObjectInfo, error) {
+	if err := validateKey(key); err != nil {
+		return ObjectInfo{}, err
+	}
+	out, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return ObjectInfo{}, fmt.Errorf("%w: %s", ErrNotFound, key)
+		}
+		return ObjectInfo{}, fmt.Errorf("s3 head %s: %w", key, redactRequestID(err))
+	}
+	return ObjectInfo{
+		ETag:     aws.ToString(out.ETag),
+		Size:     aws.ToInt64(out.ContentLength),
+		Metadata: out.Metadata,
+	}, nil
+}
+
+// isNotFound covers both the typed errors and the bare 404 that MinIO and
+// some gateways answer a missing key with.
+func isNotFound(err error) bool {
+	var nsk *s3types.NoSuchKey
+	var nf *s3types.NotFound
+	if errors.As(err, &nsk) || errors.As(err, &nf) {
+		return true
+	}
+	var respErr *awshttp.ResponseError
+	return errors.As(err, &respErr) && respErr.HTTPStatusCode() == 404
 }
 
 // redactRequestID keeps the useful part of an SDK error without dumping the

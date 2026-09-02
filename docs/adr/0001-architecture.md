@@ -147,9 +147,23 @@ fMP4로 담도록 요구하며, 범용 웹 플레이어(hls.js + MSE)에서 HEVC
 
 한 카메라를 두 샤드가 동시에 수신하면 같은 매니페스트 객체를 두 writer가
 덮어써 플레이리스트가 두 타임라인 사이를 오간다. 따라서 카메라 할당은
-active/active가 아니어야 하며, 다중 호스트로 확장할 때는 lease 또는
-stable hashing이 필요하다. 현재 `Manager`는 프로세스 내에서 카메라당
-워커가 정확히 하나임을 보장한다.
+active/active가 아니어야 한다.
+
+**해결됨 (2026-09).** 이 ADR은 원래 lease에 DynamoDB 같은 외부 저장소가 필요할
+것으로 보았다. 그 가정은 더 이상 유효하지 않다. S3와 MinIO 모두 `PutObject`에
+`If-None-Match`(조건부 생성)와 `If-Match`(compare-and-swap)를 지원하며, 고정된
+SDK·MinIO 버전에서 실측 확인했다. 따라서 새 의존성 없이 이미 쓰는 오브젝트
+스토어만으로 소유권을 강제한다.
+
+핵심은 lease 자체가 fence가 아니라는 점이다. lease를 획득해도 얼어붙은 이전
+소유자가 들고 있는 유효한 CAS 토큰을 회수할 수는 없다. 그래서 새 소유자는
+ffmpeg을 켜기 전에 방금 읽은 버전을 조건으로 매니페스트를 다시 써서 그 토큰을
+소멸시킨다. 소유권 이전 시점은 lease 획득이 아니라 이 fence 쓰기다. 세부는
+README "다중 호스트 소유권", 구현은 `internal/channel/lease.go`와
+`Worker.fenceManifest`.
+
+`Manager`는 여전히 프로세스 내 유일성을 보장하며, lease는 그 위에 프로세스 간
+유일성을 얹는다.
 
 ### 11. 의존성은 AWS SDK만
 

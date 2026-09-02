@@ -41,8 +41,15 @@ RTSP URL에 담겨 전달되며, ffmpeg의 argv로 들어갑니다. 같은 PID �
 읽습니다(`internal/storage/s3.go`). 프로덕션은 ECS task role 또는 EKS IRSA를
 사용하고 이 변수를 비워 두십시오.
 
-필요한 권한은 ingest prefix의 `s3:PutObject`와 매니페스트 키의 `s3:GetObject`
-뿐입니다. `ListBucket`, `DeleteObject`, 버킷 전체 읽기 권한은 필요하지 않습니다.
+필요한 권한은 ingest prefix의 `s3:PutObject`와, 매니페스트·lease 키의
+`s3:GetObject`·`s3:HeadObject`(SDK에서는 `s3:GetObject`로 충분)입니다.
+`ListBucket`, `DeleteObject`, 버킷 전체 읽기 권한은 필요하지 않습니다 — lease
+해제는 삭제가 아니라 tombstone 덮어쓰기입니다.
+
+소유권 lease는 `{prefix}/{center_id}/{camera_id}/_transmux/lease.json`에
+저장되며 shard 라벨과 랜덤 세션 식별자만 담습니다. RTSP URL·자격증명·호스트명은
+들어가지 않습니다. **S3 lifecycle 규칙은 `_transmux/`와 라이브 매니페스트를 반드시
+제외해야 합니다.** 활성 lease를 지우면 강제 failover가 발생합니다.
 
 ### 전달 경로는 이 리포지토리에 없다
 

@@ -18,10 +18,10 @@ import (
 // and players would see the playlist jump backwards. ffmpeg's own local
 // numbering does reset; that is why the object key never uses it.
 type checkpoint struct {
-	LastSequence          uint64                 `json:"last_sequence"`
-	DiscontinuitySequence uint64                 `json:"discontinuity_sequence"`
-	Window                []checkpointEntry      `json:"window"`
-	UpdatedAt             time.Time              `json:"updated_at"`
+	LastSequence          uint64            `json:"last_sequence"`
+	DiscontinuitySequence uint64            `json:"discontinuity_sequence"`
+	Window                []checkpointEntry `json:"window"`
+	UpdatedAt             time.Time         `json:"updated_at"`
 }
 
 type checkpointEntry struct {

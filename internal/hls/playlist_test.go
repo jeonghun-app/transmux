@@ -81,7 +81,7 @@ func TestRenderLiveTargetDurationUsesActualMax(t *testing.T) {
 		// A 9.92 s segment must round the target up to 10, not stay at 5.
 		{Sequence: 101, URI: "2026/08/31/seg-b.ts", Duration: 9920 * time.Millisecond},
 	}
-	out := string(RenderLive(segs, 3))
+	out := string(RenderLive(segs, 3, "write-1"))
 
 	for _, want := range []string{
 		"#EXTM3U",
@@ -109,7 +109,7 @@ func TestRenderLiveEmitsDiscontinuityBeforeSegment(t *testing.T) {
 		{Sequence: 1, URI: "a.ts", Duration: 5 * time.Second},
 		{Sequence: 2, URI: "b.ts", Duration: 5 * time.Second, Discontinuity: true},
 	}
-	out := string(RenderLive(segs, 0))
+	out := string(RenderLive(segs, 0, "write-1"))
 	// Search for the exact tag line: a substring search for
 	// "#EXT-X-DISCONTINUITY" would also match the header's
 	// EXT-X-DISCONTINUITY-SEQUENCE tag.
@@ -125,7 +125,7 @@ func TestRenderLiveEmitsDiscontinuityBeforeSegment(t *testing.T) {
 }
 
 func TestRenderLiveEmptyWindow(t *testing.T) {
-	out := string(RenderLive(nil, 0))
+	out := string(RenderLive(nil, 0, "write-1"))
 	if !strings.Contains(out, "#EXT-X-TARGETDURATION:1") {
 		t.Errorf("empty window must still emit a valid target duration:\n%s", out)
 	}

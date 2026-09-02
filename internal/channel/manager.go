@@ -26,18 +26,22 @@ type Manager struct {
 	reg      *metrics.Registry
 	log      *slog.Logger
 
+	// session identifies this process incarnation to the ownership lease. It
+	// must not survive a restart: a restarted task is a new owner.
+	session string
+
 	mu      sync.RWMutex
 	workers map[string]*entry
 	// ready flips true after the first successful roster load, which is what
 	// the readiness probe reports.
-	ready bool
-	lastReconcile time.Time
+	ready            bool
+	lastReconcile    time.Time
 	lastReconcileErr string
 
-	mChannels   *metrics.Metric
-	mReconcile  *metrics.Metric
+	mChannels     *metrics.Metric
+	mReconcile    *metrics.Metric
 	mReconcileErr *metrics.Metric
-	mRejected   *metrics.Metric
+	mRejected     *metrics.Metric
 }
 
 type entry struct {
@@ -55,6 +59,7 @@ func NewManager(cfg config.Config, provider camera.Provider, up ObjectClient, re
 		reg:      reg,
 		log:      log,
 		workers:  make(map[string]*entry),
+		session:  NewSessionID(),
 		mChannels: reg.Gauge("transmux_channels_running",
 			"Channels currently supervised by this shard.", shard),
 		mReconcile: reg.Counter("transmux_roster_reconcile_total",
@@ -168,7 +173,7 @@ func (m *Manager) reconcile(ctx context.Context) {
 }
 
 func (m *Manager) start(parent context.Context, c camera.Camera) {
-	w := NewWorker(c, m.cfg, m.uploader, m.reg, m.log)
+	w := NewWorker(c, m.cfg, m.uploader, m.reg, m.log, m.session)
 	ctx, cancel := context.WithCancel(parent)
 	e := &entry{worker: w, cancel: cancel, done: make(chan struct{})}
 

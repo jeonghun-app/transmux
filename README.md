@@ -84,6 +84,9 @@ transmuxd -config /etc/transmux/config.json -validate   # 설정만 검사
 | `ffmpeg.input_args` | `-i` 앞에 넣을 추가 인자 | 버전별 소켓 타임아웃 옵션을 넣는 자리 |
 | `storage.endpoint` / `force_path_style` | MinIO/LocalStack용 | 프로덕션에서는 비운다 |
 | `cameras.provider` | `static` 또는 `http` | `http`는 외부 DB/API에서 동적 로드 |
+| `lease.ttl` | 소유권 만료 시간 | 죽은 샤드의 카메라를 다른 샤드가 인수하기까지의 최악 지연 |
+| `lease.renew_interval` | 갱신 주기 | TTL은 갱신 2회 + 시계 오차 2배보다 커야 하며 검증에서 강제된다 |
+| `lease.max_clock_skew` | 샤드 간 시계 오차 상한 가정 | 인수자는 만료 후 이만큼 더 기다리고, 소유자는 이만큼 먼저 멈춘다. 호스트에 NTP가 필요하다 |
 
 자격증명: 프로덕션은 ECS task role 또는 EKS IRSA를 쓴다.
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`는 MinIO 개발용으로만 읽는다.
@@ -126,9 +129,44 @@ s3://bucket/{prefix}/{center_id}/{camera_id}/index.m3u8
 | `GET /metrics` | Prometheus 텍스트 형식 |
 
 채널 상태(`transmux_channel_state`): 1 starting, 2 receiving, 3 disconnected,
-4 reconnecting, 5 stopping, 6 stopped, **7 failed**. `failed`는 자동 복구되지
-않으며 운영자 개입이 필요하다 — 현재는 발행 시퀀스를 안전하게 확정할 수 없을 때
-(오브젝트 스토어를 읽지 못하거나 매니페스트가 우리 것이 아닐 때) 진입한다.
+4 reconnecting, 5 stopping, 6 stopped, **7 failed**, 8 waiting_ownership.
+
+`failed`는 자동 복구되지 않으며 운영자 개입이 필요하다 — 매니페스트가 우리 것이
+아닐 때, 또는 다른 샤드에게 소유권을 빼앗겼을 때 진입한다.
+
+`waiting_ownership`은 **정상적인 대기 상태다.** 다른 샤드가 아직 이 카메라를
+소유하고 있거나(롤링 배포 중 정상), 오브젝트 스토어를 읽지 못해 소유권을 확정할 수
+없는 경우다. 아무것도 발행하지 않고 ffmpeg도 띄우지 않으며, 조건이 해소되면 스스로
+복구한다. 스토어 일시 장애로 75채널이 전부 운영자 개입을 요구하면 안 되기 때문에
+`failed`와 구분한다.
+
+## 다중 호스트 소유권
+
+한 카메라는 반드시 한 샤드만 수신해야 한다. 두 샤드가 같은 매니페스트에 쓰면
+플레이리스트가 두 타임라인을 왕복하고, 세그먼트는 1년 캐시 immutable이므로 키
+재사용은 덮어쓰기가 아니라 **CDN 캐시 오염**이다.
+
+오브젝트 스토어의 조건부 쓰기만으로 해결한다(별도 DB 없음).
+
+1. **lease** — `{prefix}/{center_id}/{camera_id}/_transmux/lease.json`을
+   `If-None-Match: *`로 생성하고 `If-Match`로 갱신한다. 살아 있는 lease를 다른
+   샤드가 들고 있으면 ffmpeg을 띄우지 않는다.
+2. **fence** — lease만으로는 부족하다. 얼어붙은 소유자가 깨어나 유효한 CAS 토큰을
+   그대로 쓸 수 있기 때문이다. 그래서 새 소유자는 **ffmpeg을 켜기 전에** 방금 읽은
+   버전을 조건으로 매니페스트를 다시 쓴다. 본문에 매 쓰기마다 다른
+   `# transmux-write-id` 주석이 들어가므로 플레이리스트 내용이 같아도 ETag가
+   바뀌고, 그 순간 이전 소유자의 토큰은 소멸한다. 소유권 이전 시점은 lease 획득이
+   아니라 이 fence 쓰기다.
+3. **세그먼트는 create-only** — `If-None-Match: *`. 키가 이미 있으면 우리 자신의
+   재시도인지(`put-id` 일치) 남의 것인지 `HEAD`로 확인하고, 남의 것이면 덮어쓰지
+   않고 채널을 멈춘다.
+
+`lease.renew_interval`마다 채널당 작은 PUT 하나가 추가된다. 625채널·5초 주기면
+약 125 PUT/s로, 세그먼트·매니페스트 250 PUT/s에 더해진다.
+
+배포 주의: lease를 모르는 구버전 바이너리는 조건 없이 쓰기 때문에 신·구 혼재
+상태를 이 메커니즘으로 안전하게 만들 수 없다. 구버전 writer를 먼저 정지시켜야 한다.
+S3 lifecycle 규칙은 `_transmux/`와 라이브 매니페스트를 **반드시 제외해야** 한다.
 
 `/livez`가 카메라·S3 상태를 반영하지 않는 것은 의도적이다. 카메라 한 대나
 S3 일시 장애로 liveness를 실패시키면 오케스트레이터가 컨테이너를 재시작해
@@ -150,6 +188,9 @@ S3 일시 장애로 liveness를 실패시키면 오케스트레이터가 컨테�
 | 세그먼트는 저장됐지만 재생에 안 보임 | `transmux_channel_manifest_upload_failures_total` 증가, `seconds_since_manifest` 상승 |
 | 스풀 고갈 임박 | `transmux_channel_spool_oldest_seconds`가 `local_list_size × 세그먼트 길이`에 접근 |
 | 채널 영구 정지 | `transmux_channel_failed_total` 증가 (운영자 개입 필요) |
+| 두 샤드가 한 카메라를 수신 | `transmux_channel_manifest_conflicts_total` 또는 `transmux_channel_segment_conflicts_total`이 0이 아니면 즉시 조사 |
+| 소유권 이전 | `transmux_channel_lease_lost_total` 증가, 새 샤드에서 `transmux_channel_lease_held` = 1 |
+| 롤링 배포 정상 진행 | `transmux_channel_lease_contended_total`이 잠시 증가한 뒤 멈춤 |
 | 종료 시 flush 실패 | `transmux_channel_final_drain_failures_total` 증가 |
 | 카메라가 PDT를 안 줌 | `transmux_channel_missing_pdt_total` 증가 (날짜 디렉터리가 업로드 시각으로 대체됨) |
 | 카메라 장애와 S3 장애 구분 | `last_ffmpeg_segment_timestamp` vs `last_segment_timestamp` |
@@ -183,8 +224,6 @@ S3 일시 장애로 liveness를 실패시키면 오케스트레이터가 컨테�
   별도 indexer를 붙이면 소급 적용이 가능하다. ADR 0002 §10 참고.
 - **객체 경로에 profile 차원 없음.** 멀티뷰용 서브스트림(듀얼 스트림)을 쓰려면
   URL이 외부 계약이 되기 전에 결정해야 한다. ADR 0002 §8 참고.
-- **다중 호스트 샤드 할당에 lease 없음.** 한 카메라를 두 샤드가 동시에
-  수신하면 매니페스트가 경쟁한다. 현재는 프로세스 내 중복만 막는다.
 - **`cameras.provider: http`는 스켈레톤.** 실제 DB/API 스키마에 맞춰야
   한다.
 - **S3 lifecycle 정책 미정.** 없으면 하루 수천만 객체가 무한 축적된다.
@@ -210,8 +249,13 @@ PoC 스택에서 실제로 확인한 항목이다.
 - 카메라가 전혀 없는 상태에서 25채널을 띄워도 크래시 없음
 - 컨테이너를 삭제·재생성해 로컬 체크포인트를 잃어도 발행 매니페스트에서 시퀀스를
   복구하고 되돌아가지 않음 (16 → 22, 중복 객체 키 0)
-- 오브젝트 스토어를 읽을 수 없으면 채널이 `failed`로 fail closed 되고 ffmpeg을
-  띄우지 않음 (로컬 체크포인트가 남아 있어도 동일하다)
+- 오브젝트 스토어를 읽을 수 없으면 아무것도 발행하지 않고 ffmpeg도 띄우지 않으며
+  `waiting_ownership`으로 대기한다(로컬 체크포인트가 남아 있어도 동일). 매니페스트가
+  우리 것이 아니면 `failed`로 fail closed 된다
+- 두 데몬에 같은 카메라를 주면 한쪽만 ffmpeg을 띄우고 다른 쪽은
+  `waiting_ownership`으로 대기. 소유자를 `docker pause`로 얼리면 TTL 20초 후
+  대기하던 쪽이 인수하고 시퀀스는 되돌아가지 않음(457 → 459). 얼었던 쪽을 깨우면
+  갱신 거부를 감지해 ffmpeg을 죽이고 `failed`로 가며 매니페스트를 건드리지 않음
 - 채널당 CPU 0.37~0.83% 코어(0.5~4Mbps 실측 4점), 75채널까지 선형 확장,
   ffmpeg 81~84% / supervisor 16~19%
 - 채널당 메모리 13.4~14.3 MiB로 비트레이트에 무관(0.5Mbps와 4Mbps가 동일)

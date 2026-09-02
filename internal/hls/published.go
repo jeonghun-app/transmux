@@ -28,6 +28,10 @@ type Published struct {
 	DiscontinuitySequence uint64
 	// Window is the live window in playlist order.
 	Window []PublishedSegment
+	// WriteID is the identity of the write that produced this body, taken
+	// from the transmux-write-id comment. It is empty for a manifest written
+	// before that comment existed.
+	WriteID string
 }
 
 // ParsePublished reads a manifest this daemon previously wrote and recovers
@@ -113,6 +117,8 @@ func ParsePublished(data []byte) (Published, error) {
 			}
 		case line == "#EXT-X-DISCONTINUITY":
 			pending.Discontinuity = true
+		case strings.HasPrefix(line, WriteIDComment):
+			out.WriteID = strings.TrimSpace(strings.TrimPrefix(line, WriteIDComment))
 		case strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"):
 			v := strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:")
 			n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)
@@ -136,7 +142,13 @@ func ParsePublished(data []byte) (Published, error) {
 		return Published{}, fmt.Errorf("not an m3u8 playlist: missing #EXTM3U")
 	}
 	if count == 0 {
-		return Published{}, fmt.Errorf("playlist references no segments")
+		// An empty playlist is only ours if it carries our write marker. That
+		// is the fence write a new owner makes for a channel that has not
+		// published a segment yet; an unmarked empty playlist is someone
+		// else's and must not be adopted.
+		if out.WriteID == "" {
+			return Published{}, fmt.Errorf("playlist references no segments")
+		}
 	}
 	if !sawMediaSeq {
 		return Published{}, fmt.Errorf("playlist has no EXT-X-MEDIA-SEQUENCE; " +

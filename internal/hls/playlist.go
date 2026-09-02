@@ -39,10 +39,10 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 
 	var (
-		out           []LocalSegment
-		pending       LocalSegment
+		out            []LocalSegment
+		pending        LocalSegment
 		havePendingInf bool
-		sawHeader     bool
+		sawHeader      bool
 	)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -108,20 +108,36 @@ type PublishedSegment struct {
 	// Sequence is our monotonic media sequence number for the channel.
 	Sequence uint64
 	// URI is relative to the manifest's own location.
-	URI string
-	Duration time.Duration
+	URI             string
+	Duration        time.Duration
 	ProgramDateTime time.Time
-	Discontinuity bool
+	Discontinuity   bool
 	// Bytes is the uploaded object size, used for logging and metrics.
 	Bytes int64
 }
+
+// WriteIDComment is the playlist comment carrying the identity of the write
+// that produced this manifest body.
+//
+// It exists for two reasons. It guarantees that a fence write changes the
+// object's ETag even when the playlist entries are byte-identical, which is
+// what lets a new owner revoke a stale owner's compare-and-swap token. And it
+// lets a writer resolve an ambiguous PUT: if the stored manifest carries the
+// write ID it just attempted, the write landed despite the timeout.
+//
+// A line starting with "#" that is not an EXT tag is a comment per RFC 8216,
+// so players ignore it.
+const WriteIDComment = "# transmux-write-id: "
 
 // RenderLive builds a live media playlist.
 //
 // discontinuitySequence must be the running count of discontinuities that
 // have already scrolled out of the window; players need it to keep their
 // timeline consistent across a reconnect.
-func RenderLive(segments []PublishedSegment, discontinuitySequence uint64) []byte {
+//
+// writeID identifies this particular write. It must be unique per write for
+// the ownership protocol to work; see WriteIDComment.
+func RenderLive(segments []PublishedSegment, discontinuitySequence uint64, writeID string) []byte {
 	var b strings.Builder
 	maxDur := time.Duration(0)
 	for _, s := range segments {
@@ -146,6 +162,11 @@ func RenderLive(segments []PublishedSegment, discontinuitySequence uint64) []byt
 	// Version 3 is the minimum that allows float EXTINF. Nothing here needs
 	// a higher version for MPEG-TS segments.
 	b.WriteString("#EXT-X-VERSION:3\n")
+	if writeID != "" {
+		b.WriteString(WriteIDComment)
+		b.WriteString(writeID)
+		b.WriteString("\n")
+	}
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", target)
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", mediaSeq)
 	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discontinuitySequence)

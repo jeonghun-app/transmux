@@ -238,3 +238,42 @@ func TestPocConfigIsValid(t *testing.T) {
 		t.Error("shard_id should be set by the PoC config")
 	}
 }
+
+// TestValidateRejectsALeaseThatCannotSurviveAMissedRenewal: if the TTL does not
+// leave room for two renewals plus the skew allowance, one lost response hands
+// a healthy channel to another shard.
+func TestValidateRejectsALeaseThatCannotSurviveAMissedRenewal(t *testing.T) {
+	c := valid()
+	c.Lease.TTL = Duration{20 * time.Second}
+	c.Lease.RenewInterval = Duration{9 * time.Second}
+	c.Lease.MaxClockSkew = Duration{2 * time.Second}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "lease.ttl") {
+		t.Fatalf("want a lease.ttl error, got %v", err)
+	}
+}
+
+func TestValidateRejectsALeaseOperationSlowerThanItsInterval(t *testing.T) {
+	c := valid()
+	c.Lease.OperationTimeout = Duration{30 * time.Second}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "lease.operation_timeout") {
+		t.Fatalf("want a lease.operation_timeout error, got %v", err)
+	}
+}
+
+func TestValidateRejectsNonPositiveLeaseDurations(t *testing.T) {
+	cases := map[string]func(*Config){
+		"ttl":               func(c *Config) { c.Lease.TTL = Duration{} },
+		"renew_interval":    func(c *Config) { c.Lease.RenewInterval = Duration{} },
+		"operation_timeout": func(c *Config) { c.Lease.OperationTimeout = Duration{} },
+		"negative skew":     func(c *Config) { c.Lease.MaxClockSkew = Duration{-time.Second} },
+	}
+	for name, break_ := range cases {
+		c := valid()
+		break_(&c)
+		if err := c.Validate(); err == nil {
+			t.Errorf("lease.%s: expected rejection", name)
+		}
+	}
+}

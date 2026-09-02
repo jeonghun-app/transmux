@@ -19,8 +19,8 @@ type fakeSource struct {
 	snaps  []channel.Snapshot
 }
 
-func (f *fakeSource) Status() channel.Status         { return f.status }
-func (f *fakeSource) Snapshots() []channel.Snapshot  { return f.snaps }
+func (f *fakeSource) Status() channel.Status        { return f.status }
+func (f *fakeSource) Snapshots() []channel.Snapshot { return f.snaps }
 func (f *fakeSource) Snapshot(center, camera string) (channel.Snapshot, bool) {
 	for _, s := range f.snaps {
 		if s.CenterID == center && s.CameraID == camera {
@@ -91,7 +91,7 @@ func TestReadyzDegradedBoundary(t *testing.T) {
 		total, degraded, want int
 	}{
 		{total: 10, degraded: 0, want: http.StatusOK},
-		{total: 10, degraded: 5, want: http.StatusOK},  // exactly half healthy
+		{total: 10, degraded: 5, want: http.StatusOK}, // exactly half healthy
 		{total: 10, degraded: 6, want: http.StatusServiceUnavailable},
 		{total: 1, degraded: 1, want: http.StatusServiceUnavailable},
 		{total: 2, degraded: 1, want: http.StatusOK},

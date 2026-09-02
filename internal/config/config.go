@@ -53,12 +53,13 @@ type Config struct {
 
 	HTTPListen string `json:"http_listen"`
 
-	Segment  SegmentConfig  `json:"segment"`
-	FFmpeg   FFmpegConfig   `json:"ffmpeg"`
-	Storage  StorageConfig  `json:"storage"`
-	Upload   UploadConfig   `json:"upload"`
+	Segment   SegmentConfig   `json:"segment"`
+	FFmpeg    FFmpegConfig    `json:"ffmpeg"`
+	Storage   StorageConfig   `json:"storage"`
+	Upload    UploadConfig    `json:"upload"`
 	Reconnect ReconnectConfig `json:"reconnect"`
-	Cameras  CameraConfig   `json:"cameras"`
+	Lease     LeaseConfig     `json:"lease"`
+	Cameras   CameraConfig    `json:"cameras"`
 }
 
 type SegmentConfig struct {
@@ -156,6 +157,38 @@ type ReconnectConfig struct {
 	ResetAfter Duration `json:"reset_after"`
 }
 
+// LeaseConfig tunes the camera ownership lease.
+//
+// The lease stops two shards from ingesting the same camera, which would make
+// the published playlist flip between two sequence timelines. Because
+// segments are immutable and cached for a year, a reused key is a CDN cache
+// poisoning event rather than a harmless overwrite.
+//
+// There is deliberately no switch to turn it off and no way to change the
+// object name: either would let two shards use different lock namespaces and
+// reintroduce the bug.
+type LeaseConfig struct {
+	// TTL is how long a lease stays valid without renewal. It is also the
+	// worst-case gap before another shard may take over a dead one.
+	TTL Duration `json:"ttl"`
+
+	// RenewInterval is how often the owner extends the lease.
+	RenewInterval Duration `json:"renew_interval"`
+
+	// MaxClockSkew is the assumed bound on wall-clock disagreement between
+	// shards. A contender waits this long past expiry on top of the TTL, and
+	// the owner stops this long before it. No TTL lease can be safe without
+	// such a bound; hosts must run NTP.
+	MaxClockSkew Duration `json:"max_clock_skew"`
+
+	// OperationTimeout bounds one lease request. It is separate from
+	// upload.put_timeout because a lease record is a few hundred bytes while a
+	// segment is megabytes: sizing the two together would either make renewal
+	// hang far longer than its own interval or make segment uploads give up
+	// too early.
+	OperationTimeout Duration `json:"operation_timeout"`
+}
+
 type CameraConfig struct {
 	// Provider is "static" or "http".
 	Provider string `json:"provider"`
@@ -219,6 +252,12 @@ func Default() Config {
 			Max:        Duration{30 * time.Second},
 			Factor:     2.0,
 			ResetAfter: Duration{60 * time.Second},
+		},
+		Lease: LeaseConfig{
+			TTL:              Duration{45 * time.Second},
+			RenewInterval:    Duration{10 * time.Second},
+			MaxClockSkew:     Duration{2 * time.Second},
+			OperationTimeout: Duration{5 * time.Second},
 		},
 		Cameras: CameraConfig{
 			Provider:       "static",
@@ -372,6 +411,31 @@ func (c *Config) Validate() error {
 	if c.Reconnect.ResetAfter.Duration <= 0 {
 		return fmt.Errorf("reconnect.reset_after must be > 0, otherwise the backoff resets " +
 			"on a camera that connects and immediately stalls")
+	}
+	if c.Lease.TTL.Duration <= 0 {
+		return fmt.Errorf("lease.ttl must be > 0")
+	}
+	if c.Lease.RenewInterval.Duration <= 0 {
+		return fmt.Errorf("lease.renew_interval must be > 0")
+	}
+	if c.Lease.MaxClockSkew.Duration < 0 {
+		return fmt.Errorf("lease.max_clock_skew must not be negative")
+	}
+	// Two renewals must fit inside the TTL with the skew allowance still to
+	// spare, or a single lost renewal response expires the lease and hands the
+	// camera to another shard while this one is healthy.
+	if need := 2*c.Lease.RenewInterval.Duration + 2*c.Lease.MaxClockSkew.Duration; need >= c.Lease.TTL.Duration {
+		return fmt.Errorf("lease.ttl (%s) must exceed 2 x lease.renew_interval + "+
+			"2 x lease.max_clock_skew (%s), otherwise one missed renewal loses the camera",
+			c.Lease.TTL.Duration, need)
+	}
+	if c.Lease.OperationTimeout.Duration <= 0 {
+		return fmt.Errorf("lease.operation_timeout must be > 0")
+	}
+	if c.Lease.OperationTimeout.Duration >= c.Lease.RenewInterval.Duration {
+		return fmt.Errorf("lease.operation_timeout (%s) must be shorter than "+
+			"lease.renew_interval (%s), or a renewal cannot finish before the next is due",
+			c.Lease.OperationTimeout.Duration, c.Lease.RenewInterval.Duration)
 	}
 	if c.Cameras.PollInterval.Duration <= 0 {
 		return fmt.Errorf("cameras.poll_interval must be > 0")
