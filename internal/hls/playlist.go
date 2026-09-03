@@ -129,15 +129,37 @@ type PublishedSegment struct {
 // so players ignore it.
 const WriteIDComment = "# transmux-write-id: "
 
+// LastSequenceComment records the highest sequence this channel has ever
+// published, independently of what the window happens to contain.
+//
+// It exists because the window can legitimately be empty while the sequence is
+// far from zero: recovery drops the window when a checkpoint floor is ahead of
+// the manifest, and the ownership fence must still write a manifest. Without
+// this, that fence would publish EXT-X-MEDIA-SEQUENCE:0, and a later process
+// recovering from it would restart the sequence and reissue object keys that
+// are already live.
+const LastSequenceComment = "# transmux-last-sequence: "
+
+// Live is one rendered version of a channel's live playlist.
+type Live struct {
+	// Segments is the live window, oldest first.
+	Segments []PublishedSegment
+	// DiscontinuitySequence is the running count of discontinuities that have
+	// already scrolled out of the window; players need it to keep their
+	// timeline consistent across a reconnect.
+	DiscontinuitySequence uint64
+	// LastSequence is the highest sequence ever published for this channel. It
+	// is at least the highest sequence in Segments, and greater when the
+	// window has been dropped.
+	LastSequence uint64
+	// WriteID identifies this particular write. It must be unique per write for
+	// the ownership protocol to work; see WriteIDComment.
+	WriteID string
+}
+
 // RenderLive builds a live media playlist.
-//
-// discontinuitySequence must be the running count of discontinuities that
-// have already scrolled out of the window; players need it to keep their
-// timeline consistent across a reconnect.
-//
-// writeID identifies this particular write. It must be unique per write for
-// the ownership protocol to work; see WriteIDComment.
-func RenderLive(segments []PublishedSegment, discontinuitySequence uint64, writeID string) []byte {
+func RenderLive(l Live) []byte {
+	segments, discontinuitySequence, writeID := l.Segments, l.DiscontinuitySequence, l.WriteID
 	var b strings.Builder
 	maxDur := time.Duration(0)
 	for _, s := range segments {
@@ -166,6 +188,13 @@ func RenderLive(segments []PublishedSegment, discontinuitySequence uint64, write
 		b.WriteString(WriteIDComment)
 		b.WriteString(writeID)
 		b.WriteString("\n")
+	}
+	last := l.LastSequence
+	if len(segments) > 0 && segments[len(segments)-1].Sequence > last {
+		last = segments[len(segments)-1].Sequence
+	}
+	if last > 0 {
+		fmt.Fprintf(&b, "%s%d\n", LastSequenceComment, last)
 	}
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", target)
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", mediaSeq)

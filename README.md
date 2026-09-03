@@ -85,7 +85,8 @@ transmuxd -config /etc/transmux/config.json -validate   # 설정만 검사
 | `storage.endpoint` / `force_path_style` | MinIO/LocalStack용 | 프로덕션에서는 비운다 |
 | `cameras.provider` | `static` 또는 `http` | `http`는 외부 DB/API에서 동적 로드 |
 | `lease.ttl` | 소유권 만료 시간 | 죽은 샤드의 카메라를 다른 샤드가 인수하기까지의 최악 지연 |
-| `lease.renew_interval` | 갱신 주기 | TTL은 갱신 2회 + 시계 오차 2배보다 커야 하며 검증에서 강제된다 |
+| `lease.renew_interval` | 갱신 주기 | `ttl > 2×renew_interval + operation_timeout + max_clock_skew`가 검증에서 강제된다. 갱신 하나를 놓쳐도 다음 시도가 자기 마감 전에 끝날 수 있어야 한다 |
+| `lease.operation_timeout` | lease 요청 하나의 상한 | `upload.put_timeout`과 분리한다. lease 레코드는 수백 바이트, 세그먼트는 수 MB라 같이 묶으면 한쪽이 반드시 잘못 잡힌다 |
 | `lease.max_clock_skew` | 샤드 간 시계 오차 상한 가정 | 인수자는 만료 후 이만큼 더 기다리고, 소유자는 이만큼 먼저 멈춘다. 호스트에 NTP가 필요하다 |
 
 자격증명: 프로덕션은 ECS task role 또는 EKS IRSA를 쓴다.
@@ -160,6 +161,22 @@ s3://bucket/{prefix}/{center_id}/{camera_id}/index.m3u8
 3. **세그먼트는 create-only** — `If-None-Match: *`. 키가 이미 있으면 우리 자신의
    재시도인지(`put-id` 일치) 남의 것인지 `HEAD`로 확인하고, 남의 것이면 덮어쓰지
    않고 채널을 멈춘다.
+
+조건부 쓰기는 **재시도하지 않는다.** 착지했는데 응답만 유실된 경우 재시도는 자기
+전제조건이 이미 소비된 것을 보고 412를 받는데, 그건 "남에게 밀렸다"와 구별되지
+않는다. 어떤 write ID를 썼는지 아는 호출자만 판단할 수 있으므로, 호출자가 읽어서
+확인한다.
+
+빈 윈도우로 fence를 쓰는 경우가 있다(체크포인트 floor가 매니페스트보다 앞설 때
+윈도우를 버린다). 그래서 매니페스트 본문에 `# transmux-last-sequence`로 지금까지
+발행한 최대 시퀀스를 남긴다. 이게 없으면 그 fence가 `EXT-X-MEDIA-SEQUENCE:0`을
+발행하고, 나중에 그것만 보고 복구한 프로세스가 시퀀스를 0에서 다시 시작해 이미
+살아 있는 객체 키를 재사용한다.
+
+`# transmux-write-id`와 `# transmux-last-sequence`는 **형식 인식이지 인증이
+아니다.** 버킷에 쓸 수 있는 주체는 어차피 세그먼트를 참조하는 매니페스트도 위조할
+수 있다. 신뢰 경계는 IAM과 CAS이고, 이 주석들은 ETag를 바꾸고 자기 쓰기를
+식별하기 위한 것이다.
 
 `lease.renew_interval`마다 채널당 작은 PUT 하나가 추가된다. 625채널·5초 주기면
 약 125 PUT/s로, 세그먼트·매니페스트 250 PUT/s에 더해진다.

@@ -41,8 +41,11 @@ RTSP URL에 담겨 전달되며, ffmpeg의 argv로 들어갑니다. 같은 PID �
 읽습니다(`internal/storage/s3.go`). 프로덕션은 ECS task role 또는 EKS IRSA를
 사용하고 이 변수를 비워 두십시오.
 
-필요한 권한은 ingest prefix의 `s3:PutObject`와, 매니페스트·lease 키의
-`s3:GetObject`·`s3:HeadObject`(SDK에서는 `s3:GetObject`로 충분)입니다.
+필요한 권한은 ingest prefix의 `s3:PutObject`와, 매니페스트·lease 키 **및 세그먼트
+키**의 `s3:GetObject`입니다(`HeadObject`도 `s3:GetObject`로 인가됩니다). 세그먼트
+읽기 권한이 필요한 이유는 조건부 생성이 거부됐을 때 그 객체가 우리 자신의 재시도인지
+남의 것인지 `HEAD`로 확인해야 하기 때문입니다. 매니페스트만 읽을 수 있는 정책이면
+프로덕션에서 충돌 처리가 실패합니다.
 `ListBucket`, `DeleteObject`, 버킷 전체 읽기 권한은 필요하지 않습니다 — lease
 해제는 삭제가 아니라 tombstone 덮어쓰기입니다.
 

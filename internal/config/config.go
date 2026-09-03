@@ -421,16 +421,25 @@ func (c *Config) Validate() error {
 	if c.Lease.MaxClockSkew.Duration < 0 {
 		return fmt.Errorf("lease.max_clock_skew must not be negative")
 	}
-	// Two renewals must fit inside the TTL with the skew allowance still to
-	// spare, or a single lost renewal response expires the lease and hands the
-	// camera to another shard while this one is healthy.
-	if need := 2*c.Lease.RenewInterval.Duration + 2*c.Lease.MaxClockSkew.Duration; need >= c.Lease.TTL.Duration {
-		return fmt.Errorf("lease.ttl (%s) must exceed 2 x lease.renew_interval + "+
-			"2 x lease.max_clock_skew (%s), otherwise one missed renewal loses the camera",
-			c.Lease.TTL.Duration, need)
-	}
 	if c.Lease.OperationTimeout.Duration <= 0 {
 		return fmt.Errorf("lease.operation_timeout must be > 0")
+	}
+	// A missed renewal must still leave room for the next one to complete
+	// before the owner's own deadline at ttl - skew. The second attempt starts
+	// at 2 x renew_interval and can take a full operation_timeout, so the whole
+	// of that must fit:
+	//
+	//	2*renew_interval + operation_timeout + max_clock_skew < ttl
+	//
+	// Checking only 2*renew + 2*skew is not enough: ttl 25s, renew 10s, skew
+	// 1s, operation_timeout 9s passes that but cannot recover before its own
+	// deadline at 24s, because the second attempt may not finish until 29s.
+	if need := 2*c.Lease.RenewInterval.Duration + c.Lease.OperationTimeout.Duration +
+		c.Lease.MaxClockSkew.Duration; need >= c.Lease.TTL.Duration {
+		return fmt.Errorf("lease.ttl (%s) must exceed 2 x lease.renew_interval + "+
+			"lease.operation_timeout + lease.max_clock_skew (%s), otherwise one missed "+
+			"renewal cannot be recovered before the owner's own deadline",
+			c.Lease.TTL.Duration, need)
 	}
 	if c.Lease.OperationTimeout.Duration >= c.Lease.RenewInterval.Duration {
 		return fmt.Errorf("lease.operation_timeout (%s) must be shorter than "+

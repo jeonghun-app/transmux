@@ -1731,14 +1731,9 @@ func TestOwnAmbiguousSegmentWriteIsAdopted(t *testing.T) {
 	}
 	store.mu.Unlock()
 
-	// First drain: the segment lands but the response is lost, so the worker
-	// keeps it pending.
-	if _, err := w.drain(context.Background(), newDrainState()); err == nil {
-		t.Fatal("expected the ambiguous segment write to be reported")
-	}
-	// Second drain retries the same key and finds its own put-id there.
-	gen := newDrainState()
-	res, err := w.drain(context.Background(), gen)
+	// The write lands, the response is lost, and the worker resolves it in the
+	// same pass by asking what is at the key: its own put-id is there.
+	res, err := w.drain(context.Background(), newDrainState())
 	if err != nil {
 		t.Fatalf("our own landed write must be adopted: %v", err)
 	}
@@ -1747,6 +1742,19 @@ func TestOwnAmbiguousSegmentWriteIsAdopted(t *testing.T) {
 	}
 	if got := w.mSegmentConflict.Value(); got != 0 {
 		t.Errorf("segment conflicts = %v, want 0: it was our own write", got)
+	}
+	// Exactly one object, and the manifest references it.
+	var segs int
+	for _, k := range store.keys() {
+		if strings.HasSuffix(k, ".ts") {
+			segs++
+		}
+	}
+	if segs != 1 {
+		t.Errorf("%d segment writes, want 1: an adopted write must not be duplicated", segs)
+	}
+	if !strings.Contains(store.lastManifest(), "seg-000000001-") {
+		t.Errorf("the adopted segment must be referenced\n%s", store.lastManifest())
 	}
 }
 
@@ -1822,5 +1830,283 @@ func TestLeaseRecordCarriesNoSecrets(t *testing.T) {
 		if strings.Contains(string(body), secret) {
 			t.Errorf("lease record leaked %q: %s", secret, body)
 		}
+	}
+}
+
+// TestSequenceFloorSurvivesAnEmptyFenceManifest is the regression the review
+// found. Recovery drops the window when a checkpoint floor is ahead of the
+// manifest, so the ownership fence writes an empty playlist. If that playlist
+// did not record the sequence, a later process recovering from it would restart
+// at zero and reissue object keys that are already live and cached for a year.
+func TestSequenceFloorSurvivesAnEmptyFenceManifest(t *testing.T) {
+	store := &fakeStore{}
+	first := newTestWorker(t, store)
+	writeSpool(t, first.spoolDir, []spoolEntry{
+		{name: "seg-000000.ts", duration: 4 * time.Second, pdt: basePDT, body: []byte("a")},
+	})
+	if _, err := first.drain(context.Background(), newDrainState()); err != nil {
+		t.Fatal(err)
+	}
+	// A checkpoint far ahead of the manifest: sequences were used that no
+	// manifest ever recorded.
+	if err := saveCheckpoint(first.statePath, checkpoint{LastSequence: 9}); err != nil {
+		t.Fatal(err)
+	}
+	releaseOwnership(t, first)
+
+	// The successor resumes from the floor and fences with an empty window.
+	second := restartWorker(t, first, store)
+	if err := second.claim(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if second.lastSequence != 9 {
+		t.Fatalf("lastSequence = %d, want the checkpoint floor 9", second.lastSequence)
+	}
+	if len(second.window) != 0 {
+		t.Fatalf("window = %d entries, want it dropped", len(second.window))
+	}
+	fenced := store.lastManifest()
+	if !strings.Contains(fenced, hls.LastSequenceComment+"9") {
+		t.Fatalf("the fence manifest must record the sequence floor\n%s", fenced)
+	}
+
+	// Now lose the checkpoint entirely, as a replaced container does. The
+	// manifest is the only surviving record.
+	releaseOwnership(t, second)
+	cfg := second.cfg
+	cfg.StateDir = t.TempDir()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	third := NewWorker(second.cam, cfg, store, metrics.NewRegistry(), log, "test-session-3")
+	if third.checkpointFloor != 0 {
+		t.Fatalf("precondition: the checkpoint must be gone, got floor %d", third.checkpointFloor)
+	}
+	if err := third.claim(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if third.lastSequence != 9 {
+		t.Errorf("lastSequence = %d, want 9 recovered from the empty manifest", third.lastSequence)
+	}
+
+	// And the next segment must not reuse a key.
+	writeSpool(t, third.spoolDir, []spoolEntry{
+		{name: "seg-000000.ts", duration: 4 * time.Second, pdt: basePDT.Add(time.Hour), body: []byte("c")},
+	})
+	if _, err := third.drain(context.Background(), newDrainState()); err != nil {
+		t.Fatal(err)
+	}
+	if third.lastSequence != 10 {
+		t.Errorf("lastSequence = %d, want 10", third.lastSequence)
+	}
+	seen := map[string]int{}
+	for _, k := range store.keys() {
+		if strings.HasSuffix(k, ".ts") {
+			seen[k]++
+		}
+	}
+	for k, n := range seen {
+		if n > 1 {
+			t.Errorf("segment key %q written %d times", k, n)
+		}
+	}
+}
+
+// TestRunReleasesALeaseItCouldNotUse: claim can take the lease and then fail on
+// a foreign manifest. Holding it until the TTL blocks a legitimate successor
+// for no reason.
+func TestRunReleasesALeaseItCouldNotUse(t *testing.T) {
+	store := &fakeStore{}
+	w := newUnownedWorker(t, store, "test-session")
+	if _, err := store.Put(context.Background(), storage.Object{
+		Key:  w.objectKey(w.cfg.Storage.ManifestName),
+		Body: []byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:4.000,\nchunk_00001.ts\n"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Run(ctx)
+	}()
+	deadline := time.After(3 * time.Second)
+	for w.Snapshot().State != StateFailed {
+		select {
+		case <-deadline:
+			t.Fatalf("state = %q, want failed", w.Snapshot().State)
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+
+	// A successor must be able to claim immediately, without waiting out the TTL.
+	other := newUnownedWorker(t, store, "other-session")
+	err := other.lease.Acquire(context.Background())
+	if errors.Is(err, ErrLeaseHeld) {
+		t.Fatal("the failed worker kept its lease, blocking a successor for a full TTL")
+	}
+}
+
+// TestInvalidLeaseRecordIsTerminal: a lease object that is not a lease record
+// cannot be fixed by waiting, so it must not be retried forever.
+func TestInvalidLeaseRecordIsTerminal(t *testing.T) {
+	store := &fakeStore{}
+	w := newUnownedWorker(t, store, "test-session")
+	if _, err := store.Put(context.Background(), storage.Object{
+		Key:  w.objectKey(LeaseObjectName),
+		Body: []byte("this is not json"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := w.claim(context.Background())
+	if !errors.Is(err, ErrLeaseInvalid) {
+		t.Fatalf("err = %v, want ErrLeaseInvalid", err)
+	}
+	if errors.Is(err, ErrLeaseUnavailable) {
+		t.Error("an unreadable record must not be classified as a transient outage")
+	}
+}
+
+func TestLeaseForAnotherCameraIsTerminal(t *testing.T) {
+	store := &fakeStore{}
+	w := newUnownedWorker(t, store, "test-session")
+	rec := `{"schema":1,"camera_key":"other/cam","owner_session":"x","status":"held",` +
+		`"expires_at":"2099-01-01T00:00:00Z"}`
+	if _, err := store.Put(context.Background(), storage.Object{
+		Key:  w.objectKey(LeaseObjectName),
+		Body: []byte(rec),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.claim(context.Background()); !errors.Is(err, ErrLeaseInvalid) {
+		t.Fatalf("err = %v, want ErrLeaseInvalid", err)
+	}
+}
+
+// TestFenceOutageIsRetryableNotTerminal: a store that will not answer during
+// the fence must leave the channel waiting, not permanently disabled. Nothing
+// has been published at that point.
+func TestFenceOutageIsRetryableNotTerminal(t *testing.T) {
+	store := &fakeStore{}
+	w := newUnownedWorker(t, store, "test-session")
+	armFailure(store, func(key string) error {
+		if strings.HasSuffix(key, ".m3u8") {
+			return errors.New("store unreachable")
+		}
+		return nil
+	})
+	err := w.claim(context.Background())
+	if !errors.Is(err, ErrLeaseUnavailable) {
+		t.Fatalf("err = %v, want a retryable ownership error", err)
+	}
+}
+
+// TestRenewalAfterTheDeadlineDoesNotReviveOwnership: a renewal whose response
+// arrives after the local deadline has passed must not extend the claim. By
+// then a contender is entitled to take over.
+func TestRenewalAfterTheDeadlineDoesNotReviveOwnership(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+
+	// Freeze the clock past the deadline established at acquire time, then
+	// renew: the store will accept it, but the holder must not.
+	w.lease.now = func() time.Time {
+		return time.Now().Add(w.cfg.Lease.TTL.Duration + time.Second)
+	}
+	err := w.lease.Renew(context.Background())
+	if !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("err = %v, want ErrLeaseLost", err)
+	}
+	if !w.lease.Expired() {
+		t.Error("a lapsed holder must stay expired")
+	}
+}
+
+// TestLeaseIsSafeUnderConcurrentRenewalAndPublication exercises the goroutine
+// pairing the original implementation got wrong: the renewal loop mutating
+// lease state while the publish path reads it. It exists to be run under the
+// race detector, which never saw this path before because no test ran Run all
+// the way through ownership.
+func TestLeaseIsSafeUnderConcurrentRenewalAndPublication(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	// Renew far faster than production so many renewals overlap the drains.
+	w.cfg.Lease.RenewInterval = config.Duration{Duration: time.Millisecond}
+	w.cfg.Lease.OperationTimeout = config.Duration{Duration: time.Second}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	renewalDone := make(chan struct{})
+	go func() {
+		defer close(renewalDone)
+		w.runLeaseRenewal(ctx, cancel)
+	}()
+
+	deadline := time.After(300 * time.Millisecond)
+	i := 0
+loop:
+	for {
+		select {
+		case <-deadline:
+			break loop
+		default:
+		}
+		i++
+		writeSpool(t, w.spoolDir, []spoolEntry{
+			{name: fmt.Sprintf("seg-%06d.ts", i), duration: 4 * time.Second,
+				pdt: basePDT.Add(time.Duration(i) * 4 * time.Second), body: []byte("x")},
+		})
+		if _, err := w.drain(ctx, newDrainState()); err != nil && ctx.Err() == nil {
+			t.Fatalf("drain: %v", err)
+		}
+		_ = w.lease.Expired()
+		_ = w.leaseSecondsRemaining()
+	}
+	cancel()
+	<-renewalDone
+
+	if err := w.lease.Release(context.Background()); err != nil && !errors.Is(err, ErrLeaseLost) {
+		t.Logf("release after cancellation: %v", err)
+	}
+}
+
+// TestRenewalIsJoinedBeforeRelease pins the shutdown ordering. Releasing while
+// a renewal is in flight has the two race their compare-and-swaps, and a
+// renewal landing after the release leaves the lease held until the TTL.
+func TestRenewalIsJoinedBeforeRelease(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	leaseKey := w.objectKey(LeaseObjectName)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Run(ctx)
+	}()
+	// Let it reach the generation loop; ffmpeg will fail to start (no binary in
+	// the unit-test image), which is fine: ownership is already established.
+	time.Sleep(80 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return")
+	}
+
+	// The final lease write must be the release tombstone, not a renewal.
+	var last string
+	store.mu.Lock()
+	for _, p := range store.puts {
+		if p.Key == leaseKey {
+			last = string(p.Body)
+		}
+	}
+	store.mu.Unlock()
+	if last == "" {
+		t.Fatal("no lease writes recorded")
+	}
+	if !strings.Contains(last, `"status":"released"`) {
+		t.Errorf("the last lease write must be the release, got %s", last)
 	}
 }

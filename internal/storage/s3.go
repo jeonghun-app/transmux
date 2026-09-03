@@ -111,13 +111,20 @@ func (s *S3Store) Put(ctx context.Context, obj Object) (string, error) {
 	return aws.ToString(out.ETag), nil
 }
 
-// isPreconditionFailed recognises a refused conditional write. The typed error
-// differs between S3 and S3-compatible gateways, so the HTTP status is the
-// reliable signal.
+// isPreconditionFailed recognises a refused conditional write.
+//
+// The typed error differs between S3 and S3-compatible gateways, so the HTTP
+// status is the reliable signal. 409 is included because S3 answers a race
+// between two conditional creates with ConditionalRequestConflict rather than
+// PreconditionFailed; both mean the same thing to this daemon, which is that
+// another writer got there first.
 func isPreconditionFailed(err error) bool {
 	var respErr *awshttp.ResponseError
-	if errors.As(err, &respErr) && respErr.HTTPStatusCode() == 412 {
-		return true
+	if errors.As(err, &respErr) {
+		switch respErr.HTTPStatusCode() {
+		case 412, 409:
+			return true
+		}
 	}
 	return false
 }

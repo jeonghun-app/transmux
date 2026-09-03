@@ -43,7 +43,15 @@ type Preconditions struct {
 	IfNoneMatch bool
 }
 
-func (p Preconditions) conditional() bool { return p.IfMatch != "" || p.IfNoneMatch }
+// Conditional reports whether the write carries a precondition.
+//
+// It matters to the retry policy: a conditional write must never be retried
+// after an ambiguous failure. If the first attempt landed and only its
+// response was lost, the retry sees its own precondition already consumed and
+// returns ErrPreconditionFailed -- indistinguishable from being overtaken by
+// another writer. Only the caller, which knows the write ID it used, can
+// resolve that.
+func (p Preconditions) Conditional() bool { return p.IfMatch != "" || p.IfNoneMatch }
 
 // ObjectInfo is what the store knows about a key without its body.
 type ObjectInfo struct {
@@ -161,7 +169,7 @@ func (s *FilesystemStore) Put(_ context.Context, obj Object) (string, error) {
 	}
 	defer unlock()
 
-	if obj.Preconditions.conditional() {
+	if obj.Preconditions.Conditional() {
 		current, err := os.ReadFile(dest)
 		switch {
 		case err == nil:

@@ -329,10 +329,11 @@ S3 Event는 중복·지연·순서 역전이 가능하므로 indexer는 idempote
   origin의 `no-cache`보다 우선할 수 있다. 잘못 캐시된 `index.m3u8`은 전 시청자를
   동시에 멈춘다. `*.m3u8` behavior의 min/default TTL을 0으로 두고 error caching
   TTL도 0으로 둔다.
-- **세그먼트 immutable 캐시와 키 재사용**: §6.1로 완화했으나, 시스템 시계
-  되돌림이나 한 카메라 dual writer가 겹치면 여전히 가능하다. 다중 호스트 샤딩에는
-  lease가 필요하다(ADR 0001 §10, 미구현). 세그먼트 PUT을 조건부 생성
-  (`If-None-Match: *`)으로 바꿔 충돌을 장애로 표면화하는 것을 검토할 만하다.
+- **세그먼트 immutable 캐시와 키 재사용**: §6.1로 완화하고, 이후 lease + 매니페스트
+  fence로 dual writer를 막았다(ADR 0001 §10, 구현됨). 세그먼트 PUT도 조건부 생성
+  (`If-None-Match: *`)으로 바뀌어, 남의 객체가 있는 키는 덮어쓰지 않고 채널을
+  정지시킨다. 남는 위험은 시스템 시계 되돌림이며, 이는 lease의 시계 오차 상한
+  가정과 같은 뿌리다.
 - **OAC는 시청자 인증이 아니다.** CloudFront→S3 구간만 인증한다. 시청자 인증은
   signed cookie가 담당한다. 이 둘을 혼동하면 버킷은 닫혀 있는데 스트림은 누구나
   볼 수 있는 상태가 된다.

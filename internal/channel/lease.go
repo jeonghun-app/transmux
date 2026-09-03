@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jeonghun-app/transmux/internal/storage"
@@ -28,6 +29,11 @@ var ErrLeaseHeld = errors.New("camera lease held by another owner")
 // ErrLeaseLost reports that this process no longer owns the camera. It is
 // terminal for the worker: something else is publishing now.
 var ErrLeaseLost = errors.New("camera lease lost")
+
+// ErrLeaseInvalid reports that the lease object exists but is not a lease
+// record this daemon can reason about. Unlike a store that will not answer,
+// waiting cannot fix it, so it is terminal.
+var ErrLeaseInvalid = errors.New("camera lease record is not usable")
 
 // leaseRecord is the body of the lease object.
 //
@@ -91,23 +97,52 @@ type leaseHolder struct {
 	session string
 	cfg     leaseTuning
 
+	// opMu serialises the lease's compare-and-swap operations. A state lock
+	// alone is not enough: a renewal and a release could each snapshot the
+	// same ETag and then race, and whichever lost would report a conflict that
+	// says nothing about ownership.
+	opMu sync.Mutex
+
+	// mu guards the three fields below. They are read from the worker
+	// goroutine (through Expired) while the renewal goroutine writes them.
+	mu sync.RWMutex
 	// etag is the version of the lease object this holder last wrote. It is
 	// the token every renewal swaps against.
 	etag string
-	// deadline is the monotonic instant after which this holder must stop
-	// publishing, whatever the store says. It is derived from the wall clock
-	// at the moment a write succeeded, so a renewal response that arrives
-	// after the deadline cannot revive ownership.
+	// deadline is the instant after which this holder must stop publishing,
+	// whatever the store says. It is derived from the clock reading taken
+	// before a write began, so time spent in the request is time spent off the
+	// lease.
 	deadline time.Time
 	held     bool
 
 	now func() time.Time
 }
 
+// state returns a consistent snapshot of the mutable fields.
+func (l *leaseHolder) state() (etag string, deadline time.Time, held bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.etag, l.deadline, l.held
+}
+
+func (l *leaseHolder) setState(etag string, deadline time.Time, held bool) {
+	l.mu.Lock()
+	l.etag, l.deadline, l.held = etag, deadline, held
+	l.mu.Unlock()
+}
+
+func (l *leaseHolder) drop() {
+	l.mu.Lock()
+	l.held = false
+	l.mu.Unlock()
+}
+
 type leaseTuning struct {
-	TTL           time.Duration
-	RenewInterval time.Duration
-	MaxClockSkew  time.Duration
+	TTL              time.Duration
+	RenewInterval    time.Duration
+	MaxClockSkew     time.Duration
+	OperationTimeout time.Duration
 }
 
 func newLeaseHolder(client ObjectClient, key, camera, shardID, session string, cfg leaseTuning) *leaseHolder {
@@ -127,6 +162,9 @@ func newLeaseHolder(client ObjectClient, key, camera, shardID, session string, c
 //	other error    the store could not be consulted; ownership is unknown and
 //	               the caller must not start publishing
 func (l *leaseHolder) Acquire(ctx context.Context) error {
+	l.opMu.Lock()
+	defer l.opMu.Unlock()
+
 	body, etag, err := l.client.Get(ctx, l.key)
 	switch {
 	case errors.Is(err, storage.ErrNotFound):
@@ -141,10 +179,12 @@ func (l *leaseHolder) Acquire(ctx context.Context) error {
 	if err := json.Unmarshal(body, &rec); err != nil {
 		// Not a lease record. Refuse rather than overwrite: it may belong to
 		// another system, and guessing here is how you get two publishers.
-		return fmt.Errorf("lease %s is not readable as a lease record: %w", l.key, err)
+		// Terminal, because retrying reads the same bytes forever.
+		return fmt.Errorf("%w: %s is not readable as a lease record: %v", ErrLeaseInvalid, l.key, err)
 	}
 	if rec.CameraKey != "" && rec.CameraKey != l.camera {
-		return fmt.Errorf("lease %s belongs to camera %q, not %q", l.key, rec.CameraKey, l.camera)
+		return fmt.Errorf("%w: %s belongs to camera %q, not %q",
+			ErrLeaseInvalid, l.key, rec.CameraKey, l.camera)
 	}
 	// A contender waits out the full TTL plus the skew allowance on both
 	// sides: the holder's clock may be slow while ours is fast.
@@ -157,12 +197,16 @@ func (l *leaseHolder) Acquire(ctx context.Context) error {
 // Renew extends the lease. A refused precondition means another process took
 // over, which is terminal.
 func (l *leaseHolder) Renew(ctx context.Context) error {
-	if !l.held {
+	l.opMu.Lock()
+	defer l.opMu.Unlock()
+
+	etag, _, held := l.state()
+	if !held {
 		return ErrLeaseLost
 	}
-	err := l.write(ctx, storage.Preconditions{IfMatch: l.etag})
+	err := l.write(ctx, storage.Preconditions{IfMatch: etag})
 	if errors.Is(err, storage.ErrPreconditionFailed) {
-		l.held = false
+		l.drop()
 		return fmt.Errorf("%w: renewal refused, another owner holds %s", ErrLeaseLost, l.key)
 	}
 	return err
@@ -171,7 +215,11 @@ func (l *leaseHolder) Renew(ctx context.Context) error {
 // Release writes a tombstone so a successor can take over immediately instead
 // of waiting out the TTL. Failure is not fatal: expiry is the fallback.
 func (l *leaseHolder) Release(ctx context.Context) error {
-	if !l.held {
+	l.opMu.Lock()
+	defer l.opMu.Unlock()
+
+	etag, _, held := l.state()
+	if !held {
 		return nil
 	}
 	rec := l.record("released", l.now())
@@ -184,9 +232,11 @@ func (l *leaseHolder) Release(ctx context.Context) error {
 		Body:          raw,
 		ContentType:   "application/json",
 		CacheControl:  "no-store",
-		Preconditions: storage.Preconditions{IfMatch: l.etag},
+		Preconditions: storage.Preconditions{IfMatch: etag},
 	})
-	l.held = false
+	// Ownership ends locally either way. A refused release means a successor
+	// already took over, and a failed one expires on its own.
+	l.drop()
 	return err
 }
 
@@ -194,10 +244,11 @@ func (l *leaseHolder) Release(ctx context.Context) error {
 // worker checks it before every publish so a store it cannot reach does not
 // leave it publishing past its ownership window.
 func (l *leaseHolder) Expired() bool {
-	if !l.held {
+	_, deadline, held := l.state()
+	if !held {
 		return true
 	}
-	return !l.now().Before(l.deadline)
+	return !l.now().Before(deadline)
 }
 
 func (l *leaseHolder) record(status string, issued time.Time) leaseRecord {
@@ -220,6 +271,7 @@ func (l *leaseHolder) write(ctx context.Context, pre storage.Preconditions) erro
 	// never after: if the request takes ten seconds, those ten seconds are
 	// already gone from the lease's life.
 	issued := l.now()
+	_, prevDeadline, wasHeld := l.state()
 	rec := l.record("held", issued)
 	raw, err := json.Marshal(rec)
 	if err != nil {
@@ -232,10 +284,30 @@ func (l *leaseHolder) write(ctx context.Context, pre storage.Preconditions) erro
 		CacheControl:  "no-store",
 		Preconditions: pre,
 	})
-	if err == nil {
-		l.etag, l.held = etag, true
+
+	// commit adopts a successful write, unless our own deadline lapsed while
+	// the request was in flight. Reviving a lapsed lease would mean publishing
+	// during the window in which a contender is entitled to take over.
+	// commit adopts a successful write. newETag is empty when the write was
+	// adopted through read-back, where confirm has already recorded the ETag.
+	commit := func(newETag string) error {
+		if wasHeld && !prevDeadline.After(l.now()) {
+			l.drop()
+			return fmt.Errorf("%w: renewal completed after the local deadline had passed",
+				ErrLeaseLost)
+		}
+		l.mu.Lock()
+		if newETag != "" {
+			l.etag = newETag
+		}
+		l.held = true
 		l.deadline = issued.Add(l.cfg.TTL - l.cfg.MaxClockSkew)
+		l.mu.Unlock()
 		return nil
+	}
+
+	if err == nil {
+		return commit(etag)
 	}
 	if errors.Is(err, storage.ErrPreconditionFailed) {
 		return err
@@ -244,10 +316,14 @@ func (l *leaseHolder) write(ctx context.Context, pre storage.Preconditions) erro
 	// Reading back by operation ID is the only way to tell, and guessing
 	// either way is unsafe -- assuming failure risks two owners, assuming
 	// success risks publishing without a lease.
-	if landed, lerr := l.confirm(ctx, rec.OperationID); lerr == nil && landed {
-		l.held = true
-		l.deadline = issued.Add(l.cfg.TTL - l.cfg.MaxClockSkew)
-		return nil
+	//
+	// The read-back gets its own budget. Reusing ctx would make this useless
+	// in the common case, because the reason the write failed is often that
+	// ctx's own deadline elapsed.
+	confirmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.cfg.OperationTimeout)
+	defer cancel()
+	if landed, lerr := l.confirm(confirmCtx, rec.OperationID); lerr == nil && landed {
+		return commit("")
 	}
 	return err
 }
@@ -265,6 +341,8 @@ func (l *leaseHolder) confirm(ctx context.Context, operationID string) (bool, er
 	if rec.OperationID != operationID {
 		return false, nil
 	}
+	l.mu.Lock()
 	l.etag = etag
+	l.mu.Unlock()
 	return true, nil
 }

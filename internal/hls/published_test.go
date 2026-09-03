@@ -65,7 +65,7 @@ func TestRenderLiveParsePublishedRoundTrip(t *testing.T) {
 			Duration: 6500 * time.Millisecond, ProgramDateTime: pdt.Add(4 * time.Second),
 			Discontinuity: true},
 	}
-	rendered := RenderLive(original, 7, "write-1")
+	rendered := RenderLive(Live{Segments: original, DiscontinuitySequence: 7, WriteID: "write-1"})
 
 	pub, err := ParsePublished(rendered)
 	if err != nil {

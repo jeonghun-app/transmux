@@ -187,6 +187,5 @@ Prometheus 클라이언트, YAML 파서, fsnotify를 모두 쓰지 않았다. 30
 2. H.265 카메라 존재 여부와, 존재할 경우 fMP4 프로파일 구현
 3. 오디오 요구사항 확정
 4. 카메라 provider의 실제 DB/API 연동 (현재 static과 http 스켈레톤)
-5. 다중 호스트 샤드 할당의 lease 메커니즘
-6. S3 lifecycle 정책 — 보존 기간이 정해지지 않으면 하루 수천만 객체가
+5. S3 lifecycle 정책 — 보존 기간이 정해지지 않으면 하루 수천만 객체가
    무한 축적된다

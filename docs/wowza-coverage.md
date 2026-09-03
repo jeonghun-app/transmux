@@ -107,7 +107,7 @@
 |---|---|---|
 | Origin–edge, 라이브 리피터 | 불필요 → 설계만 | S3가 origin, CDN이 edge(ADR 0002 §2) |
 | 소스 장애 조치 | 부분 | 채널별 재연결·full jitter backoff·fail-closed 복구는 있다. A/B 소스 전환은 없다 |
-| **안전한 수평 샤딩** | **대체됨** | 오브젝트 스토어 조건부 쓰기 기반 lease + 매니페스트 fence(`internal/channel/lease.go`, `worker.go` `fenceManifest`). 두 데몬에 같은 카메라를 준 뒤 소유자를 얼려 인수·펜싱을 실측 확인했다. README "다중 호스트 소유권" 참고 |
+| **안전한 수평 샤딩** | **대체됨** | 오브젝트 스토어 조건부 쓰기 기반 lease + 매니페스트 fence(`internal/channel/lease.go`, `worker.go` `fenceManifest`). 두 데몬에 같은 카메라를 준 뒤 소유자를 얼려 인수·펜싱을 실측 확인했다. 단위 테스트는 stale writer 펜싱·애매한 쓰기·시퀀스 floor 보존을 덮지만, 이중 데몬 인수 시나리오는 아직 수동 절차다. README "다중 호스트 소유권" 참고 |
 | 무중단 롤링 배포 | **대체됨** | 매니페스트 기반 시퀀스 복구로 태스크 교체가 안전하고, 영속 볼륨이 필요 없다 |
 
 ## 8. 캡션 / 메타데이터 / 썸네일

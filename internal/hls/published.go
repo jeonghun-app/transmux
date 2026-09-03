@@ -32,6 +32,19 @@ type Published struct {
 	// from the transmux-write-id comment. It is empty for a manifest written
 	// before that comment existed.
 	WriteID string
+	// LastSequence is the highest sequence the writer had ever published, from
+	// the transmux-last-sequence comment. It can exceed MaxSequence when the
+	// window was dropped, and it is what keeps a sequence floor durable across
+	// a restart that recovers from an empty manifest.
+	LastSequence uint64
+}
+
+// Floor returns the sequence a successor must resume above.
+func (p Published) Floor() uint64 {
+	if p.LastSequence > p.MaxSequence {
+		return p.LastSequence
+	}
+	return p.MaxSequence
 }
 
 // ParsePublished reads a manifest this daemon previously wrote and recovers
@@ -119,6 +132,13 @@ func ParsePublished(data []byte) (Published, error) {
 			pending.Discontinuity = true
 		case strings.HasPrefix(line, WriteIDComment):
 			out.WriteID = strings.TrimSpace(strings.TrimPrefix(line, WriteIDComment))
+		case strings.HasPrefix(line, LastSequenceComment):
+			v := strings.TrimSpace(strings.TrimPrefix(line, LastSequenceComment))
+			n, err := strconv.ParseUint(v, 10, 64)
+			if err != nil {
+				return Published{}, fmt.Errorf("invalid %s%q: %w", LastSequenceComment, v, err)
+			}
+			out.LastSequence = n
 		case strings.HasPrefix(line, "#EXT-X-MEDIA-SEQUENCE:"):
 			v := strings.TrimPrefix(line, "#EXT-X-MEDIA-SEQUENCE:")
 			n, err := strconv.ParseUint(strings.TrimSpace(v), 10, 64)

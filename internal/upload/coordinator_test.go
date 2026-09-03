@@ -51,6 +51,10 @@ func (s *stubStore) Get(context.Context, string) ([]byte, string, error) {
 func (s *stubStore) Head(context.Context, string) (storage.ObjectInfo, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.attempts++
+	if s.attempts <= s.failFor {
+		return storage.ObjectInfo{}, errors.New("transient")
+	}
 	return storage.ObjectInfo{ETag: `"stub-etag"`, Size: int64(len(s.body))}, nil
 }
 
@@ -106,7 +110,10 @@ func TestGetReturnsNotFoundImmediately(t *testing.T) {
 	}
 }
 
-type notFoundStore struct{ attempts int }
+type notFoundStore struct {
+	attempts     int
+	headAttempts int
+}
 
 func (s *notFoundStore) Put(context.Context, storage.Object) (string, error) { return "", nil }
 func (s *notFoundStore) Get(context.Context, string) ([]byte, string, error) {
@@ -114,6 +121,7 @@ func (s *notFoundStore) Get(context.Context, string) ([]byte, string, error) {
 	return nil, "", storage.ErrNotFound
 }
 func (s *notFoundStore) Head(context.Context, string) (storage.ObjectInfo, error) {
+	s.headAttempts++
 	return storage.ObjectInfo{}, storage.ErrNotFound
 }
 func (s *notFoundStore) Describe() string { return "notfound" }
@@ -322,3 +330,88 @@ func (s *conflictStore) Head(context.Context, string) (storage.ObjectInfo, error
 	return storage.ObjectInfo{}, nil
 }
 func (s *conflictStore) Describe() string { return "conflict" }
+
+// TestConditionalWriteIsNotRetriedAfterAnAmbiguousFailure is the defect that
+// made the worker's whole ambiguity-resolution path dead code.
+//
+// A conditional write that lands and then loses its response must be reported
+// to the caller as-is. Retrying it makes the second attempt fail its own
+// now-consumed precondition, and the caller sees ErrPreconditionFailed --
+// indistinguishable from being overtaken by another writer, which it treats as
+// permanent loss of ownership. So a healthy channel would kill itself over a
+// dropped TCP connection.
+func TestConditionalWriteIsNotRetriedAfterAnAmbiguousFailure(t *testing.T) {
+	store := &ambiguousStore{}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+
+	_, err := c.Put(context.Background(), storage.Object{
+		Key: "c1/cam1/index.m3u8", Body: []byte("v2"),
+		Preconditions: storage.Preconditions{IfMatch: `"v1"`},
+	})
+	if err == nil {
+		t.Fatal("the ambiguous outcome must be reported, not hidden")
+	}
+	if errors.Is(err, storage.ErrPreconditionFailed) {
+		t.Fatal("a retry turned a lost response into a false conflict; the caller " +
+			"cannot tell that apart from losing ownership")
+	}
+	if store.attempts != 1 {
+		t.Errorf("attempts = %d, want 1: a conditional write must not be retried", store.attempts)
+	}
+	if !store.stored {
+		t.Error("precondition: the store should have recorded the landed write")
+	}
+}
+
+// TestUnconditionalWriteStillRetries: the no-retry rule must be scoped to
+// conditional writes, or every transient segment upload failure becomes fatal.
+func TestUnconditionalWriteStillRetries(t *testing.T) {
+	store := &stubStore{failFor: 2}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	if _, err := c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if store.count() != 3 {
+		t.Errorf("attempts = %d, want 3", store.count())
+	}
+}
+
+// ambiguousStore stores the object and then reports a transport failure: the
+// write landed, the response did not.
+type ambiguousStore struct {
+	attempts int
+	stored   bool
+}
+
+func (s *ambiguousStore) Put(context.Context, storage.Object) (string, error) {
+	s.attempts++
+	s.stored = true
+	return "", errors.New("connection reset by peer")
+}
+func (s *ambiguousStore) Get(context.Context, string) ([]byte, string, error) { return nil, "", nil }
+func (s *ambiguousStore) Head(context.Context, string) (storage.ObjectInfo, error) {
+	return storage.ObjectInfo{}, nil
+}
+func (s *ambiguousStore) Describe() string { return "ambiguous" }
+
+// TestHeadIsBoundedAndRetried: Head resolves conflicts while holding an upload
+// slot, so an unbounded one would wedge a channel and a slot together.
+func TestHeadIsBoundedAndRetried(t *testing.T) {
+	store := &stubStore{failFor: 2}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	if _, err := c.Head(context.Background(), "k"); err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+	if store.count() != 3 {
+		t.Errorf("attempts = %d, want 3 (two transient failures then success)", store.count())
+	}
+
+	nf := &notFoundStore{}
+	c2 := NewCoordinator(nf, testCfg(), metrics.NewRegistry())
+	if _, err := c2.Head(context.Background(), "k"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if nf.headAttempts != 1 {
+		t.Errorf("attempts = %d, want 1: absence is an answer", nf.headAttempts)
+	}
+}

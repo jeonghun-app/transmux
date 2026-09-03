@@ -124,6 +124,10 @@ func (c *Coordinator) PutFile(ctx context.Context, obj storage.Object, srcPath s
 // It exists to resolve an ambiguous conditional write: when a request times
 // out, the caller cannot know whether it landed, and a blind retry of a
 // conditional write would report a spurious conflict.
+//
+// It is bounded and retried like Get. An unbounded Head would be worse here
+// than elsewhere, because it runs while a channel is already stuck resolving a
+// conflict and it holds an upload slot the whole time.
 func (c *Coordinator) Head(ctx context.Context, key string) (storage.ObjectInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return storage.ObjectInfo{}, err
@@ -134,7 +138,30 @@ func (c *Coordinator) Head(ctx context.Context, key string) (storage.ObjectInfo,
 		return storage.ObjectInfo{}, ctx.Err()
 	}
 	defer func() { <-c.sem }()
-	return c.store.Head(ctx, key)
+
+	var lastErr error
+	for attempt := 1; attempt <= c.cfg.MaxAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.PutTimeout.Duration)
+		info, err := c.store.Head(attemptCtx, key)
+		cancel()
+		if err == nil {
+			return info, nil
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			return storage.ObjectInfo{}, err
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return storage.ObjectInfo{}, ctx.Err()
+		}
+		if attempt < c.cfg.MaxAttempts {
+			if !sleepCtx(ctx, c.backoff(attempt)) {
+				return storage.ObjectInfo{}, ctx.Err()
+			}
+		}
+	}
+	return storage.ObjectInfo{}, fmt.Errorf("%w after %d attempts for %s: %v",
+		ErrGaveUp, c.cfg.MaxAttempts, key, lastErr)
 }
 
 // attempts runs the retry loop. The caller must already hold a semaphore slot.
@@ -160,6 +187,16 @@ func (c *Coordinator) attempts(ctx context.Context, obj storage.Object) (string,
 			return "", err
 		}
 		lastErr = err
+		// A conditional write must not be retried. If this attempt landed and
+		// only its response was lost, the retry would find its own
+		// precondition already consumed and report a conflict that never
+		// happened -- which the caller cannot tell apart from being overtaken.
+		// Only the caller knows the write ID it used, so only the caller can
+		// resolve the ambiguity, by reading back.
+		if obj.Preconditions.Conditional() {
+			c.putFailures.Inc()
+			return "", err
+		}
 		// A cancelled parent context means shutdown, not a transient fault.
 		if ctx.Err() != nil {
 			c.putFailures.Inc()
