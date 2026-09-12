@@ -1,0 +1,14 @@
+# Camera simulator only. This is not the delivery server.
+logLevel: warn
+rtspTransports: [tcp]
+rtspAddress: :8554
+hls: false
+webrtc: false
+srt: false
+rtmp: false
+api: true
+apiAddress: :9997
+paths:
+  entrance:
+  warehouse:
+  hevc:

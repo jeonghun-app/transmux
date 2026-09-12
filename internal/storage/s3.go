@@ -5,14 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/url"
-	"os"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
@@ -37,13 +34,9 @@ func NewS3Store(ctx context.Context, cfg config.StorageConfig) (*S3Store, error)
 	if cfg.Region != "" {
 		loadOpts = append(loadOpts, awscfg.WithRegion(cfg.Region))
 	}
-	// Static credentials are only used for MinIO/LocalStack in development.
-	// In production the task role (ECS) or IRSA (EKS) supplies credentials
-	// through the default chain and these variables are unset.
-	if id, secret := devCredentials(); id != "" && secret != "" {
-		loadOpts = append(loadOpts, awscfg.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(id, secret, "")))
-	}
+	// The SDK chain supports ECS/IRSA as well as development environment
+	// credentials, including AWS_SESSION_TOKEN for temporary credentials.
+	// Rebuilding a static provider from just key/secret discards that token.
 	// Retries are handled by the upload coordinator so that attempts,
 	// backoff and metrics stay in one place.
 	loadOpts = append(loadOpts, awscfg.WithRetryMaxAttempts(1))
@@ -63,7 +56,13 @@ func NewS3Store(ctx context.Context, cfg config.StorageConfig) (*S3Store, error)
 
 	describe := fmt.Sprintf("s3://%s region=%s", cfg.Bucket, awsCfg.Region)
 	if cfg.Endpoint != "" {
-		describe += " endpoint=" + cfg.Endpoint
+		if u, err := url.Parse(cfg.Endpoint); err == nil {
+			u.User, u.RawQuery, u.Fragment, u.RawFragment = nil, "", "", ""
+			u.ForceQuery = false
+			describe += " endpoint=" + u.String()
+		} else {
+			describe += " endpoint=<invalid>"
+		}
 	}
 	return &S3Store{
 		client:   s3.NewFromConfig(awsCfg, s3Opts...),
@@ -76,6 +75,9 @@ func (s *S3Store) Describe() string { return s.describe }
 
 func (s *S3Store) Put(ctx context.Context, obj Object) (string, error) {
 	if err := validateKey(obj.Key); err != nil {
+		return "", err
+	}
+	if err := obj.Preconditions.validate(); err != nil {
 		return "", err
 	}
 	in := &s3.PutObjectInput{
@@ -93,6 +95,13 @@ func (s *S3Store) Put(ctx context.Context, obj Object) (string, error) {
 	if len(obj.Metadata) > 0 {
 		in.Metadata = obj.Metadata
 	}
+	if len(obj.Tags) > 0 {
+		tags := url.Values{}
+		for key, value := range obj.Tags {
+			tags.Set(key, value)
+		}
+		in.Tagging = aws.String(tags.Encode())
+	}
 	// Conditional writes are what make single-writer ownership enforceable.
 	// If-None-Match claims a key that must not already exist; If-Match is a
 	// compare-and-swap against the version this caller last observed.
@@ -108,7 +117,10 @@ func (s *S3Store) Put(ctx context.Context, obj Object) (string, error) {
 		}
 		return "", fmt.Errorf("s3 put %s: %w", obj.Key, redactRequestID(err))
 	}
-	return aws.ToString(out.ETag), nil
+	if etag := aws.ToString(out.ETag); etag != "" {
+		return etag, nil
+	}
+	return "", fmt.Errorf("s3 put %s returned no ETag", obj.Key)
 }
 
 // isPreconditionFailed recognises a refused conditional write.
@@ -154,9 +166,12 @@ func (s *S3Store) Get(ctx context.Context, key string) ([]byte, string, error) {
 	}
 	defer out.Body.Close()
 	// Manifests are small; cap the read so a wrong key cannot exhaust memory.
-	body, err := io.ReadAll(io.LimitReader(out.Body, 8<<20))
+	body, err := readControlBody(out.Body)
 	if err != nil {
 		return nil, "", fmt.Errorf("s3 get %s body: %w", key, err)
+	}
+	if aws.ToString(out.ETag) == "" {
+		return nil, "", fmt.Errorf("s3 get %s returned no ETag", key)
 	}
 	return body, aws.ToString(out.ETag), nil
 }
@@ -213,11 +228,4 @@ func redactRequestID(err error) error {
 		return fmt.Errorf("%s failed: %v", urlErr.Op, urlErr.Err)
 	}
 	return err
-}
-
-// devCredentials reads the static keys used to talk to MinIO or LocalStack.
-// Production deployments leave these unset and rely on the ECS task role or
-// EKS IRSA credentials resolved by the default chain.
-func devCredentials() (string, string) {
-	return os.Getenv("AWS_ACCESS_KEY_ID"), os.Getenv("AWS_SECRET_ACCESS_KEY")
 }

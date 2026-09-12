@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -83,6 +84,9 @@ type Worker struct {
 	// lastManifestAt is when a manifest was last stored successfully. Guarded
 	// by mu because the scrape-time collector reads it.
 	lastManifestAt time.Time
+	// firstSegmentAt anchors manifest lag when no media manifest has ever
+	// succeeded. An initial empty ownership fence is not playable media.
+	firstSegmentAt time.Time
 	// spoolStatsAt rate limits the spool directory scan behind the spool
 	// gauges, which would otherwise run on every tick for every channel.
 	spoolStatsAt time.Time
@@ -92,6 +96,9 @@ type Worker struct {
 	// that has been taken over discovers it on its next publish instead of
 	// clobbering the new owner's timeline.
 	manifestETag string
+	// pendingManifest retains an ambiguous write across failed readbacks.
+	// Its identity must survive until the stored version can be inspected.
+	pendingManifest *manifestWrite
 	// lease is this worker's claim on the camera. It gates starting ffmpeg;
 	// the manifest ETag is what actually fences writes.
 	lease *leaseHolder
@@ -238,20 +245,6 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 				"local_list_size x segment length when the object store is failing, and "+
 				"segments are reclaimed after that.", labels...),
 	}
-	w.mLeaseExpiresAt = reg.GaugeFunc("transmux_channel_lease_seconds_remaining",
-		"Seconds until this shard must stop publishing unless it renews. It falls to 0 "+
-			"when the lease is not held.", w.leaseSecondsRemaining, labels...)
-	// Values that decay with wall-clock time are computed at scrape time.
-	// Stored gauges for these went stale during reconnect backoff and in the
-	// failed state, which is exactly when an operator reads them.
-	w.mGapSeconds = reg.GaugeFunc("transmux_channel_seconds_since_segment",
-		"Seconds since the most recently published segment.", w.secondsSinceSegment, labels...)
-	w.mGapAlarm = reg.GaugeFunc("transmux_channel_segment_gap_alarm",
-		"1 when a receiving channel has exceeded its allowed segment gap.", w.gapAlarm, labels...)
-	w.mManifestLag = reg.GaugeFunc("transmux_channel_seconds_since_manifest",
-		"Seconds since the last successfully stored manifest. Unlike the segment gap "+
-			"this covers the publish step, so it rises when only the manifest PUT fails.",
-		w.secondsSinceManifest, labels...)
 	w.snap = Snapshot{
 		CenterID:  cam.CenterID,
 		CameraID:  cam.CameraID,
@@ -284,13 +277,30 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 		w.log.Info("checkpoint loaded, pending validation against the published manifest",
 			"last_sequence", cp.LastSequence)
 	}
-	w.lease = newLeaseHolder(up, w.objectKey(LeaseObjectName), cam.Key(), cfg.ShardID, session,
+	var leaseClient storage.ControlClient = up
+	if provider, ok := up.(interface{ LeaseClient() storage.ControlClient }); ok {
+		leaseClient = provider.LeaseClient()
+	}
+	w.lease = newLeaseHolder(leaseClient, w.objectKey(LeaseObjectName), cam.Key(), cfg.ShardID, session,
 		leaseTuning{
 			TTL:              cfg.Lease.TTL.Duration,
 			RenewInterval:    cfg.Lease.RenewInterval.Duration,
 			MaxClockSkew:     cfg.Lease.MaxClockSkew.Duration,
 			OperationTimeout: cfg.Lease.OperationTimeout.Duration,
 		})
+	// Publishing a callback makes this worker visible to concurrent scrapes.
+	// All state it reads, especially lease, must already be initialized.
+	w.mLeaseExpiresAt = reg.GaugeFunc("transmux_channel_lease_seconds_remaining",
+		"Seconds until this shard must stop publishing unless it renews. It falls to 0 "+
+			"when the lease is not held.", w.leaseSecondsRemaining, labels...)
+	w.mGapSeconds = reg.GaugeFunc("transmux_channel_seconds_since_segment",
+		"Seconds since the most recently published segment.", w.secondsSinceSegment, labels...)
+	w.mGapAlarm = reg.GaugeFunc("transmux_channel_segment_gap_alarm",
+		"1 when a receiving channel has exceeded its allowed segment gap.", w.gapAlarm, labels...)
+	w.mManifestLag = reg.GaugeFunc("transmux_channel_seconds_since_manifest",
+		"Seconds since the last successfully stored media manifest, or the first "+
+			"stored segment while the initial manifest is still pending.",
+		w.secondsSinceManifest, labels...)
 	return w
 }
 
@@ -311,6 +321,9 @@ func NewWorker(cam camera.Camera, cfg config.Config, up ObjectClient, reg *metri
 //	manifest foreign    fail closed; it belongs to another writer and only an
 //	                    operator can decide what that means
 func (w *Worker) recover(ctx context.Context) error {
+	if w.checkpointFloor == math.MaxUint64 {
+		return fmt.Errorf("checkpoint media sequence is exhausted")
+	}
 	key := w.objectKey(w.cfg.Storage.ManifestName)
 	body, etag, err := w.uploader.Get(ctx, key)
 	if err != nil {
@@ -347,6 +360,12 @@ func (w *Worker) recover(ctx context.Context) error {
 		// The object exists but is not one of ours. Overwriting it blindly
 		// could clobber another writer's stream, so refuse.
 		return fmt.Errorf("published manifest %s is not usable for recovery: %w", key, err)
+	}
+	if pub.Floor() == math.MaxUint64 {
+		return fmt.Errorf("published manifest media sequence is exhausted")
+	}
+	if etag == "" {
+		return fmt.Errorf("%w: manifest has no ETag", ErrLeaseUnavailable)
 	}
 
 	w.mu.Lock()
@@ -432,6 +451,9 @@ func (w *Worker) leaseSecondsRemaining() float64 {
 func (w *Worker) secondsSinceManifest() float64 {
 	w.mu.RLock()
 	last := w.lastManifestAt
+	if last.IsZero() {
+		last = w.firstSegmentAt
+	}
 	w.mu.RUnlock()
 	if last.IsZero() {
 		return 0
@@ -464,7 +486,8 @@ func (w *Worker) healthyLocked() bool {
 	if w.snap.LastSegmentAt == nil {
 		return false
 	}
-	return time.Since(*w.snap.LastSegmentAt) <= w.gapAllowance()
+	return time.Since(*w.snap.LastSegmentAt) <= w.gapAllowance() &&
+		!w.lastManifestAt.IsZero() && time.Since(w.lastManifestAt) <= w.gapAllowance()
 }
 
 // gapAllowance is how long a receiving channel may go without a segment
@@ -537,6 +560,8 @@ func (w *Worker) Run(ctx context.Context) {
 			// is publishing this camera now and our spool belongs to a
 			// timeline that is no longer authoritative.
 			w.log.Error("channel disabled: ownership of the published stream was lost")
+			w.lease.drop()
+			w.mLeaseHeld.Set(0)
 			w.setState(StateFailed)
 			w.mFailed.Inc()
 			<-ctx.Done()
@@ -562,6 +587,8 @@ func (w *Worker) Run(ctx context.Context) {
 			w.setError(err)
 			w.setState(StateFailed)
 			w.mFailed.Inc()
+			w.lease.drop()
+			w.mLeaseHeld.Set(0)
 			// Stop renewing a lease we have been fenced out of, rather than
 			// leaving the goroutine to discover it on its own schedule.
 			ownershipLost()
@@ -585,7 +612,7 @@ func (w *Worker) Run(ctx context.Context) {
 		delay := w.bo.Next()
 		w.setState(StateReconnecting)
 		w.log.Info("reconnecting", "delay", delay.String(), "attempt", w.bo.Attempt())
-		if !sleepCtx(ctx, delay) {
+		if !sleepCtx(ownedCtx, delay) && ctx.Err() != nil {
 			return
 		}
 	}
@@ -749,6 +776,7 @@ func (w *Worker) fenceManifest(ctx context.Context) error {
 			w.log.Warn("manifest changed under us while fencing, re-reading")
 			w.mu.Lock()
 			w.needsRecovery = true
+			w.pendingManifest = nil
 			w.mu.Unlock()
 			return fmt.Errorf("%w: manifest changed while fencing", ErrLeaseUnavailable)
 		}
@@ -839,7 +867,15 @@ func (w *Worker) runGeneration(ctx context.Context, generation int) error {
 	// The previous generation's spool is about to be destroyed. Try once more
 	// to flush it: the reconnect backoff has just elapsed, which is enough
 	// time for a brief object-store outage to have cleared.
-	w.flushPreviousGeneration(ctx)
+	if err := w.flushPreviousGeneration(ctx); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if w.lease.Expired() {
+		return ErrLeaseLost
+	}
 	if err := w.accountDiscardedSpool(); err != nil {
 		w.log.Warn("could not account for discarded spool files", "error", err)
 	}
@@ -847,10 +883,13 @@ func (w *Worker) runGeneration(ctx context.Context, generation int) error {
 		return err
 	}
 	args, err := ffmpeg.BuildArgs(ffmpeg.Spec{
-		RTSPURL:  w.cam.RTSPURL,
-		SpoolDir: w.spoolDir,
-		Cfg:      w.cfg.FFmpeg,
-		Segment:  w.cfg.Segment,
+		RTSPURL:    w.cam.RTSPURL,
+		SpoolDir:   w.spoolDir,
+		Cfg:        w.cfg.FFmpeg,
+		Segment:    w.cfg.Segment,
+		Audio:      w.cam.Audio,
+		Format:     w.cam.Format,
+		VideoCodec: w.cam.VideoCodec,
 	})
 	if err != nil {
 		return err
@@ -987,14 +1026,14 @@ const finalDrainTimeout = 15 * time.Second
 // store was unavailable. By the time the next generation starts, the
 // reconnect backoff has elapsed, so a transient outage has had time to clear
 // and those segments can still be saved.
-func (w *Worker) flushPreviousGeneration(ctx context.Context) {
+func (w *Worker) flushPreviousGeneration(ctx context.Context) error {
 	if w.prevGen == nil {
-		return
+		return nil
 	}
 	gen := w.prevGen
 	w.prevGen = nil
 	if ctx.Err() != nil || w.lease.Expired() {
-		return
+		return ErrLeaseLost
 	}
 	drainCtx, cancel := context.WithTimeout(ctx, finalDrainTimeout)
 	defer cancel()
@@ -1002,12 +1041,16 @@ func (w *Worker) flushPreviousGeneration(ctx context.Context) {
 	if err != nil {
 		w.log.Warn("carry-over drain incomplete, spooled segments will be discarded",
 			"uploaded", res.Uploaded, "error", err)
-		return
+		if errors.Is(err, ErrLeaseLost) {
+			return err
+		}
+		return nil
 	}
 	if res.Uploaded > 0 {
 		w.log.Info("carry-over drain rescued segments from the previous generation",
 			"count", res.Uploaded)
 	}
+	return nil
 }
 
 // accountDiscardedSpool counts segments that are about to be destroyed with
@@ -1027,7 +1070,7 @@ func (w *Worker) accountDiscardedSpool() error {
 	}
 	discarded := 0
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ts") {
+		if e.IsDir() || !ffmpeg.ValidSegmentName(e.Name()) {
 			continue
 		}
 		discarded++
@@ -1042,6 +1085,10 @@ func (w *Worker) accountDiscardedSpool() error {
 
 // drainState is per-generation bookkeeping for the spool scanner.
 type drainState struct {
+	// The init object is content-addressed and copied into each capture
+	// date. A date-based retention policy can then delete whole days without
+	// breaking a later day's fragments from a long-running RTSP session.
+	initURI string
 	// lastLocalIndex is the highest ffmpeg segment index already handled,
 	// meaning uploaded or accounted for as lost.
 	lastLocalIndex int
@@ -1097,6 +1144,9 @@ func newDrainState() *drainState {
 // breaks playback for every viewer at once, whereas a stored segment that is
 // not yet listed is invisible and harmless.
 func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error) {
+	if w.lease.Expired() {
+		return drainResult{}, ErrLeaseLost
+	}
 	playlistPath := filepath.Join(w.spoolDir, ffmpeg.LocalPlaylistName)
 	raw, err := os.ReadFile(playlistPath)
 	if err != nil {
@@ -1137,24 +1187,25 @@ func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error
 		if !ok {
 			continue
 		}
-		// The playlist is a file on disk; treat its contents as untrusted
-		// input rather than joining an arbitrary string onto the spool path.
-		if !ffmpeg.ValidSegmentName(seg.Name) {
-			w.log.Error("ignoring a playlist entry that is not a segment name",
-				"name", seg.Name)
-			gen.processed[seg.Name] = true
+		if idx <= gen.lastLocalIndex {
 			continue
 		}
 		// Detect segments that ffmpeg created and then reclaimed before we
 		// got to them. This is real data loss and must be visible.
-		if gen.lastLocalIndex >= 0 && idx > gen.lastLocalIndex+1 {
+		if idx > gen.lastLocalIndex+1 {
 			missed := idx - gen.lastLocalIndex - 1
 			w.recordLost(missed)
 			w.log.Error("segments reclaimed before upload",
 				"count", missed, "from_index", gen.lastLocalIndex+1, "to_index", idx-1)
+			// Account for the gap now, even if the following upload fails.
+			// Otherwise every retry counts the same missing files again.
+			gen.lastLocalIndex = idx - 1
 		}
 
 		if err := w.publishSegment(ctx, gen, seg); err != nil {
+			if errors.Is(err, ErrLeaseLost) {
+				return res, err
+			}
 			if errors.Is(err, fs.ErrNotExist) {
 				// Already reclaimed by ffmpeg's delete_segments between the
 				// playlist being written and the upload slot being granted.
@@ -1193,6 +1244,9 @@ func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error
 	// storm that tells an operator nothing new.
 	if w.manifestDirty && (res.Uploaded > 0 || !time.Now().Before(w.manifestRetryAfter)) {
 		if err := w.publishManifest(ctx); err != nil {
+			if errors.Is(err, ErrLeaseLost) {
+				return res, err
+			}
 			w.manifestRetryAfter = time.Now().Add(w.cfg.Segment.TargetDuration.Duration)
 			if firstErr == nil {
 				firstErr = err
@@ -1201,7 +1255,8 @@ func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error
 	}
 	// Bound the processed set: entries for segments that have scrolled out
 	// of ffmpeg's playlist can never reappear within this generation.
-	if len(gen.processed) > 4*w.cfg.Segment.LocalListSize {
+	if len(gen.processed) > 4*w.cfg.Segment.LocalListSize ||
+		len(gen.fallbackPDT) > 4*w.cfg.Segment.LocalListSize {
 		pruneProcessed(gen, local)
 	}
 	return res, firstErr
@@ -1213,7 +1268,17 @@ func (w *Worker) drain(ctx context.Context, gen *drainState) (drainResult, error
 // the number of segments resident in memory is bounded by upload concurrency
 // rather than by channel count.
 func (w *Worker) publishSegment(ctx context.Context, gen *drainState, seg hls.LocalSegment) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if w.lease.Expired() {
+		return ErrLeaseLost
+	}
 	w.mu.Lock()
+	if w.lastSequence == math.MaxUint64 {
+		w.mu.Unlock()
+		return fmt.Errorf("%w: media sequence exhausted", ErrLeaseLost)
+	}
 	seqNo := w.lastSequence + 1
 	// A discontinuity comes from either side: the supervisor knows about
 	// reconnects and restarts, and ffmpeg reports the ones it saw inside a
@@ -1243,8 +1308,21 @@ func (w *Worker) publishSegment(ctx context.Context, gen *drainState, seg hls.Lo
 	// The date directory comes from the segment's own wall-clock anchor, not
 	// from time.Now at upload time, so a slow upload near midnight still
 	// files the segment under the day it was captured.
+	extension, contentType := ".ts", hls.ContentTypeSegment
+	initURI := ""
+	if strings.HasSuffix(seg.Name, ".m4s") {
+		if seg.InitName != "init.mp4" {
+			return fmt.Errorf("fMP4 fragment has no supported initialization map")
+		}
+		var err error
+		initURI, err = w.publishInit(ctx, gen, pdt)
+		if err != nil {
+			return err
+		}
+		extension, contentType = ".m4s", "video/mp4"
+	}
 	relURI := path.Join(pdt.UTC().Format("2006/01/02"),
-		fmt.Sprintf("seg-%09d-%d.ts", seqNo, pdt.UTC().UnixMilli()))
+		fmt.Sprintf("seg-%09d-%d%s", seqNo, pdt.UTC().UnixMilli(), extension))
 	key := w.objectKey(relURI)
 
 	// The write identity must be stable across retries of the same segment,
@@ -1256,7 +1334,8 @@ func (w *Worker) publishSegment(ctx context.Context, gen *drainState, seg hls.Lo
 	putID := w.session + ":" + strconv.FormatUint(seqNo, 10)
 	size, _, err := w.uploader.PutFile(ctx, storage.Object{
 		Key:         key,
-		ContentType: hls.ContentTypeSegment,
+		ContentType: contentType,
+		Tags:        storage.RetentionTags(w.cfg.Storage.TagMedia, false),
 		// Segments are immutable, so they can be cached indefinitely.
 		CacheControl: "public, max-age=31536000, immutable",
 		// Written now so a recording index can be built later without
@@ -1274,6 +1353,7 @@ func (w *Worker) publishSegment(ctx context.Context, gen *drainState, seg hls.Lo
 			"center-id":     w.cam.CenterID,
 			"camera-id":     w.cam.CameraID,
 			"put-id":        putID,
+			"init-uri":      initURI,
 		},
 		// Create-only. A segment key is immutable and cached for a year, so
 		// overwriting one is cache poisoning rather than a correction. If the
@@ -1306,6 +1386,7 @@ func (w *Worker) publishSegment(ctx context.Context, gen *drainState, seg hls.Lo
 	published := hls.PublishedSegment{
 		Sequence:        seqNo,
 		URI:             relURI,
+		InitURI:         initURI,
 		Duration:        seg.Duration,
 		ProgramDateTime: pdt,
 		Discontinuity:   disc,
@@ -1316,6 +1397,16 @@ func (w *Worker) publishSegment(ctx context.Context, gen *drainState, seg hls.Lo
 	w.mu.Lock()
 	w.lastSequence = seqNo
 	w.pendingDiscontinuity = false
+	if len(w.window) > 0 && (w.window[len(w.window)-1].InitURI != "") != (initURI != "") {
+		// EXT-X-MAP cannot be unset. Start a fresh window when the operator
+		// changes containers so a TS segment cannot inherit an old MP4 map.
+		for _, old := range w.window {
+			if old.Discontinuity {
+				w.discontinuitySequence++
+			}
+		}
+		w.window = nil
+	}
 	w.window = append(w.window, published)
 	for len(w.window) > w.cfg.Segment.LiveWindow {
 		// A discontinuity that scrolls out of the window must be accounted
@@ -1330,6 +1421,9 @@ func (w *Worker) publishSegment(ctx context.Context, gen *drainState, seg hls.Lo
 	w.snap.BytesPublished += size
 	w.snap.LastSequence = seqNo
 	w.snap.LastSegmentAt = &now
+	if w.firstSegmentAt.IsZero() {
+		w.firstSegmentAt = now
+	}
 	w.mu.Unlock()
 
 	// The segment is stored but no manifest references it yet.
@@ -1436,6 +1530,20 @@ func (w *Worker) publishManifest(ctx context.Context) error {
 func (w *Worker) writeManifest(ctx context.Context, window []hls.PublishedSegment,
 	discSeq, lastSeq uint64, pre storage.Preconditions) (string, error) {
 
+	if pending := w.pendingManifest; pending != nil {
+		etag, err := w.resumeManifest(ctx, pending)
+		if err != nil {
+			return "", err
+		}
+		w.pendingManifest = nil
+		w.mu.Lock()
+		w.manifestETag = etag
+		w.mu.Unlock()
+		pre = manifestPrecondition(etag)
+	}
+	if w.lease.Expired() {
+		return "", ErrLeaseLost
+	}
 	writeID := newID()
 	// LastSequence is recorded explicitly because the window can be empty
 	// while the sequence is far from zero -- recovery drops the window when a
@@ -1451,7 +1559,7 @@ func (w *Worker) writeManifest(ctx context.Context, window []hls.PublishedSegmen
 	})
 	key := w.objectKey(w.cfg.Storage.ManifestName)
 
-	etag, err := w.uploader.Put(ctx, storage.Object{
+	pending := &manifestWrite{id: writeID, object: storage.Object{
 		Key:         key,
 		Body:        body,
 		ContentType: hls.ContentTypeManifest,
@@ -1459,22 +1567,89 @@ func (w *Worker) writeManifest(ctx context.Context, window []hls.PublishedSegmen
 		// browser, otherwise viewers stall on a stale window.
 		CacheControl:  "no-cache, max-age=0",
 		Preconditions: pre,
-	})
+	}}
+	etag, err := w.putManifest(ctx, pending)
+	if err != nil && !errors.Is(err, storage.ErrPreconditionFailed) {
+		w.pendingManifest = pending
+	}
+	return etag, err
+}
+
+type manifestWrite struct {
+	id        string
+	object    storage.Object
+	ambiguous bool
+}
+
+// resumeManifest resolves the previous write before a newer window is sent.
+// If the store is unchanged, replay the exact body and identity: a delayed
+// first request may still land, and must remain recognizable.
+func (w *Worker) resumeManifest(ctx context.Context, pending *manifestWrite) (string, error) {
+	body, etag, err := w.uploader.Get(ctx, pending.object.Key)
+	if errors.Is(err, storage.ErrNotFound) {
+		if pending.object.Preconditions.IfNoneMatch {
+			return w.putManifest(ctx, pending)
+		}
+		return "", storage.ErrPreconditionFailed
+	}
+	if err != nil {
+		return "", err
+	}
+	if etag == "" {
+		return "", fmt.Errorf("manifest readback has no ETag")
+	}
+	pub, err := hls.ParsePublished(body)
+	if err != nil {
+		return "", fmt.Errorf("%w: pending manifest was replaced by an unusable playlist", storage.ErrPreconditionFailed)
+	}
+	if pub.WriteID == pending.id {
+		return etag, nil
+	}
+	if etag != pending.object.Preconditions.IfMatch {
+		return "", storage.ErrPreconditionFailed
+	}
+	if w.lease.Expired() {
+		return "", ErrLeaseLost
+	}
+	return w.putManifest(ctx, pending)
+}
+
+func (w *Worker) putManifest(ctx context.Context, pending *manifestWrite) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if w.lease.Expired() {
+		return "", ErrLeaseLost
+	}
+	etag, err := w.uploader.Put(ctx, pending.object)
+	if err == nil && etag == "" {
+		err = fmt.Errorf("manifest write returned no ETag")
+	}
 	if err == nil {
 		return etag, nil
 	}
-	if errors.Is(err, storage.ErrPreconditionFailed) || ctx.Err() != nil {
+	if errors.Is(err, storage.ErrPreconditionFailed) && !pending.ambiguous {
 		return "", err
 	}
-	// Ambiguous. Read back: if the stored manifest carries our write ID, the
-	// write landed and we own the resulting version.
-	stored, storedETag, gerr := w.uploader.Get(ctx, key)
+	pending.ambiguous = true
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	stored, storedETag, gerr := w.uploader.Get(ctx, pending.object.Key)
 	if gerr != nil {
-		return "", err
+		// A replay's 412 may be our earlier request. Without a readback it
+		// is still ambiguous, not evidence that another owner fenced us.
+		return "", fmt.Errorf("manifest write and readback failed: %v; %v", err, gerr)
 	}
-	if pub, perr := hls.ParsePublished(stored); perr == nil && pub.WriteID == writeID {
+	if pub, perr := hls.ParsePublished(stored); perr == nil && pub.WriteID == pending.id && storedETag != "" {
 		w.log.Warn("manifest write reported an error but landed; adopting it", "error", err)
 		return storedETag, nil
+	}
+	if storedETag != "" && storedETag != pending.object.Preconditions.IfMatch {
+		return "", storage.ErrPreconditionFailed
+	}
+	if errors.Is(err, storage.ErrPreconditionFailed) {
+		return "", fmt.Errorf("manifest replay could not be confirmed: %v", err)
 	}
 	return "", err
 }
@@ -1512,6 +1687,7 @@ func (w *Worker) recordLost(n int) {
 	w.mLost.Add(float64(n))
 	w.mu.Lock()
 	w.snap.SegmentsLost += uint64(n)
+	w.pendingDiscontinuity = true
 	w.mu.Unlock()
 }
 
@@ -1555,7 +1731,7 @@ func (w *Worker) refreshSpoolMetrics() {
 	var files, bytes int64
 	oldest := time.Time{}
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".ts") {
+		if e.IsDir() || (!ffmpeg.ValidSegmentName(e.Name()) && e.Name() != "init.mp4") {
 			continue
 		}
 		info, err := e.Info()
@@ -1590,7 +1766,10 @@ func (w *Worker) Cleanup() {
 }
 
 func parseLocalIndex(name string) (int, bool) {
-	base := strings.TrimSuffix(name, ".ts")
+	if !ffmpeg.ValidSegmentName(name) {
+		return 0, false
+	}
+	base := strings.TrimSuffix(name, filepath.Ext(name))
 	i := strings.LastIndexByte(base, '-')
 	if i < 0 {
 		return 0, false
@@ -1611,6 +1790,11 @@ func pruneProcessed(gen *drainState, local []hls.LocalSegment) {
 	for name := range gen.processed {
 		if !live[name] {
 			delete(gen.processed, name)
+		}
+	}
+	for name := range gen.fallbackPDT {
+		if !live[name] {
+			delete(gen.fallbackPDT, name)
 		}
 	}
 }

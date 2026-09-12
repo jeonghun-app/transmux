@@ -1,38 +1,62 @@
-# transmux — RTSP → HLS 경량 트랜스먹싱 모듈
+# transmux — IP 카메라 라이브·녹화 솔루션
 
-**Wowza Streaming Engine의 ingest 경로를 대체한다.** IP 카메라의 RTSP(H.264)를
-**트랜스코딩 없이** HLS 세그먼트로 잘라 S3에 저장한다. 코덱은 건드리지 않는다
-(`-c:v copy`).
+**카메라 관제·녹화에 사용하는 Wowza 경로를 대체한다.** `transmuxd`가
+RTSP 영상을 HLS로 저장하고, `playbackd`가 인증된 라이브·녹화 재생,
+카메라 관리, MP4 내보내기와 운영자 화면을 제공한다.
 
-전달·재생 경로(CDN, 시청자 인증, 재생 URL 발급, 과거 영상 조회)는 구현되어 있지
-않으므로, 이것만으로 Wowza를 전부 대체할 수는 없다. 무엇이 대체되고 무엇이
-남았는지는 [docs/wowza-coverage.md](docs/wowza-coverage.md)에 기능별로 정리했다.
+H.264/MPEG-TS와 H.264·H.265/fMP4를 지원한다. 영상은 재인코딩하지 않고
+복사한다(`-c:v copy`). 음성은 카메라별로 제외, 복사 또는 AAC 변환을 선택한다.
+비공개 S3의 영상은 센터·카메라 권한을 검사하는 재생 서버를 통해 전달한다.
 
 ```
-IP 카메라 ──RTSP/TCP──> ffmpeg (stream copy) ──> tmpfs 스풀 ──> Go 업로더 ──> S3
-                            ▲                                      │
-                            └────── Go supervisor ─────────────────┘
-                                    (상태·재연결·헬스체크)
+IP 카메라 ──RTSP/TCP──> transmuxd ──> 비공개 S3
+                          │               │
+                    소유권·재연결         ├──> 녹화 인덱스
+                                          │        │
+                                          └──> playbackd ──> 관제 화면·클라이언트
+                                               인증·HLS·MP4
 ```
 
 채널마다 ffmpeg 프로세스 하나를 Go supervisor가 관리한다. 근거와 대안
 검토는 [docs/adr/0001-architecture.md](docs/adr/0001-architecture.md),
 실측 용량은 [docs/capacity-model.md](docs/capacity-model.md).
 
-**이 모듈은 ingest 경로다.** 고객 디바이스가 여기에 어떻게 접속해 재생하는지
-(CDN, 인증, 재생 URL, 과거 영상 조회)는 아직 구현되어 있지 않다. 설계와 남은
-결정 사항은 [docs/adr/0002-delivery-playback.md](docs/adr/0002-delivery-playback.md).
+실행·API·배포 계약은 [솔루션 가이드](docs/solution.md),
+실제 대체 범위와 남은 조건은 [Wowza 대체 범위](docs/wowza-coverage.md),
+현재 전달 구조의 결정은 [ADR 0003](docs/adr/0003-camera-solution.md)에 정리했다.
+WebRTC·RTMP·SRT·ABR 등 방송 서버의 모든 기능을 제공하는 제품은 아니다.
 
 ## 빠른 시작
 
-호스트에 Go나 ffmpeg을 설치할 필요는 없다. 모든 작업은 컨테이너에서 돈다.
+Docker/Compose v2와 Python 3가 필요하다. 호스트에 Go나 ffmpeg을 설치할 필요는 없다.
+빌드·검사는 Go 1.26.8 / Alpine 3.23, 런타임은 Alpine 3.23을 사용한다.
+
+```bash
+make solution-up      # 비공개 저장소 + 수집·재생 서버 + 모의 카메라 3대
+make solution-verify  # 인증, 라이브·녹화, Range, MP4 실제 디코딩
+make solution-down    # 중지; 녹화·설정 볼륨은 보존
+```
+
+운영자 화면은 `http://localhost:8090`이다. `admin`과 `viewer`의 비밀번호는
+자동 생성된 `.env.solution`에 있다. 계정·포트 설정과 브라우저 검증은
+[솔루션 가이드](docs/solution.md#로컬-실행)를 참고한다.
+
+개발 검사:
 
 ```bash
 make help          # 사용 가능한 타겟
+make fmt-check     # Go 포맷 검사
+make vet           # 정적 검사
 make test          # 단위 테스트
+make race          # 동시성 검사
+make vuln          # 모듈 무결성 및 도달 가능한 Go 취약점 검사
 make test-ffmpeg   # 실제 ffmpeg이 필요한 통합 테스트
 make image         # 런타임 이미지 빌드
+```
 
+기존 수집 전용 PoC와 용량 측정 구성도 유지한다.
+
+```bash
 make poc-up        # 가짜 카메라 2대 + MediaMTX + transmuxd + MinIO
 make poc-up-capacity  # 위 + 용량 측정용 1080p/D1/720p 소스
 make poc-verify    # 종단 검증 (재생 가능성, 매니페스트 정합성)
@@ -64,11 +88,14 @@ CPU 시간을 측정하고, ffmpeg과 supervisor를 분리해 보여주며, 채�
 
 ## 설정
 
-JSON 파일 하나로 설정한다(`configs/poc.json` 참고). 알 수 없는 키가 있으면
-기동을 거부하므로 오타가 조용히 기본값으로 넘어가지 않는다.
+수집과 재생은 각각 JSON 파일로 설정한다(`configs/solution-ingest.json`,
+`configs/solution-playback.json`). 알 수 없는 키, 잘못된 카메라
+식별자·RTSP URL, 중복 카메라, 잘못된 HTTP endpoint, 안전하지 않은 객체 prefix는
+기동 전에 거부한다. `-validate`에도 동일한 검증을 적용한다.
 
 ```bash
 transmuxd -config /etc/transmux/config.json -validate   # 설정만 검사
+playbackd -config /etc/transmux/playback.json -validate
 ```
 
 주요 항목:
@@ -83,33 +110,53 @@ transmuxd -config /etc/transmux/config.json -validate   # 설정만 검사
 | `ffmpeg.stall_timeout` | 세그먼트 미생성 시 ffmpeg 종료 임계 | 버전 독립적인 주 단절 감지기 |
 | `ffmpeg.input_args` | `-i` 앞에 넣을 추가 인자 | 버전별 소켓 타임아웃 옵션을 넣는 자리 |
 | `storage.endpoint` / `force_path_style` | MinIO/LocalStack용 | 프로덕션에서는 비운다 |
-| `cameras.provider` | `static` 또는 `http` | `http`는 외부 DB/API에서 동적 로드 |
-| `lease.ttl` | 소유권 만료 시간 | 죽은 샤드의 카메라를 다른 샤드가 인수하기까지의 최악 지연 |
-| `lease.renew_interval` | 갱신 주기 | `ttl > 2×renew_interval + operation_timeout + max_clock_skew`가 검증에서 강제된다. 갱신 하나를 놓쳐도 다음 시도가 자기 마감 전에 끝날 수 있어야 한다 |
+| `upload.max_concurrent` | 세그먼트·매니페스트 저장 요청 동시성 | 소유권 요청에는 별도로 `min(16, max_concurrent)`개의 슬롯을 예약해 업로드 적체가 lease 갱신을 막지 않게 한다 |
+| `storage.tag_media` | 보존용 `transmux-kind` 객체 태그 | 기본 꺼짐. 켜면 `s3:PutObjectTagging` 필요; 제어 객체에는 태그를 붙이지 않는다 |
+| `cameras.provider` | `static`, `http`, `object` | `object`는 조건부 갱신되는 공유 목록과 관리 API를 사용 |
+| `cameras.shard_filter` | 담당 수집 서버 ID | 목록의 `shard_id`가 일치하는 카메라만 수집 |
+| `cameras.static[].format` | `mpegts` 또는 `fmp4` | 기본 `mpegts`; HEVC에는 `fmp4` 권장 |
+| `cameras.static[].video_codec` | `auto`, `h264`, `hevc` | HEVC는 `fmp4`와 함께 지정하면 Apple 호환 `hvc1` 표시 적용 |
+| `cameras.static[].audio` | `none`, `copy`, `aac` | 기본 `none`; G.711 등은 `aac`로 변환 |
+| `lease.ttl` | 소유권 만료 시간 | 장애 인수에는 TTL에 시계 오차 여유 `2×max_clock_skew`, 다음 로스터/lease 확인과 저장 요청 시간이 더해진다 |
+| `lease.renew_interval` | 갱신 주기 | `ttl > 2×renew_interval + 2×operation_timeout + max_clock_skew`를 강제한다. 갱신 하나를 놓쳐도 다음 쓰기와 응답 유실 확인이 자기 마감 전에 끝나야 한다 |
 | `lease.operation_timeout` | lease 요청 하나의 상한 | `upload.put_timeout`과 분리한다. lease 레코드는 수백 바이트, 세그먼트는 수 MB라 같이 묶으면 한쪽이 반드시 잘못 잡힌다 |
 | `lease.max_clock_skew` | 샤드 간 시계 오차 상한 가정 | 인수자는 만료 후 이만큼 더 기다리고, 소유자는 이만큼 먼저 멈춘다. 호스트에 NTP가 필요하다 |
 
-자격증명: 프로덕션은 ECS task role 또는 EKS IRSA를 쓴다.
-`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`는 MinIO 개발용으로만 읽는다.
+자격증명은 AWS SDK의 기본 체인으로 읽는다. 프로덕션은 ECS task role 또는 EKS
+IRSA를 권장하며, MinIO 개발 환경은 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`를
+사용한다. 임시 환경 자격증명을 사용할 때는 `AWS_SESSION_TOKEN`도 함께 전달된다.
 
-필요한 S3 권한은 ingest prefix에 대한 `s3:PutObject`와, 시퀀스 복구를 위한
-매니페스트 키의 `s3:GetObject`다. `state_dir`에 영속 볼륨은 **필요하지 않다** —
+필요한 S3 권한은 ingest prefix의 `s3:PutObject`와 `s3:GetObject`다. 읽기 권한은
+매니페스트·lease 및 세그먼트의 충돌 확인용 HEAD까지 포함한다. 또한 없는 키에 대한
+GET을 `404`로 구분하려면 버킷의 `s3:ListBucket` 권한이 필요하다. 이 권한이 없으면
+S3는 없는 키에도 `403`을 반환할 수 있고, 데몬은 새 카메라라고 추측하지 않고
+소유권 확인을 기다린다. `transmuxd`는 목록 조회나 객체 삭제 API를 호출하지 않는다.
+`playbackd`에는 인덱싱용 목록 권한이 필요하고, 보존 삭제를 켜면 미디어 삭제 권한도
+필요하다. 역할별 권한은 [보안 정책](SECURITY.md)을 참고한다.
+
+수집의 `state_dir`에 영속 볼륨은 **필요하지 않다** —
 기동할 때마다 발행 매니페스트를 읽어 시퀀스를 확정하며, 로컬 체크포인트는
 "이 값 이하로는 절대 내려가지 않는다"는 하한으로만 쓴다. 체크포인트는 매니페스트
 PUT이 성공한 **뒤에** 기록되므로 그 사이에 죽으면 매니페스트보다 뒤처질 수 있고,
 따라서 단독 권위가 될 수 없다. 두 값 중 큰 쪽을 채택한다.
+재생의 녹화 인덱스·고정 VOD 목록에는 별도의 영속 디스크를 사용한다.
 
 ## 객체 레이아웃
 
 ```
 s3://bucket/{prefix}/{center_id}/{camera_id}/{YYYY}/{MM}/{DD}/seg-{sequence}-{unixms}.ts
+s3://bucket/{prefix}/{center_id}/{camera_id}/{YYYY}/{MM}/{DD}/seg-{sequence}-{unixms}.m4s
+s3://bucket/{prefix}/{center_id}/{camera_id}/{YYYY}/{MM}/{DD}/init-{sha256}.mp4
 s3://bucket/{prefix}/{center_id}/{camera_id}/index.m3u8
+s3://bucket/{prefix}/{center_id}/{camera_id}/_transmux/lease.json
+s3://bucket/_transmux/rosters/{name}.json
 ```
 
 세그먼트에는 S3 user metadata가 붙는다(`sequence`, `pdt-ms`, `duration-ms`,
 `discontinuity`, `center-id`, `camera-id`). 실제 duration은 객체 키에서 복원할 수
-없고 다음 세그먼트 timestamp로 추정하면 카메라 단절 구간에서 틀리기 때문에,
-나중에 녹화 인덱스를 만들 수 있도록 업로드 시점에 기록한다.
+없고 다음 세그먼트 timestamp로 추정하면 카메라 단절 구간에서 틀리기 때문에
+업로드 시점에 기록한다. fMP4에는 `init-uri`도 기록한다.
+`playbackd`의 백그라운드 인덱서가 이를 검증해 시간 인덱스를 만들고 복구한다.
 
 세그먼트는 요구사항대로 날짜 디렉터리에 들어가고, 라이브 매니페스트는
 카메라 루트에 둔다. 매니페스트를 날짜 디렉터리에 두면 자정마다 재생 URL이
@@ -118,12 +165,12 @@ s3://bucket/{prefix}/{center_id}/{camera_id}/index.m3u8
 날짜는 업로드 시각이 아니라 세그먼트 자신의 wall-clock 기준이다. 자정
 직전에 촬영된 세그먼트가 업로드 지연 때문에 다음 날짜로 넘어가지 않는다.
 
-## 모니터링
+## 수집 서버 모니터링
 
 | 엔드포인트 | 용도 |
 |---|---|
 | `GET /livez` | 프로세스 생존만. 카메라나 S3 장애에 영향받지 않는다 |
-| `GET /readyz` | 로스터 로드 완료 + 정상 채널이 절반 이상 (degraded가 과반이면 실패) |
+| `GET /readyz` | 로스터 로드 완료 + 정상 채널이 절반 이상 (세그먼트 저장과 매니페스트 발행이 모두 최근이어야 정상) |
 | `GET /healthz` | Zabbix/WhaTap용 집계. 항상 200이며 본문 필드로 알람 |
 | `GET /channels` | 전체 채널 인벤토리 |
 | `GET /channels/{center_id}/{camera_id}` | 개별 채널 |
@@ -162,10 +209,12 @@ s3://bucket/{prefix}/{center_id}/{camera_id}/index.m3u8
    재시도인지(`put-id` 일치) 남의 것인지 `HEAD`로 확인하고, 남의 것이면 덮어쓰지
    않고 채널을 멈춘다.
 
-조건부 쓰기는 **재시도하지 않는다.** 착지했는데 응답만 유실된 경우 재시도는 자기
+업로드 계층은 조건부 쓰기를 **자동 재시도하지 않는다.** 착지했는데 응답만 유실된 경우 재시도는 자기
 전제조건이 이미 소비된 것을 보고 412를 받는데, 그건 "남에게 밀렸다"와 구별되지
 않는다. 어떤 write ID를 썼는지 아는 호출자만 판단할 수 있으므로, 호출자가 읽어서
-확인한다.
+확인한다. 확인 요청까지 실패하면 원래 쓰기 식별자와 본문을 보관하고 다음 시도에서
+먼저 다시 읽는다. 저장 버전이 그대로인 경우에만 같은 식별자로 다시 시도하고,
+자기 쓰기가 확인되면 해당 ETag를 채택한 뒤 최신 매니페스트를 발행한다.
 
 빈 윈도우로 fence를 쓰는 경우가 있다(체크포인트 floor가 매니페스트보다 앞설 때
 윈도우를 버린다). 그래서 매니페스트 본문에 `# transmux-last-sequence`로 지금까지
@@ -224,43 +273,59 @@ S3 일시 장애로 liveness를 실패시키면 오케스트레이터가 컨테�
 `seconds_since_segment`, `seconds_since_manifest`, `segment_gap_alarm`은 스크랩
 시점에 계산한다. 저장된 게이지로 두면 재연결 backoff 중이나 `failed` 상태에서
 갱신이 멈춰, 정작 필요한 순간에 오래된 값을 보게 된다.
+첫 미디어 매니페스트가 한 번도 성공하지 않았어도 `seconds_since_manifest`는
+첫 세그먼트 저장 시각부터 증가한다. 세그먼트만 저장되고 매니페스트가 발행되지 않는
+채널은 정상으로 보고하지 않는다.
+
+HTTP 카메라 목록은 `StaticCamera` JSON 배열 계약을 따른다. 알 수 없는 필드,
+8MiB를 넘는 응답, 뒤에 다른 문서가 붙은 응답, `null`은 오류로 처리하고 기존
+채널을 유지한다. 전체 카메라를 해제하려면 명시적으로 `[]`를 반환해야 한다.
 
 ## 알려진 제약과 미구현
 
-- **오디오 미지원.** 현재 `-an`으로 제거한다. HLS/MPEG-TS에서 AAC는
-  가능하지만 G.711은 아니므로 카메라별 코덱 정책이 정해져야 한다.
-- **H.265 미검증.** `.ts`만 생성한다. HEVC-in-TS는 생성은 되지만 범용
-  플레이어 호환을 보장할 수 없다. fMP4 프로파일이 필요할 수 있다.
-  ADR 0001 §9 참고.
-- **메모리 8GB / 625채널 미달.** 실측 외삽 약 8.6GiB.
-  CPU는 충족한다(625채널 3.6~5.2코어). `docs/capacity-model.md` 참고.
-- **고객 전달 경로 미구현.** CDN, 시청자 인증, 재생 URL 발급 API, CORS가 전부
-  없다. ADR 0002 참고.
-- **과거 영상 재생 미구현.** 라이브 윈도우 밖의 세그먼트는 S3에 남지만 어떤
-  매니페스트도 참조하지 않는다. 인덱싱용 메타데이터는 이미 기록하고 있으므로
-  별도 indexer를 붙이면 소급 적용이 가능하다. ADR 0002 §10 참고.
+- **대규모 장기 부하 미검증.** 기존 영상 복사 경로의 625채널 메모리 외삽은
+  약 8.6GiB로 목표 8GB를 넘는다. 오디오 변환·인덱싱·시청·내보내기 부하는
+  별도로 측정해야 한다. [용량 모델](docs/capacity-model.md) 참고.
+- **일반 HLS 지연.** WebRTC·LL-HLS 및 1∼3초 저지연 전송을 제공하지 않는다.
+- **HEVC 클라이언트 제약.** 실제 fMP4 수집·재생·MP4 디코딩을 검증했으나
+  웹 재생은 OS·브라우저의 HEVC 디코더 지원에 달려 있다.
+- **단일 재생 서버 기준.** 영속 bbolt 인덱스는 한 프로세스만 연다.
+  여러 재생 서버 사이의 세션·내보내기 상태 공유와 자동 장애 전환은 없다.
+- **CDN 배포는 별도.** 현재 전달은 인증 프록시다. CloudFront OAC·서명 쿠키,
+  TLS 종단 및 고객 SSO 연동은 운영 환경에 맞춰 구성해야 한다.
+- **녹화는 조각 경계 기준.** 프레임 단위 절단과 TS/fMP4 형식 변경을 가로지르는
+  단일 VOD는 지원하지 않는다.
 - **객체 경로에 profile 차원 없음.** 멀티뷰용 서브스트림(듀얼 스트림)을 쓰려면
   URL이 외부 계약이 되기 전에 결정해야 한다. ADR 0002 §8 참고.
-- **`cameras.provider: http`는 스켈레톤.** 실제 DB/API 스키마에 맞춰야
-  한다.
-- **S3 lifecycle 정책 미정.** 없으면 하루 수천만 객체가 무한 축적된다.
+- **HTTP provider는 고정 JSON 배열 계약만 지원한다.** 페이지네이션이나 별도 응답
+  envelope를 쓰는 DB/API에는 어댑터가 필요하다.
+- **보존 삭제 기본 꺼짐.** 백그라운드 정리와 태그 기반 S3 Lifecycle 예시를 제공한다.
+  운영 보존 기간·처리율·버전 관리 정책을 적용해야 한다.
 
 ## 검증된 동작
 
-PoC 스택에서 실제로 확인한 항목이다.
+PoC 스택에서 실제로 확인한 항목이다. 수집 장애 검증은
+[품질 점검 기록](docs/quality-review.md), 재생·관리·내보내기 검증은
+[솔루션 검증 기록](docs/solution-review.md)에 정리했다.
 
-- 라이브 RTSP → HLS → 오브젝트 스토어 파이프라인, ffmpeg 6.1.1/6.1.2
+- 비공개 버킷에서 인증된 H.264 TS, H.264 fMP4, H.265 fMP4 라이브·녹화 재생
+- AAC 복사·G.711→AAC 변환, HTTP Range, 실제 디코딩 가능한 MP4 추출
+- 센터·카메라 범위, 관리·내보내기 권한, 토큰 만료·알고리즘·경로 제한
+- 고정 녹화 세션, 자정·단절 처리, 인덱스 재시작·커서 복구
+- 공유 카메라 목록의 동시 편집 충돌 방지, 담당 서버별 배정·수집 중지
+
+- 라이브 RTSP → HLS → 오브젝트 스토어 파이프라인, ffmpeg 8.0.1
+  (이전 검증 버전: 6.1.1/6.1.2)
 - 세그먼트가 매니페스트보다 먼저 저장되고, 매니페스트가 참조하는 모든
   세그먼트가 존재함
 - 발행된 스트림이 재생 가능하며 코덱이 h264 그대로임
 - GOP 8초 카메라가 4초 목표에서 8초 세그먼트를 내놓고, 정상으로 판정됨
 - 카메라 단절 시 지수 backoff(full jitter, `[base/2, min(base×factor^n, max)]`)로
   재연결, 시퀀스 되돌림 없음, `EXT-X-DISCONTINUITY` 삽입, 유실 0
-- 오브젝트 스토어 30초 장애 중 ffmpeg 재시작 없음, 복구 후 스풀에 남은
-  세그먼트 전부 업로드, 유실 0. 재측정(35초 중단) 기록: 스풀 9파일 7.0MB까지
-  누적, `spool_oldest_seconds` 34초, `seconds_since_manifest` 38초,
-  `reconnects_total` 0, 복구 후 `segments_published_total` 53 → 70,
-  `segments_lost_total` 0
+- lease TTL 20초인 PoC에서 오브젝트 스토어 8초 중단 후 자동 복구,
+  두 채널의 ffmpeg 재연결 0, 세그먼트 유실 0. 저장소 장애가 소유권 만료까지
+  지속되면 채널은 `failed`가 되므로 TTL은 허용 장애 시간과 인수 지연을 함께
+  고려해 설정한다
 - SIGTERM 시 남은 세그먼트를 최대 15초 동안 flush 후 종료(그 안에 스토어가
   응답하지 않으면 남은 것은 유실로 로깅된다), 좀비 프로세스 0, exit code 0
 - 카메라가 전혀 없는 상태에서 25채널을 띄워도 크래시 없음

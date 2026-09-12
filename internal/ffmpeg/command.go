@@ -28,14 +28,17 @@ func ValidSegmentName(name string) bool {
 	return segmentNamePattern.MatchString(name)
 }
 
-var segmentNamePattern = regexp.MustCompile(`^seg-\d{1,10}\.ts$`)
+var segmentNamePattern = regexp.MustCompile(`^seg-\d{1,10}\.(ts|m4s)$`)
 
 // Spec describes one transmux invocation.
 type Spec struct {
-	RTSPURL  string
-	SpoolDir string
-	Cfg      config.FFmpegConfig
-	Segment  config.SegmentConfig
+	RTSPURL    string
+	SpoolDir   string
+	Cfg        config.FFmpegConfig
+	Segment    config.SegmentConfig
+	Audio      string
+	Format     string
+	VideoCodec string
 }
 
 // BuildArgs returns the full ffmpeg argument vector.
@@ -97,14 +100,41 @@ func OutputArgs(s Spec) ([]string, error) {
 		secs = 1
 	}
 	hlsTime := strconv.FormatFloat(secs, 'f', -1, 64)
-	return []string{
-		// Video only for now. Audio needs a per-codec HLS policy (AAC is
-		// fine in MPEG-TS, G.711 is not) and cameras vary, so it is an
-		// explicit follow-up rather than a silent passthrough.
-		"-map", "0:v:0",
-		"-an",
-		"-c:v", "copy",
-
+	args := []string{"-map", "0:v:0", "-c:v", "copy"}
+	switch s.Audio {
+	case "", "none":
+		args = append(args, "-an")
+	case "copy":
+		args = append(args, "-map", "0:a:0?", "-c:a", "copy")
+	case "aac":
+		args = append(args, "-map", "0:a:0?", "-c:a", "aac", "-ar", "48000", "-b:a", "96k")
+	default:
+		return nil, fmt.Errorf("audio must be none, copy or aac")
+	}
+	pattern := SegmentPattern
+	switch s.Format {
+	case "", "mpegts":
+	case "fmp4":
+		pattern = "seg-%06d.m4s"
+		args = append(args, "-hls_segment_type", "fmp4", "-hls_fmp4_init_filename", "init.mp4")
+	default:
+		return nil, fmt.Errorf("format must be mpegts or fmp4")
+	}
+	switch s.VideoCodec {
+	case "", "auto":
+	case "h264":
+		if s.Format == "fmp4" {
+			args = append(args, "-tag:v", "avc1")
+		}
+	case "hevc":
+		if s.Format != "fmp4" {
+			return nil, fmt.Errorf("HEVC requires fmp4 format")
+		}
+		args = append(args, "-tag:v", "hvc1")
+	default:
+		return nil, fmt.Errorf("video_codec must be auto, h264 or hevc")
+	}
+	return append(args, []string{
 		"-f", "hls",
 		"-hls_time", hlsTime,
 		"-hls_list_size", strconv.Itoa(s.Segment.LocalListSize),
@@ -117,7 +147,7 @@ func OutputArgs(s Spec) ([]string, error) {
 		// program_date_time: gives each segment a wall-clock anchor, which
 		//   the published manifest and the missing-segment alarm both use.
 		"-hls_flags", "temp_file+delete_segments+program_date_time",
-		"-hls_segment_filename", filepath.Join(s.SpoolDir, SegmentPattern),
+		"-hls_segment_filename", filepath.Join(s.SpoolDir, pattern),
 		filepath.Join(s.SpoolDir, LocalPlaylistName),
-	}, nil
+	}...), nil
 }

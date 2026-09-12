@@ -25,10 +25,11 @@ var ErrGaveUp = errors.New("upload exhausted all attempts")
 // hundred channels, unbounded concurrent PutObject calls would exhaust file
 // descriptors and sockets long before S3 pushed back.
 type Coordinator struct {
-	store storage.ObjectStore
-	cfg   config.UploadConfig
-	sem   chan struct{}
-	reg   *metrics.Registry
+	store      storage.ObjectStore
+	cfg        config.UploadConfig
+	sem        chan struct{}
+	controlSem chan struct{}
+	reg        *metrics.Registry
 
 	putTotal     *metrics.Metric
 	putFailures  *metrics.Metric
@@ -40,10 +41,11 @@ type Coordinator struct {
 
 func NewCoordinator(store storage.ObjectStore, cfg config.UploadConfig, reg *metrics.Registry) *Coordinator {
 	return &Coordinator{
-		store: store,
-		cfg:   cfg,
-		sem:   make(chan struct{}, cfg.MaxConcurrent),
-		reg:   reg,
+		store:      store,
+		cfg:        cfg,
+		sem:        make(chan struct{}, cfg.MaxConcurrent),
+		controlSem: make(chan struct{}, min(16, cfg.MaxConcurrent)),
+		reg:        reg,
 		putTotal: reg.Counter("transmux_object_put_total",
 			"Successful object store PUT operations."),
 		putFailures: reg.Counter("transmux_object_put_failures_total",
@@ -57,6 +59,14 @@ func NewCoordinator(store storage.ObjectStore, cfg config.UploadConfig, reg *met
 		inFlight: reg.Gauge("transmux_object_put_in_flight",
 			"Object store PUT operations currently in flight."),
 	}
+}
+
+// LeaseClient reserves bounded capacity for ownership traffic independently
+// of segment uploads. Both clients share the store, metrics and retry rules.
+func (c *Coordinator) LeaseClient() storage.ControlClient {
+	control := *c
+	control.sem = c.controlSem
+	return &control
 }
 
 // Store exposes the backing store description for health output.
@@ -257,8 +267,16 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, string, erro
 // exponential matters here: several hundred channels failing at the same
 // instant would otherwise retry in lockstep.
 func (c *Coordinator) backoff(attempt int) time.Duration {
+	if c.cfg.RetryBase.Duration <= 0 || c.cfg.RetryMax.Duration <= 0 {
+		return 0
+	}
 	base := float64(c.cfg.RetryBase.Duration)
 	capped := math.Min(base*math.Pow(2, float64(attempt-1)), float64(c.cfg.RetryMax.Duration))
+	// float64 rounds MaxInt64 up to 1<<63; converting that back to int64
+	// or adding one to the bound would overflow and panic in Int63n.
+	if capped >= float64(math.MaxInt64) {
+		return time.Duration(rand.Int63())
+	}
 	return time.Duration(rand.Int63n(int64(capped) + 1))
 }
 

@@ -1,0 +1,71 @@
+{
+  "shard_id": "solution-0",
+  "max_channels": 16,
+  "http_listen": ":8080",
+  "segment": {
+    "target_duration": "4s",
+    "live_window": 4,
+    "local_list_size": 10,
+    "max_gop_slack": "10s"
+  },
+  "ffmpeg": {
+    "stall_timeout": "20s",
+    "startup_timeout": "20s"
+  },
+  "storage": {
+    "backend": "s3",
+    "bucket": "transmux",
+    "region": "us-east-1",
+    "endpoint": "http://minio:9000",
+    "force_path_style": true,
+    "tag_media": true,
+    "key_prefix": "recordings",
+    "manifest_name": "index.m3u8"
+  },
+  "upload": {
+    "max_concurrent": 16
+  },
+  "lease": {
+    "ttl": "20s",
+    "renew_interval": "5s",
+    "max_clock_skew": "2s",
+    "operation_timeout": "3s"
+  },
+  "cameras": {
+    "provider": "object",
+    "object_key": "_transmux/rosters/solution.json",
+    "shard_filter": "solution-0",
+    "poll_interval": "3s",
+    "request_timeout": "5s",
+    "static": [
+      {
+        "center_id": "demo-center",
+        "camera_id": "entrance",
+        "shard_id": "solution-0",
+        "name": "정문 · 모의 카메라",
+        "rtsp_url": "rtsp://mediamtx:8554/entrance",
+        "audio": "copy",
+        "format": "mpegts"
+      },
+      {
+        "center_id": "demo-center",
+        "camera_id": "warehouse",
+        "shard_id": "solution-0",
+        "name": "창고 · 모의 카메라",
+        "rtsp_url": "rtsp://mediamtx:8554/warehouse",
+        "audio": "aac",
+        "format": "fmp4"
+      },
+      {
+        "center_id": "demo-center",
+        "camera_id": "hevc",
+        "shard_id": "solution-0",
+        "name": "H.265 · 모의 카메라",
+        "rtsp_url": "rtsp://mediamtx:8554/hevc",
+        "video_codec": "hevc",
+        "audio": "aac",
+        "format": "fmp4"
+      }
+    ]
+  }
+}

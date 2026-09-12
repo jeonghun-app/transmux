@@ -28,6 +28,7 @@ type LocalSegment struct {
 	Duration        time.Duration
 	ProgramDateTime time.Time // zero when ffmpeg did not emit the tag
 	Discontinuity   bool
+	InitName        string
 }
 
 // ParseLocal reads an ffmpeg-generated media playlist.
@@ -43,6 +44,7 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 		pending        LocalSegment
 		havePendingInf bool
 		sawHeader      bool
+		initName       string
 	)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -56,6 +58,7 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 				continue
 			}
 			pending.Name = line
+			pending.InitName = initName
 			out = append(out, pending)
 			pending = LocalSegment{}
 			havePendingInf = false
@@ -65,15 +68,11 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 		case line == "#EXTM3U":
 			sawHeader = true
 		case strings.HasPrefix(line, "#EXTINF:"):
-			v := strings.TrimPrefix(line, "#EXTINF:")
-			if i := strings.IndexByte(v, ','); i >= 0 {
-				v = v[:i]
-			}
-			secs, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+			duration, err := parseEXTINF(line)
 			if err != nil {
-				return nil, fmt.Errorf("invalid EXTINF %q: %w", line, err)
+				return nil, err
 			}
-			pending.Duration = time.Duration(secs * float64(time.Second))
+			pending.Duration = duration
 			havePendingInf = true
 		case strings.HasPrefix(line, "#EXT-X-PROGRAM-DATE-TIME:"):
 			raw := strings.TrimPrefix(line, "#EXT-X-PROGRAM-DATE-TIME:")
@@ -82,6 +81,11 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 			}
 		case line == "#EXT-X-DISCONTINUITY":
 			pending.Discontinuity = true
+		case strings.HasPrefix(line, "#EXT-X-MAP:"):
+			if line != `#EXT-X-MAP:URI="init.mp4"` {
+				return nil, fmt.Errorf("unsupported local initialization map")
+			}
+			initName = "init.mp4"
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -91,6 +95,23 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 		return nil, fmt.Errorf("not an m3u8 playlist: missing #EXTM3U")
 	}
 	return out, nil
+}
+
+func parseEXTINF(line string) (time.Duration, error) {
+	v := strings.TrimPrefix(line, "#EXTINF:")
+	if i := strings.IndexByte(v, ','); i >= 0 {
+		v = v[:i]
+	}
+	secs, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil || math.IsNaN(secs) || math.IsInf(secs, 0) ||
+		secs <= 0 || secs >= float64(math.MaxInt64)/float64(time.Second) {
+		return 0, fmt.Errorf("invalid EXTINF duration %q", v)
+	}
+	d := time.Duration(secs * float64(time.Second))
+	if d < time.Millisecond {
+		return 0, fmt.Errorf("EXTINF duration %q is below manifest millisecond precision", v)
+	}
+	return d, nil
 }
 
 // parsePDT accepts both the RFC3339 form and ffmpeg's "+0000" offset form.
@@ -109,6 +130,7 @@ type PublishedSegment struct {
 	Sequence uint64
 	// URI is relative to the manifest's own location.
 	URI             string
+	InitURI         string
 	Duration        time.Duration
 	ProgramDateTime time.Time
 	Discontinuity   bool
@@ -181,9 +203,14 @@ func RenderLive(l Live) []byte {
 	}
 
 	b.WriteString("#EXTM3U\n")
-	// Version 3 is the minimum that allows float EXTINF. Nothing here needs
-	// a higher version for MPEG-TS segments.
-	b.WriteString("#EXT-X-VERSION:3\n")
+	version := 3
+	for _, s := range segments {
+		if s.InitURI != "" {
+			version = 7
+			break
+		}
+	}
+	fmt.Fprintf(&b, "#EXT-X-VERSION:%d\n", version)
 	if writeID != "" {
 		b.WriteString(WriteIDComment)
 		b.WriteString(writeID)
@@ -199,10 +226,15 @@ func RenderLive(l Live) []byte {
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", target)
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", mediaSeq)
 	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discontinuitySequence)
+	var initURI string
 	for _, s := range segments {
 		if s.Discontinuity {
 			b.WriteString("#EXT-X-DISCONTINUITY\n")
 		}
+		if s.InitURI != "" && s.InitURI != initURI {
+			fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"%s\"\n", s.InitURI)
+		}
+		initURI = s.InitURI
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\n", s.Duration.Seconds())
 		if !s.ProgramDateTime.IsZero() {
 			fmt.Fprintf(&b, "#EXT-X-PROGRAM-DATE-TIME:%s\n",
@@ -219,3 +251,10 @@ const ContentTypeManifest = "application/vnd.apple.mpegurl"
 
 // ContentTypeSegment is the media type for an MPEG-TS segment.
 const ContentTypeSegment = "video/mp2t"
+
+// RenderRecording creates a finite, segment-aligned VOD. Recording queries
+// may contain sequence gaps; VOD media sequence is independent of ingest.
+func RenderRecording(segments []PublishedSegment) []byte {
+	body := RenderLive(Live{Segments: segments})
+	return append(body, []byte("#EXT-X-ENDLIST\n")...)
+}

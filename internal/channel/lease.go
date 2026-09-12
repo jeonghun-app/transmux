@@ -66,6 +66,16 @@ func (r leaseRecord) held(now time.Time, skew time.Duration) bool {
 	return r.Status == "held" && now.Before(r.ExpiresAt.Add(skew))
 }
 
+func (r leaseRecord) validate(camera string) error {
+	if r.Schema != 1 || r.CameraKey != camera || r.OwnerSession == "" ||
+		r.ShardID == "" || r.OperationID == "" ||
+		(r.Status != "held" && r.Status != "released") ||
+		r.IssuedAt.IsZero() || !r.ExpiresAt.After(r.IssuedAt) {
+		return fmt.Errorf("%w: incomplete, unsupported, or mismatched lease record", ErrLeaseInvalid)
+	}
+	return nil
+}
+
 // newID returns a 128-bit random identifier. Randomness rather than a counter
 // is what keeps identity unique across an operator deleting the lease object.
 func newID() string {
@@ -90,7 +100,7 @@ func NewSessionID() string { return newID() }
 // process's ability to write the manifest key, so the actual fence is the
 // conditional manifest write in the worker; see Worker.fenceManifest.
 type leaseHolder struct {
-	client  ObjectClient
+	client  storage.ControlClient
 	key     string
 	camera  string
 	shardID string
@@ -102,6 +112,9 @@ type leaseHolder struct {
 	// same ETag and then race, and whichever lost would report a conflict that
 	// says nothing about ownership.
 	opMu sync.Mutex
+	// pending is guarded by opMu. An ambiguous write remains identifiable
+	// across failed confirmation reads and later renewal attempts.
+	pending *leaseWrite
 
 	// mu guards the three fields below. They are read from the worker
 	// goroutine (through Expired) while the renewal goroutine writes them.
@@ -145,7 +158,14 @@ type leaseTuning struct {
 	OperationTimeout time.Duration
 }
 
-func newLeaseHolder(client ObjectClient, key, camera, shardID, session string, cfg leaseTuning) *leaseHolder {
+type leaseWrite struct {
+	record           leaseRecord
+	preconditions    storage.Preconditions
+	previousDeadline time.Time
+	wasHeld          bool
+}
+
+func newLeaseHolder(client storage.ControlClient, key, camera, shardID, session string, cfg leaseTuning) *leaseHolder {
 	return &leaseHolder{
 		client: client, key: key, camera: camera,
 		shardID: shardID, session: session, cfg: cfg,
@@ -164,6 +184,12 @@ func newLeaseHolder(client ObjectClient, key, camera, shardID, session string, c
 func (l *leaseHolder) Acquire(ctx context.Context) error {
 	l.opMu.Lock()
 	defer l.opMu.Unlock()
+	// Acquire is a new admission attempt, followed by a manifest fence. It
+	// may establish a new lease after an earlier unfenced claim expired.
+	l.drop()
+	if l.pending != nil && !l.pending.record.IssuedAt.Add(l.cfg.TTL-l.cfg.MaxClockSkew).After(l.now()) {
+		l.pending = nil
+	}
 
 	body, etag, err := l.client.Get(ctx, l.key)
 	switch {
@@ -182,13 +208,15 @@ func (l *leaseHolder) Acquire(ctx context.Context) error {
 		// Terminal, because retrying reads the same bytes forever.
 		return fmt.Errorf("%w: %s is not readable as a lease record: %v", ErrLeaseInvalid, l.key, err)
 	}
-	if rec.CameraKey != "" && rec.CameraKey != l.camera {
-		return fmt.Errorf("%w: %s belongs to camera %q, not %q",
-			ErrLeaseInvalid, l.key, rec.CameraKey, l.camera)
+	if err := rec.validate(l.camera); err != nil {
+		return err
+	}
+	if etag == "" {
+		return fmt.Errorf("%w: lease read returned no ETag", ErrLeaseInvalid)
 	}
 	// A contender waits out the full TTL plus the skew allowance on both
 	// sides: the holder's clock may be slow while ours is fast.
-	if rec.held(l.now(), 2*l.cfg.MaxClockSkew) && rec.OwnerSession != l.session {
+	if rec.held(l.now().Add(-l.cfg.MaxClockSkew), l.cfg.MaxClockSkew) && rec.OwnerSession != l.session {
 		return fmt.Errorf("%w: %s until %s", ErrLeaseHeld, rec.ShardID, rec.ExpiresAt.UTC().Format(time.RFC3339))
 	}
 	return l.write(ctx, storage.Preconditions{IfMatch: etag})
@@ -200,9 +228,14 @@ func (l *leaseHolder) Renew(ctx context.Context) error {
 	l.opMu.Lock()
 	defer l.opMu.Unlock()
 
-	etag, _, held := l.state()
-	if !held {
+	etag, deadline, held := l.state()
+	if !held || !l.now().Before(deadline) {
+		l.drop()
 		return ErrLeaseLost
+	}
+	if etag == "" {
+		l.drop()
+		return fmt.Errorf("%w: renewal has no ETag", ErrLeaseLost)
 	}
 	err := l.write(ctx, storage.Preconditions{IfMatch: etag})
 	if errors.Is(err, storage.ErrPreconditionFailed) {
@@ -222,6 +255,16 @@ func (l *leaseHolder) Release(ctx context.Context) error {
 	if !held {
 		return nil
 	}
+	if etag == "" {
+		l.drop()
+		return fmt.Errorf("%w: release has no ETag", ErrLeaseLost)
+	}
+	if l.pending != nil {
+		landed, confirmed, err := l.confirm(ctx, l.pending.record.OperationID)
+		if err == nil && landed {
+			etag = confirmed
+		}
+	}
 	rec := l.record("released", l.now())
 	raw, err := json.Marshal(rec)
 	if err != nil {
@@ -237,6 +280,7 @@ func (l *leaseHolder) Release(ctx context.Context) error {
 	// Ownership ends locally either way. A refused release means a successor
 	// already took over, and a failed one expires on its own.
 	l.drop()
+	l.pending = nil
 	return err
 }
 
@@ -267,13 +311,42 @@ func (l *leaseHolder) record(status string, issued time.Time) leaseRecord {
 // write stores a held record under the given precondition and, on an
 // ambiguous outcome, reads back to find out whether it landed.
 func (l *leaseHolder) write(ctx context.Context, pre storage.Preconditions) error {
-	// The deadline is derived from the clock reading taken before the request,
-	// never after: if the request takes ten seconds, those ten seconds are
-	// already gone from the lease's life.
-	issued := l.now()
-	_, prevDeadline, wasHeld := l.state()
-	rec := l.record("held", issued)
-	raw, err := json.Marshal(rec)
+	pending := l.pending
+	replaying := pending != nil
+	if replaying {
+		landed, etag, err := l.confirm(ctx, pending.record.OperationID)
+		if errors.Is(err, storage.ErrNotFound) && !pending.preconditions.IfNoneMatch {
+			l.pending = nil
+			return storage.ErrPreconditionFailed
+		}
+		if err != nil && !(errors.Is(err, storage.ErrNotFound) && pending.preconditions.IfNoneMatch) {
+			return err
+		}
+		if landed {
+			return l.commit(pending, etag)
+		}
+		if etag != pending.preconditions.IfMatch {
+			l.pending = nil
+			return storage.ErrPreconditionFailed
+		}
+	} else {
+		_, deadline, held := l.state()
+		pending = &leaseWrite{
+			record: l.record("held", l.now()), preconditions: pre,
+			previousDeadline: deadline, wasHeld: held,
+		}
+	}
+	if !pending.preconditions.Conditional() {
+		return fmt.Errorf("%w: refusing an unconditional lease write", ErrLeaseInvalid)
+	}
+	now := l.now()
+	if !now.Before(pending.record.IssuedAt.Add(l.cfg.TTL-l.cfg.MaxClockSkew)) ||
+		(pending.wasHeld && !now.Before(pending.previousDeadline)) {
+		l.drop()
+		l.pending = nil
+		return ErrLeaseLost
+	}
+	raw, err := json.Marshal(pending.record)
 	if err != nil {
 		return err
 	}
@@ -282,36 +355,18 @@ func (l *leaseHolder) write(ctx context.Context, pre storage.Preconditions) erro
 		Body:          raw,
 		ContentType:   "application/json",
 		CacheControl:  "no-store",
-		Preconditions: pre,
+		Preconditions: pending.preconditions,
 	})
-
-	// commit adopts a successful write, unless our own deadline lapsed while
-	// the request was in flight. Reviving a lapsed lease would mean publishing
-	// during the window in which a contender is entitled to take over.
-	// commit adopts a successful write. newETag is empty when the write was
-	// adopted through read-back, where confirm has already recorded the ETag.
-	commit := func(newETag string) error {
-		if wasHeld && !prevDeadline.After(l.now()) {
-			l.drop()
-			return fmt.Errorf("%w: renewal completed after the local deadline had passed",
-				ErrLeaseLost)
-		}
-		l.mu.Lock()
-		if newETag != "" {
-			l.etag = newETag
-		}
-		l.held = true
-		l.deadline = issued.Add(l.cfg.TTL - l.cfg.MaxClockSkew)
-		l.mu.Unlock()
-		return nil
+	if err == nil && etag == "" {
+		err = fmt.Errorf("lease write returned no ETag")
 	}
-
 	if err == nil {
-		return commit(etag)
+		return l.commit(pending, etag)
 	}
-	if errors.Is(err, storage.ErrPreconditionFailed) {
+	if errors.Is(err, storage.ErrPreconditionFailed) && !replaying {
 		return err
 	}
+	l.pending = pending
 	// Ambiguous: the request may have landed and the response been lost.
 	// Reading back by operation ID is the only way to tell, and guessing
 	// either way is unsafe -- assuming failure risks two owners, assuming
@@ -322,27 +377,51 @@ func (l *leaseHolder) write(ctx context.Context, pre storage.Preconditions) erro
 	// ctx's own deadline elapsed.
 	confirmCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.cfg.OperationTimeout)
 	defer cancel()
-	if landed, lerr := l.confirm(confirmCtx, rec.OperationID); lerr == nil && landed {
-		return commit("")
+	landed, confirmedETag, confirmErr := l.confirm(confirmCtx, pending.record.OperationID)
+	if confirmErr == nil && landed {
+		return l.commit(pending, confirmedETag)
+	}
+	if confirmErr == nil && confirmedETag != pending.preconditions.IfMatch {
+		l.pending = nil
+		return storage.ErrPreconditionFailed
+	}
+	if errors.Is(err, storage.ErrPreconditionFailed) {
+		return fmt.Errorf("lease replay could not be confirmed: %v", confirmErr)
 	}
 	return err
 }
 
+func (l *leaseHolder) commit(pending *leaseWrite, etag string) error {
+	now := l.now()
+	deadline := pending.record.IssuedAt.Add(l.cfg.TTL - l.cfg.MaxClockSkew)
+	if !now.Before(deadline) || (pending.wasHeld && !now.Before(pending.previousDeadline)) {
+		l.drop()
+		l.pending = nil
+		return fmt.Errorf("%w: lease write completed after the local deadline", ErrLeaseLost)
+	}
+	if etag == "" {
+		return fmt.Errorf("lease confirmation returned no ETag")
+	}
+	l.setState(etag, deadline, true)
+	l.pending = nil
+	return nil
+}
+
 // confirm reports whether the given operation is the one stored at the key.
-func (l *leaseHolder) confirm(ctx context.Context, operationID string) (bool, error) {
+func (l *leaseHolder) confirm(ctx context.Context, operationID string) (bool, string, error) {
 	body, etag, err := l.client.Get(ctx, l.key)
 	if err != nil {
-		return false, err
+		return false, "", err
+	}
+	if etag == "" {
+		return false, "", fmt.Errorf("lease readback returned no ETag")
 	}
 	var rec leaseRecord
 	if err := json.Unmarshal(body, &rec); err != nil {
-		return false, err
+		return false, "", err
 	}
-	if rec.OperationID != operationID {
-		return false, nil
+	if err := rec.validate(l.camera); err != nil {
+		return false, "", err
 	}
-	l.mu.Lock()
-	l.etag = etag
-	l.mu.Unlock()
-	return true, nil
+	return rec.OperationID == operationID && rec.OwnerSession == l.session && rec.Status == "held", etag, nil
 }

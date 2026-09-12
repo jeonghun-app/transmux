@@ -3,7 +3,7 @@
 
 VERSION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 IMAGE   ?= transmux
-GOIMAGE ?= golang:1.23-alpine
+GOIMAGE ?= golang:1.26.8-alpine3.23
 DOCKER  ?= docker
 
 # Cache the module and build cache on the host so repeat runs are fast.
@@ -30,9 +30,19 @@ tidy: ## Resolve dependencies and write go.sum
 vet: ## go vet
 	$(RUNGO) $(GOIMAGE) go vet ./...
 
+.PHONY: fmt-check
+fmt-check: ## Check Go formatting
+	$(RUNGO) $(GOIMAGE) sh -c 'files=$$(gofmt -l cmd internal); test -z "$$files" || { printf "%s\n" "$$files"; exit 1; }'
+
+.PHONY: vuln
+vuln: ## Verify modules and scan reachable Go vulnerabilities
+	$(RUNGO) $(GOIMAGE) go mod verify
+	$(RUNGO) $(GOIMAGE) go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+
 .PHONY: build
-build: ## Compile the daemon
+build: ## Compile ingest and playback services
 	$(RUNGO) $(GOIMAGE) go build -trimpath -o /tmp/transmuxd ./cmd/transmuxd
+	$(RUNGO) $(GOIMAGE) go build -trimpath -o /tmp/playbackd ./cmd/playbackd
 
 .PHONY: test
 test: ## Unit tests
@@ -81,3 +91,16 @@ poc-down: ## Tear down the PoC stack and its volumes
 .PHONY: clean
 clean:
 	-$(DOCKER) volume rm $(GOCACHE_VOL) $(GOMOD_VOL)
+
+.PHONY: solution-env solution-up solution-down solution-verify
+solution-env: ## Generate local solution credentials (existing values are preserved)
+	python3 scripts/solution-env.py
+
+solution-up: solution-env ## Run private storage, ingest, playback console and three simulated cameras
+	$(DOCKER) compose --env-file .env.solution -f deploy/docker-compose.solution.yml up -d --build
+
+solution-down: ## Stop the solution stack, preserving recordings and configuration
+	$(DOCKER) compose --env-file .env.solution -f deploy/docker-compose.solution.yml down
+
+solution-verify: ## Verify authentication, live playback, archive and exports in the solution stack
+	python3 scripts/verify-solution.py

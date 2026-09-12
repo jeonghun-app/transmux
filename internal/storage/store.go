@@ -9,12 +9,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 	"syscall"
+	"time"
+	"unicode"
 )
 
 // ErrNotFound reports that the key does not exist. Callers distinguish this
@@ -53,6 +55,21 @@ type Preconditions struct {
 // resolve that.
 func (p Preconditions) Conditional() bool { return p.IfMatch != "" || p.IfNoneMatch }
 
+func (p Preconditions) validate() error {
+	if p.IfMatch != "" && p.IfNoneMatch {
+		return fmt.Errorf("If-Match and If-None-Match are mutually exclusive")
+	}
+	return nil
+}
+
+// ControlClient is the small-object interface used for ownership leases.
+// A coordinator can supply it with independent concurrency so slow segment
+// uploads cannot consume every slot needed to renew ownership.
+type ControlClient interface {
+	Put(context.Context, Object) (string, error)
+	Get(context.Context, string) ([]byte, string, error)
+}
+
 // ObjectInfo is what the store knows about a key without its body.
 type ObjectInfo struct {
 	// ETag is an opaque version token. It must never be interpreted as a
@@ -72,6 +89,8 @@ type Object struct {
 	// facts a future recording index needs and that cannot be recovered from
 	// the object key alone, most importantly the real duration.
 	Metadata map[string]string
+	// Tags are S3 object tags (distinct from user metadata).
+	Tags map[string]string
 	// Preconditions, when set, make the write conditional.
 	Preconditions Preconditions
 }
@@ -112,14 +131,14 @@ type ObjectStore interface {
 // after a restart.
 type FilesystemStore struct {
 	root string
-	mu   sync.Mutex
+	gate chan struct{}
 }
 
 func NewFilesystemStore(root string) (*FilesystemStore, error) {
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return nil, fmt.Errorf("create storage root: %w", err)
 	}
-	return &FilesystemStore{root: root}, nil
+	return &FilesystemStore{root: root, gate: make(chan struct{}, 1)}, nil
 }
 
 func (s *FilesystemStore) Describe() string { return "filesystem:" + s.root }
@@ -137,33 +156,56 @@ func (s *FilesystemStore) sidecar(dest string) string {
 // lock serialises conditional writes across every process sharing the root.
 // An in-process mutex is not enough: the whole point of the precondition is
 // to arbitrate between two daemons.
-func (s *FilesystemStore) lock() (func(), error) {
-	s.mu.Lock()
+func (s *FilesystemStore) lock(ctx context.Context) (func(), error) {
+	select {
+	case s.gate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	path := filepath.Join(s.root, ".transmux-cas.lock")
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
-		s.mu.Unlock()
+		<-s.gate
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+	for {
+		err = ctx.Err()
+		if err == nil {
+			err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		}
+		if err == nil {
+			break
+		}
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			timer := time.NewTimer(5 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+			}
+			timer.Stop()
+			continue
+		}
 		f.Close()
-		s.mu.Unlock()
+		<-s.gate
 		return nil, err
 	}
 	return func() {
 		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
-		s.mu.Unlock()
+		<-s.gate
 	}, nil
 }
 
-func (s *FilesystemStore) Put(_ context.Context, obj Object) (string, error) {
+func (s *FilesystemStore) Put(ctx context.Context, obj Object) (string, error) {
 	if err := validateKey(obj.Key); err != nil {
+		return "", err
+	}
+	if err := obj.Preconditions.validate(); err != nil {
 		return "", err
 	}
 	dest := filepath.Join(s.root, filepath.FromSlash(obj.Key))
 
-	unlock, err := s.lock()
+	unlock, err := s.lock(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -218,28 +260,43 @@ func (s *FilesystemStore) Put(_ context.Context, obj Object) (string, error) {
 		if err := os.WriteFile(s.sidecar(dest), raw, 0o600); err != nil {
 			return "", err
 		}
+	} else if err := os.Remove(s.sidecar(dest)); err != nil && !os.IsNotExist(err) {
+		return "", err
 	}
 	return etagOf(obj.Body), nil
 }
 
-func (s *FilesystemStore) Get(_ context.Context, key string) ([]byte, string, error) {
+func (s *FilesystemStore) Get(ctx context.Context, key string) ([]byte, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
 	if err := validateKey(key); err != nil {
 		return nil, "", err
 	}
-	body, err := os.ReadFile(filepath.Join(s.root, filepath.FromSlash(key)))
+	f, err := os.Open(filepath.Join(s.root, filepath.FromSlash(key)))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, "", fmt.Errorf("%w: %s", ErrNotFound, key)
 		}
 		return nil, "", err
 	}
+	defer f.Close()
+	body, err := readControlBody(f)
+	if err != nil {
+		return nil, "", err
+	}
 	return body, etagOf(body), nil
 }
 
-func (s *FilesystemStore) Head(_ context.Context, key string) (ObjectInfo, error) {
+func (s *FilesystemStore) Head(ctx context.Context, key string) (ObjectInfo, error) {
 	if err := validateKey(key); err != nil {
 		return ObjectInfo{}, err
 	}
+	unlock, err := s.lock(ctx)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	defer unlock()
 	dest := filepath.Join(s.root, filepath.FromSlash(key))
 	body, err := os.ReadFile(dest)
 	if err != nil {
@@ -251,9 +308,12 @@ func (s *FilesystemStore) Head(_ context.Context, key string) (ObjectInfo, error
 	info := ObjectInfo{ETag: etagOf(body), Size: int64(len(body))}
 	if raw, err := os.ReadFile(s.sidecar(dest)); err == nil {
 		md := map[string]string{}
-		if json.Unmarshal(raw, &md) == nil {
-			info.Metadata = md
+		if err := json.Unmarshal(raw, &md); err != nil {
+			return ObjectInfo{}, fmt.Errorf("read object metadata: %w", err)
 		}
+		info.Metadata = md
+	} else if !os.IsNotExist(err) {
+		return ObjectInfo{}, err
 	}
 	return info, nil
 }
@@ -266,12 +326,29 @@ func validateKey(key string) error {
 	if strings.HasPrefix(key, "/") {
 		return fmt.Errorf("object key %q must be relative", key)
 	}
+	if strings.Contains(key, `\`) || strings.IndexFunc(key, unicode.IsControl) >= 0 {
+		return fmt.Errorf("object key contains an unsafe character")
+	}
 	for _, part := range strings.Split(key, "/") {
 		if part == "" || part == "." || part == ".." {
 			return fmt.Errorf("object key %q contains an unsafe path element", key)
 		}
 	}
 	return nil
+}
+
+// Read one byte beyond the bound so a valid prefix of an oversized object
+// can never be mistaken for the complete ownership or recovery record.
+func readControlBody(r io.Reader) ([]byte, error) {
+	const maxControlBytes = 8 << 20
+	body, err := io.ReadAll(io.LimitReader(r, maxControlBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxControlBytes {
+		return nil, fmt.Errorf("control object exceeds %d bytes", maxControlBytes)
+	}
+	return body, nil
 }
 
 // MetadataKeys returns the metadata field names in sorted order. Used for
@@ -283,4 +360,15 @@ func MetadataKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func RetentionTags(enabled bool, initialization bool) map[string]string {
+	if !enabled {
+		return nil
+	}
+	kind := "segment"
+	if initialization {
+		kind = "init"
+	}
+	return map[string]string{"transmux-kind": kind}
 }

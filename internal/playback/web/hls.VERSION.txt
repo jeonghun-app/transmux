@@ -1,0 +1,4 @@
+hls.js 1.7.3
+Source: https://registry.npmjs.org/hls.js/-/hls.js-1.7.3.tgz
+Integrity: sha512-MsPlx6yVW4Qv4C7mEVou4/gk/5cN2dVxOTnrNjPSmyH2f0Ln+/UkG10Ax1PE6OvrmTVPKgQYozTtBaPOuCzq7A==
+License: Apache-2.0 (hls.LICENSE.txt)

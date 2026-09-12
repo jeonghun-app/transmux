@@ -1,0 +1,55 @@
+{
+  "http_listen": ":8090",
+  "public_url": "http://localhost:8090",
+  "ingest_config": "/etc/transmux/config.json",
+  "index_path": "/var/lib/transmux/playback/recordings.db",
+  "auth": {
+    "secret_env": "TRANSMUX_AUTH_SECRET",
+    "issuer": "transmux",
+    "audience": "transmux-api",
+    "access_ttl": "8h",
+    "session_ttl": "15m",
+    "users": [
+      {
+        "username": "admin",
+        "password_env": "TRANSMUX_ADMIN_PASSWORD",
+        "grants": [
+          {
+            "center_id": "*",
+            "camera_ids": ["*"],
+            "permissions": ["live", "recording", "export", "manage"]
+          }
+        ]
+      },
+      {
+        "username": "viewer",
+        "password_env": "TRANSMUX_VIEWER_PASSWORD",
+        "grants": [
+          {
+            "center_id": "demo-center",
+            "camera_ids": ["entrance", "warehouse"],
+            "permissions": ["live", "recording"]
+          }
+        ]
+      }
+    ]
+  },
+  "index": {
+    "days": 31,
+    "workers": 8,
+    "poll_interval": "3s"
+  },
+  "retention": {
+    "enabled": false,
+    "days": 30,
+    "interval": "1h",
+    "batch": 1000
+  },
+  "export": {
+    "temp_dir": "/var/lib/transmux/playback/exports",
+    "max_duration": "2h",
+    "timeout": "10m",
+    "max_bytes": 4294967296,
+    "workers": 2
+  }
+}

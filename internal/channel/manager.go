@@ -133,7 +133,8 @@ func (m *Manager) reconcile(ctx context.Context) {
 			continue
 		}
 		// A changed RTSP URL means the source moved; restart the pipeline.
-		if newCam.RTSPURL != e.worker.Camera().RTSPURL {
+		oldCam := e.worker.Camera()
+		if newCam.RTSPURL != oldCam.RTSPURL || newCam.Audio != oldCam.Audio || newCam.Format != oldCam.Format || newCam.VideoCodec != oldCam.VideoCodec {
 			m.log.Info("camera source changed, restarting channel", "camera", key)
 			toStop = append(toStop, e)
 			delete(m.workers, key)
@@ -151,6 +152,10 @@ func (m *Manager) reconcile(ctx context.Context) {
 	for _, e := range toStop {
 		m.log.Info("stopping channel", "camera", e.worker.Camera().Key())
 		e.cancel()
+	}
+	// Start every drain before waiting. Serial cancellation would multiply
+	// the shutdown budget by the number of removed or changed cameras.
+	for _, e := range toStop {
 		<-e.done
 		e.worker.Cleanup()
 	}
@@ -200,6 +205,7 @@ func (m *Manager) shutdown() {
 		entries = append(entries, e)
 	}
 	m.workers = make(map[string]*entry)
+	m.ready = false
 	m.mu.Unlock()
 
 	m.log.Info("shutting down channels", "count", len(entries))
