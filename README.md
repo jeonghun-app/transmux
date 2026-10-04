@@ -1,6 +1,12 @@
 # transmux — IP 카메라 라이브·녹화 솔루션
 
-**카메라 관제·녹화에 사용하는 Wowza 경로를 대체한다.** `transmuxd`가
+[![CI](https://github.com/jeonghun-app/transmux/actions/workflows/ci.yml/badge.svg)](https://github.com/jeonghun-app/transmux/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
+[![Go 1.26.8](https://img.shields.io/badge/Go-1.26.8-00ADD8.svg)](go.mod)
+
+[English](README.en.md)
+
+**IP 카메라의 라이브 관제와 녹화 검색·재생을 제공한다.** `transmuxd`가
 RTSP 영상을 HLS로 저장하고, `playbackd`가 인증된 라이브·녹화 재생,
 카메라 관리, MP4 내보내기와 운영자 화면을 제공한다.
 
@@ -22,9 +28,24 @@ IP 카메라 ──RTSP/TCP──> transmuxd ──> 비공개 S3
 실측 용량은 [docs/capacity-model.md](docs/capacity-model.md).
 
 실행·API·배포 계약은 [솔루션 가이드](docs/solution.md),
-실제 대체 범위와 남은 조건은 [Wowza 대체 범위](docs/wowza-coverage.md),
+기능 범위와 전환 조건은 [기존 미디어 서버에서의 전환](docs/wowza-coverage.md),
 현재 전달 구조의 결정은 [ADR 0003](docs/adr/0003-camera-solution.md)에 정리했다.
 WebRTC·RTMP·SRT·ABR 등 방송 서버의 모든 기능을 제공하는 제품은 아니다.
+
+## 프로젝트 상태와 지원 플랫폼
+
+현재 **1.0 이전(pre-1.0)** 프로젝트다. API·설정·저장 형식이 마이너 버전에서
+변경될 수 있으므로 버전을 고정하고 업그레이드 전에 변경 내용과 검증 범위를 확인한다.
+보안 수정의 지원 범위와 신고 방법은 [보안 정책](SECURITY.md)을 따른다.
+
+| 플랫폼 | 지원 범위 |
+|---|---|
+| Linux/amd64 | 수집·재생 서비스와 컨테이너 기반 검증의 기준 환경 |
+| macOS·Windows | Docker Desktop의 Linux 컨테이너를 이용한 개발 경로. 네이티브 서비스 실행은 검증하지 않음 |
+| 기타 CPU 아키텍처 | 빌드·ffmpeg·실제 미디어 경로를 별도 검증해야 함 |
+
+브라우저 재생은 H.264 기준이며 HEVC는 OS·브라우저 디코더 지원에 달려 있다.
+운영 배포 전에 실제 카메라·단말과 예상 부하로 검증한다.
 
 ## 빠른 시작
 
@@ -40,6 +61,9 @@ make solution-down    # 중지; 녹화·설정 볼륨은 보존
 운영자 화면은 `http://localhost:8090`이다. `admin`과 `viewer`의 비밀번호는
 자동 생성된 `.env.solution`에 있다. 계정·포트 설정과 브라우저 검증은
 [솔루션 가이드](docs/solution.md#로컬-실행)를 참고한다.
+RustFS 전환으로 저장 볼륨 이름은 `objects`에서 `s3-data`로 바뀌며, 기존 로컬
+녹화는 새 스택에서 보이지 않는다(정리·보존 방법은 [솔루션 가이드](docs/solution.md#로컬-실행)). `make solution-env`는 기존 `.env.solution`에
+`TRANSMUX_S3_SECRET_KEY`가 없으면 자동으로 추가하며 `make solution-up`에서도 실행된다.
 
 개발 검사:
 
@@ -49,6 +73,9 @@ make fmt-check     # Go 포맷 검사
 make vet           # 정적 검사
 make test          # 단위 테스트
 make race          # 동시성 검사
+make build         # 수집·재생 바이너리 빌드
+make dist          # 릴리스 묶음 생성
+make lint-actions  # 워크플로 수정 시 검사
 make vuln          # 모듈 무결성 및 도달 가능한 Go 취약점 검사
 make test-ffmpeg   # 실제 ffmpeg이 필요한 통합 테스트
 make image         # 런타임 이미지 빌드
@@ -57,7 +84,7 @@ make image         # 런타임 이미지 빌드
 기존 수집 전용 PoC와 용량 측정 구성도 유지한다.
 
 ```bash
-make poc-up        # 가짜 카메라 2대 + MediaMTX + transmuxd + MinIO
+make poc-up        # 가짜 카메라 2대 + MediaMTX + transmuxd + RustFS(S3 호환)
 make poc-up-capacity  # 위 + 용량 측정용 1080p/D1/720p 소스
 make poc-verify    # 종단 검증 (재생 가능성, 매니페스트 정합성)
 make poc-logs      # transmuxd 로그
@@ -65,7 +92,7 @@ make poc-down      # 정리
 ```
 
 `make poc-up`은 실제 IP 카메라와 실제 S3 없이 전체 파이프라인을 돌린다.
-MediaMTX가 카메라 역할을, MinIO가 S3 역할을 한다. 가짜 카메라 2대는
+MediaMTX가 카메라 역할을, RustFS(Apache-2.0, S3 호환)가 S3 역할을 한다. 가짜 카메라 2대는
 키프레임 간격이 다르다. `cam-shortgop`은 GOP 2초로 4초 목표를 지킬 수 있고,
 `cam-longgop`은 GOP 8초로 지킬 수 없다. 둘 다 정상 동작해야 한다.
 
@@ -98,10 +125,11 @@ transmuxd -config /etc/transmux/config.json -validate   # 설정만 검사
 playbackd -config /etc/transmux/playback.json -validate
 ```
 
-주요 항목:
+주요 수집 설정(`configs/solution-ingest.json`):
 
 | 키 | 의미 | 주의 |
 |---|---|---|
+| `http_listen` | 수집 서버의 내부 모니터링 주소 | 기본 `127.0.0.1:8080`. 컨테이너 예제는 `:8080`을 명시하고 호스트 노출을 제한한다 |
 | `max_channels` | 이 샤드가 받을 최대 채널 수 | 검증된 용량 이상으로 밀려들지 않게 하는 상한 |
 | `segment.target_duration` | `-hls_time` 값 | **목표이자 하한.** 실제 길이는 카메라 GOP가 결정한다 |
 | `segment.live_window` | 발행 매니페스트에 유지할 세그먼트 수 | |
@@ -109,10 +137,11 @@ playbackd -config /etc/transmux/playback.json -validate
 | `segment.max_gop_slack` | 누락 판정에 더하는 여유 | GOP가 긴 카메라를 고장으로 오인하지 않게 한다 |
 | `ffmpeg.stall_timeout` | 세그먼트 미생성 시 ffmpeg 종료 임계 | 버전 독립적인 주 단절 감지기 |
 | `ffmpeg.input_args` | `-i` 앞에 넣을 추가 인자 | 버전별 소켓 타임아웃 옵션을 넣는 자리 |
-| `storage.endpoint` / `force_path_style` | MinIO/LocalStack용 | 프로덕션에서는 비운다 |
+| `storage.endpoint` / `force_path_style` | RustFS 등 S3 호환 서버용 | AWS S3에서는 기본 설정을 사용한다 |
+| `storage.key_prefix` | 미디어·lease 객체의 접두사 | 앞뒤 `/`는 정규화한다. `/tenant/video/`는 `tenant/video`와 같으며 공유 카메라 목록 키에는 붙이지 않는다 |
 | `upload.max_concurrent` | 세그먼트·매니페스트 저장 요청 동시성 | 소유권 요청에는 별도로 `min(16, max_concurrent)`개의 슬롯을 예약해 업로드 적체가 lease 갱신을 막지 않게 한다 |
 | `storage.tag_media` | 보존용 `transmux-kind` 객체 태그 | 기본 꺼짐. 켜면 `s3:PutObjectTagging` 필요; 제어 객체에는 태그를 붙이지 않는다 |
-| `cameras.provider` | `static`, `http`, `object` | `object`는 조건부 갱신되는 공유 목록과 관리 API를 사용 |
+| `cameras.provider` | `static`, `http`, `object` | `object`는 조건부 갱신되는 공유 목록과 관리 API를 사용. `http`의 비활성 카메라는 수집에서 제외하되 샤드 필터 범위의 재생 카탈로그·보존 작업에는 유지 |
 | `cameras.shard_filter` | 담당 수집 서버 ID | 목록의 `shard_id`가 일치하는 카메라만 수집 |
 | `cameras.static[].format` | `mpegts` 또는 `fmp4` | 기본 `mpegts`; HEVC에는 `fmp4` 권장 |
 | `cameras.static[].video_codec` | `auto`, `h264`, `hevc` | HEVC는 `fmp4`와 함께 지정하면 Apple 호환 `hvc1` 표시 적용 |
@@ -122,9 +151,32 @@ playbackd -config /etc/transmux/playback.json -validate
 | `lease.operation_timeout` | lease 요청 하나의 상한 | `upload.put_timeout`과 분리한다. lease 레코드는 수백 바이트, 세그먼트는 수 MB라 같이 묶으면 한쪽이 반드시 잘못 잡힌다 |
 | `lease.max_clock_skew` | 샤드 간 시계 오차 상한 가정 | 인수자는 만료 후 이만큼 더 기다리고, 소유자는 이만큼 먼저 멈춘다. 호스트에 NTP가 필요하다 |
 
+주요 재생 설정(`configs/solution-playback.json`):
+
+| 키 | 의미 | 주의 |
+|---|---|---|
+| `auth.trusted_proxies` | `X-Forwarded-For`를 신뢰할 프록시 CIDR 문자열 배열 | 기본 `[]`, 최대 64개. 비어 있으면 `RemoteAddr`만 사용. TLS 리버스 프록시 뒤 배포 시 실제 프록시 CIDR 지정 필수 |
+| `export.min_free_bytes` | 내보내기 볼륨에 남길 최소 여유 바이트 | 기본 `1073741824` (1GiB), 허용 범위 128MiB∼1TiB. 작업별 예약은 `3 × (세그먼트 바이트 합 + 서로 다른 초기화 파일 수 × 1MiB) + (파일 수 + 2) × 64KiB`다. 파일 수는 세그먼트와 서로 다른 초기화 파일 수의 합이며, 진행 중 작업은 아직 기록하지 않은 예약분만 합산한다. 부족하면 시작 전에 `507 export_storage_full` (`Retry-After: 60`) 반환 |
+
+로그인은 실제 계정과 미존재 이름 모두 실패한 시도만 10회/분으로 집계한다.
+미존재 이름은 비밀 키 HMAC으로 고정 4,096개 버킷에 배정되어 한도를 공유할 수 있다.
+비밀번호 검증 전에 시도를 선계수하고 성공 시 되돌려 동시 요청에도 상한을 지킨다.
+한도를 소진하면 남은 고정 창(최대 1분) 동안 올바른 비밀번호도 `429`로 거절하는
+의도된 잠금 정책을 적용한다. 버킷을 대량으로 포화시키는 공격 없이는 응답으로
+계정 존재 여부를 구별하기 어렵지만, 완전한 은닉을 보장하지는 않는다.
+
+클라이언트 한도는 모든 로그인 시도에 30회/분이며 IPv6는 `/64` 단위로 묶는다.
+클라이언트 추적 키는 최대 10,000개이며, 가득 차면 신규 클라이언트는 공용 overflow
+버킷(300회/분)을 공유한다. 포화 시 신규 클라이언트가 함께 제한될 수 있으며,
+이 상태는 관리자 상태 API(`GET /v1/admin/status`)의 `login.overflow_attempts`·`login.overflow_refused`와 경고 로그로 확인할 수 있다. 이 한도들은 설정 키가 없는 상수다.
+내보내기의 즉시 오류 응답은 [솔루션 API 가이드](docs/solution.md#api)를 참고한다.
+
 자격증명은 AWS SDK의 기본 체인으로 읽는다. 프로덕션은 ECS task role 또는 EKS
-IRSA를 권장하며, MinIO 개발 환경은 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`를
+IRSA를 권장하며, 로컬 S3 호환 서버(RustFS) 개발 환경은 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`를
 사용한다. 임시 환경 자격증명을 사용할 때는 `AWS_SESSION_TOKEN`도 함께 전달된다.
+
+S3 호환 서버는 조건부 PUT(`If-None-Match: *`, `If-Match`)을 지원해야 한다.
+이 헤더를 무시하는 서버(예: Garage)에서는 소유권 펜싱이 동작하지 않는다.
 
 필요한 S3 권한은 ingest prefix의 `s3:PutObject`와 `s3:GetObject`다. 읽기 권한은
 매니페스트·lease 및 세그먼트의 충돌 확인용 HEAD까지 포함한다. 또한 없는 키에 대한
@@ -132,7 +184,7 @@ GET을 `404`로 구분하려면 버킷의 `s3:ListBucket` 권한이 필요하다
 S3는 없는 키에도 `403`을 반환할 수 있고, 데몬은 새 카메라라고 추측하지 않고
 소유권 확인을 기다린다. `transmuxd`는 목록 조회나 객체 삭제 API를 호출하지 않는다.
 `playbackd`에는 인덱싱용 목록 권한이 필요하고, 보존 삭제를 켜면 미디어 삭제 권한도
-필요하다. 역할별 권한은 [보안 정책](SECURITY.md)을 참고한다.
+필요하다. 역할별 권한은 [배포 보안 가이드](docs/deployment-security.md)를 참고한다.
 
 수집의 `state_dir`에 영속 볼륨은 **필요하지 않다** —
 기동할 때마다 발행 매니페스트를 읽어 시퀀스를 확정하며, 로컬 체크포인트는
@@ -158,7 +210,7 @@ s3://bucket/_transmux/rosters/{name}.json
 업로드 시점에 기록한다. fMP4에는 `init-uri`도 기록한다.
 `playbackd`의 백그라운드 인덱서가 이를 검증해 시간 인덱스를 만들고 복구한다.
 
-세그먼트는 요구사항대로 날짜 디렉터리에 들어가고, 라이브 매니페스트는
+세그먼트는 날짜 디렉터리에 들어가고, 라이브 매니페스트는
 카메라 루트에 둔다. 매니페스트를 날짜 디렉터리에 두면 자정마다 재생 URL이
 바뀌기 때문이다. 이름은 `storage.manifest_name`으로 바꿀 수 있다.
 
@@ -284,7 +336,7 @@ HTTP 카메라 목록은 `StaticCamera` JSON 배열 계약을 따른다. 알 수
 ## 알려진 제약과 미구현
 
 - **대규모 장기 부하 미검증.** 기존 영상 복사 경로의 625채널 메모리 외삽은
-  약 8.6GiB로 목표 8GB를 넘는다. 오디오 변환·인덱싱·시청·내보내기 부하는
+  약 8.6GiB로, 예를 들어 8GB 메모리 예산을 넘는다. 오디오 변환·인덱싱·시청·내보내기 부하는
   별도로 측정해야 한다. [용량 모델](docs/capacity-model.md) 참고.
 - **일반 HLS 지연.** WebRTC·LL-HLS 및 1∼3초 저지연 전송을 제공하지 않는다.
 - **HEVC 클라이언트 제약.** 실제 fMP4 수집·재생·MP4 디코딩을 검증했으나
@@ -292,7 +344,7 @@ HTTP 카메라 목록은 `StaticCamera` JSON 배열 계약을 따른다. 알 수
 - **단일 재생 서버 기준.** 영속 bbolt 인덱스는 한 프로세스만 연다.
   여러 재생 서버 사이의 세션·내보내기 상태 공유와 자동 장애 전환은 없다.
 - **CDN 배포는 별도.** 현재 전달은 인증 프록시다. CloudFront OAC·서명 쿠키,
-  TLS 종단 및 고객 SSO 연동은 운영 환경에 맞춰 구성해야 한다.
+  TLS 종단 및 외부 SSO 연동은 운영 환경에 맞춰 구성해야 한다.
 - **녹화는 조각 경계 기준.** 프레임 단위 절단과 TS/fMP4 형식 변경을 가로지르는
   단일 VOD는 지원하지 않는다.
 - **객체 경로에 profile 차원 없음.** 멀티뷰용 서브스트림(듀얼 스트림)을 쓰려면
@@ -305,8 +357,8 @@ HTTP 카메라 목록은 `StaticCamera` JSON 배열 계약을 따른다. 알 수
 ## 검증된 동작
 
 PoC 스택에서 실제로 확인한 항목이다. 수집 장애 검증은
-[품질 점검 기록](docs/quality-review.md), 재생·관리·내보내기 검증은
-[솔루션 검증 기록](docs/solution-review.md)에 정리했다.
+[품질 점검 기록](docs/verification/2026-09-12-quality-review.md), 재생·관리·내보내기 검증은
+[솔루션 검증 기록](docs/verification/2026-09-12-solution-review.md)에 정리했다.
 
 - 비공개 버킷에서 인증된 H.264 TS, H.264 fMP4, H.265 fMP4 라이브·녹화 재생
 - AAC 복사·G.711→AAC 변환, HTTP Range, 실제 디코딩 가능한 MP4 추출
@@ -341,3 +393,18 @@ PoC 스택에서 실제로 확인한 항목이다. 수집 장애 검증은
 - 채널당 CPU 0.37~0.83% 코어(0.5~4Mbps 실측 4점), 75채널까지 선형 확장,
   ffmpeg 81~84% / supervisor 16~19%
 - 채널당 메모리 13.4~14.3 MiB로 비트레이트에 무관(0.5Mbps와 4Mbps가 동일)
+
+## 기여
+
+변경 제안·개발 환경·검증 명령과 DCO 서명 방법은
+[기여 가이드](CONTRIBUTING.md)에 정리했다.
+참여자는 [행동 강령](CODE_OF_CONDUCT.md)을 따른다.
+보안 취약점은 공개 이슈 대신 [비공개 신고 경로](SECURITY.md#취약점-신고)를 사용한다.
+
+## 라이선스
+
+transmux는 [Apache License 2.0](LICENSE)으로 배포한다.
+저작권·상위 프로젝트 고지는 [NOTICE](NOTICE),
+Go 의존성·hls.js·런타임 ffmpeg의 라이선스는
+[서드파티 고지](THIRD_PARTY_NOTICES.md)를 참고한다.
+런타임 이미지에 포함된 ffmpeg 등은 각 구성 요소의 라이선스를 따른다.

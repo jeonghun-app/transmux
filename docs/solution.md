@@ -22,8 +22,18 @@ make solution-verify
 | `viewer` | `.env.solution`의 `TRANSMUX_VIEWER_PASSWORD` | 모의 정문·창고 카메라의 라이브·녹화 |
 
 `make solution-env`는 비밀번호와 서명 키를 생성하고 기존 파일은 보존한다.
+기존 `.env.solution`에 `TRANSMUX_S3_SECRET_KEY`가 없으면 자동으로 추가하며,
+`make solution-up`에서도 실행된다.
 이 파일은 Git과 Docker 빌드 컨텍스트에서 제외된다. 파일 권한은 `0600`이다.
 `make solution-down`은 컨테이너를 중지하되 녹화·카메라 목록·인덱스 볼륨을 보존한다.
+RustFS 전환으로 저장 볼륨 이름은 `objects`에서 `s3-data`로 바뀌며, 기존 로컬
+녹화는 새 스택에서 보이지 않는다. `make solution-up`은 `--remove-orphans`로
+이전 MinIO 컨테이너를 정리한다. 같은 Compose 프로젝트에서 이 파일에 정의되지
+않은 다른 서비스도 함께 제거된다. 이전 `transmux-solution_objects` 볼륨은 남는다.
+이전 녹화가 필요 없으면
+`docker volume rm transmux-solution_objects transmux-solution_playback-state`로
+이전 데이터와 재생 인덱스를 함께 지운다. 이전 녹화를 보존하려면 업그레이드 전에
+이전 버전에서 MP4로 내보낸다.
 
 모의 카메라는 다음 경로를 실제 RTSP로 전송한다.
 
@@ -33,13 +43,40 @@ make solution-verify
 | 창고 `warehouse` | H.264 + G.711 μ-law | fMP4, 음성 AAC 변환 | 8초 |
 | `hevc` | H.265 + G.711 μ-law | fMP4, 음성 AAC 변환 | 2초 |
 
-MinIO 버킷은 비공개다. MinIO와 RTSP 포트는 호스트에 공개하지 않고,
-운영자 API만 `127.0.0.1:8090`에 바인딩한다. MinIO와 MediaMTX는 이 Compose의
-개발용 저장소·카메라 대역이다. 운영 구성은 실제 카메라와 비공개 S3를 사용한다.
+로컬 S3 호환 서버(RustFS, 서비스 이름 `s3`) 버킷은 비공개다. S3와 RTSP 포트는
+호스트에 공개하지 않고 운영자 API만 `127.0.0.1:8090`에 바인딩한다.
+RustFS와 MediaMTX는 이 Compose의 개발용 저장소·카메라 대역이다.
+운영 구성은 실제 카메라와 비공개 S3를 사용한다.
+S3 호환 서버는 조건부 PUT(`If-None-Match: *`, `If-Match`)을 지원해야 한다.
+이 헤더를 무시하는 서버(예: Garage)에서는 소유권 펜싱이 동작하지 않는다.
 
 포트를 바꿀 때는 `.env.solution`의 `TRANSMUX_HTTP_PORT`와
 `TRANSMUX_PUBLIC_URL`을 함께 바꾼다. `TRANSMUX_PUBLIC_URL`은 재생 설정의
 `public_url`을 덮어쓴다. 공개 URL은 프록시 외부에서 접근하는 정확한 origin이어야 한다.
+
+## 설정
+
+수집은 `configs/solution-ingest.json`, 재생은 `configs/solution-playback.json`으로
+설정한다. 다음 항목은 재생 서버(`playbackd`)의 설정이다.
+
+| 키 | 기본값 | 의미·제한 |
+|---|---|---|
+| `auth.trusted_proxies` | `[]` | `X-Forwarded-For`를 신뢰할 프록시의 CIDR 문자열 배열. 최대 64개 |
+| `export.min_free_bytes` | `1073741824` (1GiB) | 내보내기 볼륨에 남겨 둘 최소 여유 바이트. 허용 범위 128MiB∼1TiB |
+
+TLS 리버스 프록시 뒤에 배포할 때는 `auth.trusted_proxies`에 실제 프록시의 CIDR을
+반드시 지정한다. 직접 연결한 `RemoteAddr`가 신뢰 범위에 속할 때만
+`X-Forwarded-For`를 오른쪽부터 읽고, 신뢰 프록시가 아닌 첫 주소를 클라이언트로
+판정한다. 배열이 비어 있거나 직접 연결한 주소가 신뢰 범위 밖이면 헤더를 무시하고
+`RemoteAddr`만 사용한다. 상세 배포 조건은 [배포 보안 가이드](deployment-security.md)를 따른다.
+
+내보내기의 작업별 공간 예약 산식은
+`3 × (세그먼트 바이트 합 + 서로 다른 초기화 파일 수 × 1MiB) + (파일 수 + 2) × 64KiB`다.
+파일 수는 세그먼트와 서로 다른 초기화 파일 수의 합이며, 추가 2개는 재생 목록과 출력 파일이다.
+진행 중 작업은 아직 기록하지 않은 예약분만 합산한다.
+이 예약분과 `export.min_free_bytes`를 고려해 공간이 부족하면 작업 시작 전에
+`507 export_storage_full`로 거절한다. 인덱스와 내보내기가 같은 볼륨을 사용하면
+인덱스 갱신에 필요한 여유도 이 값에 반영한다.
 
 ## 데이터 흐름
 
@@ -73,6 +110,21 @@ flowchart LR
 `auth.users`는 자체 운영 계정의 최소 구성이다. 비밀번호는 지정한 환경변수에서
 읽어 메모리에서 salt와 PBKDF2-SHA256 600,000회로 처리한다. 로그인 시도와
 동시 비밀번호 검증 수를 제한한다.
+
+로그인 한도는 설정 키가 없는 상수이며 1분 고정 창으로 집계한다.
+실제 계정과 미존재 이름 모두 **실패한 시도만 10회/분**으로 제한한다.
+미존재 이름은 비밀 키 HMAC으로 고정 4,096개 버킷에 배정되어 한도를 공유할 수 있다.
+비밀번호 검증 전에 시도를 선계수하고 성공 시 되돌리므로 동시 요청에도 상한을 지킨다.
+한도를 소진하면 해당 창이 끝날 때까지 최대 1분 동안 그 계정의 로그인은
+올바른 비밀번호를 보내도 `429 login_rate_limit`로 거절한다.
+이는 의도된 계정 잠금 정책이다.
+버킷을 대량으로 포화시키는 공격 없이는 응답으로 계정 존재 여부를 구별하기 어렵지만,
+완전한 은닉을 보장하지는 않는다.
+
+클라이언트별로는 모든 로그인 시도에 **30회/분**을 적용하며 IPv6 주소는 `/64`
+단위로 묶는다. 클라이언트 추적 키는 최대 10,000개이며, 가득 차면 신규 클라이언트는
+공용 overflow 버킷(**300회/분**)을 공유한다. 포화 시 신규 클라이언트가 함께
+제한될 수 있으며, 이 상태는 관리자 상태 API(`GET /v1/admin/status`)의 `login.overflow_attempts`·`login.overflow_refused`와 경고 로그로 확인할 수 있다.
 
 기존 인증 시스템은 신뢰할 수 있는 중앙 백엔드에서 아래 JWT 계약을 발급해
 연동할 수 있다. 서명 키는 브라우저나 개별 테넌트에 배포하지 않는다.
@@ -124,7 +176,7 @@ JSON 요청은 `Content-Type: application/json`, 관리·조회 요청은
 
 | 메서드·경로 | 동작 |
 |---|---|
-| `POST /v1/login` | `username`, `password`로 API 토큰 발급 |
+| `POST /v1/login` | `username`, `password`로 API 토큰 발급. 로그인 한도 초과·계정 잠금 시 `429 login_rate_limit` |
 | `GET /v1/me` | 사용자, 범위, 만료 시각, 관리 가능 여부 |
 | `GET /v1/centers` | 권한이 있는 센터와 카메라 수 |
 | `GET /v1/cameras` | 권한이 있는 카메라 목록 |
@@ -132,7 +184,7 @@ JSON 요청은 `Content-Type: application/json`, 관리·조회 요청은
 | `POST /v1/playback-sessions` | 1∼16개 카메라의 라이브·녹화 세션 |
 | `POST /v1/playback-sessions/renew` | `session_token`으로 기존 세션 갱신 |
 | `GET /v1/recordings` | 카메라·시각 구간의 녹화 기간과 인덱스 복구 상태 |
-| `POST /v1/exports` | MP4 준비 작업 시작, `202`와 작업 ID 반환 |
+| `POST /v1/exports` | 사전 검사와 공간 예약 성공 시 MP4 준비 작업 시작, `202`와 작업 ID 반환 |
 | `GET /v1/exports` | 해당 사용자의 내보내기 작업 |
 | `GET /v1/exports/{id}` | 상태·실패 코드·준비된 다운로드 URL |
 | `DELETE /v1/exports/{id}` | 작업 취소 또는 준비된 파일 제거 |
@@ -145,6 +197,15 @@ JSON 요청은 `Content-Type: application/json`, 관리·조회 요청은
 | `GET /media/{capability}/...` | 인증된 HLS 매니페스트·미디어 |
 | `GET /exports/{capability}/clip.mp4` | 완료된 파일 다운로드, Range 지원 |
 | `GET /healthz`, `GET /readyz` | 일반적인 생존·카탈로그 준비 상태 |
+
+`POST /v1/exports`가 작업 시작 전에 즉시 응답하는 주요 오류는 다음과 같다.
+
+| HTTP 상태 | 오류 코드 | 의미 |
+|---|---|---|
+| `404` | `recording_not_found` | 요청 구간에 색인된 녹화가 없음 |
+| `422` | `export_too_large` | 내보내기 크기·세그먼트 수 한도 초과 |
+| `409` | `recording_format_changed` | 요청 구간이 MPEG-TS/fMP4 형식 변경을 가로지름 |
+| `507` | `export_storage_full` | 예약 공간과 최소 여유를 확보할 수 없음. `Retry-After: 60` 응답 |
 
 라이브 세션 요청:
 
@@ -260,6 +321,10 @@ RTSP 주소를 비워서 PUT하면 기존 비밀 주소를 유지한다. 조회 
 
 기존 `static`, `http` 공급자는 계속 지원한다. 이 경우 자체 관리 API는
 카메라 변경을 거절하고 외부 공급자를 시스템 원장으로 사용한다.
+HTTP 공급자의 `enabled: false` 카메라는 수집에서 제외하지만 재생 카탈로그와
+보존 작업 대상에는 유지하므로 권한이 있는 사용자는 과거 녹화를 계속 조회·재생할 수 있다.
+수집 설정에 `cameras.shard_filter`를 지정한 경우 HTTP 카탈로그에도 적용하므로
+다른 샤드의 카메라는 해당 재생 서버의 카탈로그·보존 작업에 포함하지 않는다.
 
 ## 보존과 내보내기
 
@@ -326,9 +391,9 @@ lease·매니페스트·공유 목록에 DeleteObject를 허용할 이유는 없
 
 2∼8초 GOP 기반 일반 HLS이므로 초저지연 서비스가 아니다. HEVC fMP4의
 브라우저 재생은 클라이언트의 HEVC 디코더 지원에 달려 있다.
-625채널·8GB·30일 연속 운영은 이 기능 구현만으로 인증되지 않는다.
+625채널 예시의 8GB 메모리·30일 연속 운영은 이 기능 구현만으로 인증되지 않는다.
 측정과 실제 전환 조건은 [용량 모델](capacity-model.md),
-[Wowza 대체 범위](wowza-coverage.md)를 함께 적용한다.
+[기존 미디어 서버에서의 전환](wowza-coverage.md)을 함께 적용한다.
 
 ## 검증 도구
 
@@ -356,4 +421,4 @@ npm test
 카메라 추가 후 실제 수집·중지, 계정 권한, 중복 제출, 오류 복구,
 좁은 화면·키보드·axe 접근성 검사를 포함한다.
 테스트 데이터는 모의 스택에만 작성한다. HEVC의 모든 브라우저·네이티브
-앱 조합, 보조기기 수동 검사, 고객의 실제 카메라 호환성을 대신하지 않는다.
+앱 조합, 보조기기 수동 검사, 실제 운영 카메라 호환성을 대신하지 않는다.

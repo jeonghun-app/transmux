@@ -1,4 +1,4 @@
-# ADR 0002 — 고객 디바이스 전달(delivery)·재생 경로
+# ADR 0002 — 클라이언트 디바이스 전달(delivery)·재생 경로
 
 - 상태: **과거 제안, 현재 구현은 ADR 0003으로 대체**
 - 날짜: 2026-09-01
@@ -8,19 +8,19 @@
 이 문서는 초기 CloudFront·DynamoDB 제안과 비용·지연 분석을 보존한다.
 아래의 “현재”, “미구현”, “결정 대기”는 작성 당시를 뜻한다.
 실제 구현은 인증 프록시, 영속 시간 인덱스, 카메라별 권한과 오디오·fMP4를
-채택했다. 현재 API·IAM 계약은 [솔루션 가이드](../solution.md)와
-[보안 정책](../../SECURITY.md)을 따른다.
+채택했다. 현재 API는 [솔루션 가이드](../solution.md), 운영 IAM은
+[배포 보안 가이드](../deployment-security.md)를 따른다.
 
 ## 1. 배경
 
 ADR 0001과 그 구현은 RTSP를 받아 HLS로 트랜스먹싱해 S3에 넣는 **ingest 경로**만
-다룬다. 고객 디바이스(관제 클라이언트, 웹, 모바일)가 그 스트림에 어떻게 접속해
+다룬다. 클라이언트 디바이스(관제 클라이언트, 웹, 모바일)가 그 스트림에 어떻게 접속해
 재생하는지는 설계도 구현도 없었다.
 
 현재 코드 확인 결과:
 
 - `internal/storage`에 delivery용 presign, CloudFront, 인증 코드가 없다.
-- `internal/health`의 `/channels`는 **인증 없는 운영 모니터링 API**이며 고객용
+- `internal/health`의 `/channels`는 **인증 없는 운영 모니터링 API**이며 시청자용
   카탈로그가 아니다.
 - PoC에서 재생이 되는 것은 MinIO에 anonymous download를 켜뒀기 때문이다
   (`deploy/docker-compose.poc.yml`). 프로덕션 모델이 아니다.
@@ -30,7 +30,7 @@ ADR 0001과 그 구현은 RTSP를 받아 HLS로 트랜스먹싱해 S3에 넣는 
 ## 2. 결정: 기본 경로
 
 ```
-고객 디바이스
+클라이언트 디바이스
   └─ ① 인증 → Playback API (센터/카메라 권한 확인)
        └─ ② 센터 범위 CloudFront signed cookie 발급
             └─ ③ CloudFront (cookie 검증, 세그먼트 캐시)
@@ -44,7 +44,7 @@ S3 측 요건:
   `AWS:SourceArn`으로 distribution을 한정한다
 - transmuxd task role은 지정된 ingest prefix에 대한 `s3:PutObject`와,
   시퀀스 복구용 `s3:GetObject`만 갖는다 (§6 참고)
-- 고객에게 S3 URL이나 AWS 자격증명을 주지 않는다
+- 시청자에게 S3 URL이나 AWS 자격증명을 주지 않는다
 
 CloudFront를 고르는 이유는 **비용 절감이 아니다**(§7에서 계산). signed cookie
 기반 인증, origin 비공개화, 세그먼트 fan-out 캐시, WAF·접속 로그가 목적이다.
@@ -101,11 +101,11 @@ Secure; HttpOnly; SameSite=None; Domain=.example.com; Path=/live/{center_id}/
 
 ## 4. 결정: 재생 URL과 API
 
-고객 디바이스가 URL을 직접 조립하지 않는다.
+클라이언트 디바이스가 URL을 직접 조립하지 않는다.
 
 ```http
 POST /v1/playback-sessions
-Authorization: Bearer <customer-token>
+Authorization: Bearer <access-token>
 
 { "center_id": "center-01", "camera_ids": ["cam-01"], "mode": "live" }
 ```
@@ -131,7 +131,7 @@ Authorization: Bearer <customer-token>
 timestamp/GOP가 정렬되어 있지 않으면 전환 시 stall을 유발하므로, 멀티뷰는 sub,
 확대는 main을 **명시적으로 선택**하는 방식을 권한다.
 
-이 API는 transmuxd에 넣지 않는다. 기존 고객 인증 시스템과 붙어야 하고, ingest
+이 API는 transmuxd에 넣지 않는다. 기존 인증 시스템과 연동할 수 있어야 하고, ingest
 데몬을 사용자 트래픽 장애 도메인에 묶으면 안 된다.
 
 ## 5. 지연 예산: 약 15~17초
@@ -165,8 +165,8 @@ GOP 8초 카메라는 28~35초가 된다.
 segment·blocking playlist reload를 지원하는 origin이 필요하므로 정적 S3
 origin으로는 사실상 불가능하다.
 
-**Wowza가 RTSP 직결이나 WebRTC로 1~3초를 제공하고 있었다면 S3 HLS는 대체가 되지
-않는다.** 이것이 §9의 최우선 미결 항목이다.
+**기존 경로가 RTSP 직결이나 WebRTC로 1~3초를 제공했다면 S3 HLS로 같은 지연을
+보장할 수 없다.** 이것이 §9의 최우선 검토 항목이다.
 
 ## 6. 구현한 것 (이번 변경)
 
@@ -260,31 +260,31 @@ $0.023/GB-month 가정 시 약 $18.6K/월.
 | 16분할 | 64Mbps | 28.8GB |
 | 25분할 | 100Mbps | 45GB |
 
-16개 동시 1080p 하드웨어 디코딩은 GPU·OS·브라우저별 세션 한도가 달라 일반
-요구사항으로 보장할 수 없다. 소프트웨어 fallback이 걸리면 CPU가 급증한다.
+16개 동시 1080p 하드웨어 디코딩은 GPU·OS·브라우저별 세션 한도가 달라
+일반적으로 보장할 수 없다. 소프트웨어 fallback이 걸리면 CPU가 급증한다.
 
 권고: 타일에는 카메라의 **second stream**(360p/0.5~1Mbps), 확대 시 main으로 전환.
 트랜스코딩 금지와 충돌하지 않는다.
 
 단, 전 카메라 main+sub를 상시 ingest하면:
 
-- 논리 채널 640 → 1,280
-- 메모리 고정비 14MiB × 1,280 ≈ **17.5GiB** (채널당 메모리는 비트레이트에
+- 논리 채널 예시 625 → 1,250
+- 메모리 고정비 14MiB × 1,250 ≈ **17.1GiB** (채널당 메모리는 비트레이트에
   둔감하므로 서브스트림도 거의 같은 비용, `docs/capacity-model.md`)
 - PID·FD·PUT 수 거의 2배
 
 서브스트림은 **관제 화면이 열릴 때만 on-demand로 수신**하는 것이 자원상 낫다.
 동시 관제 화면 수가 전체 카메라 수보다 훨씬 작다면 그렇다.
 
-객체 경로에 profile 차원(`{center}/{camera}/{profile}/...`)을 넣는 것은 URL이
-외부 계약이 되기 전에 결정해야 한다. 요구사항이 명시한 경로와 달라지므로 §9의
-결정 사항으로 둔다. **현재 구현은 profile 차원이 없다.**
+객체 경로에 profile 차원(`{center}/{camera}/{profile}/...`)을 넣을지는
+클라이언트에서 URL 경로를 사용하기 전에 결정해야 한다. 경로 형식이 달라지므로
+§9의 결정 사항으로 둔다. **현재 구현은 profile 차원이 없다.**
 
 ## 9. 미결 항목 — 이것들이 다음 구현을 막고 있다
 
 | # | 질문 | 무엇이 갈리는가 |
 |---|---|---|
-| 1 | **고객 디바이스가 무엇이고 접속 경로가 인터넷인가 사내망인가** | CloudFront vs 인증 프록시. 비용이 두 자릿수 배 차이 |
+| 1 | **클라이언트 디바이스가 무엇이고 접속 경로가 인터넷인가 사내망인가** | CloudFront vs 인증 프록시. 비용이 두 자릿수 배 차이 |
 | 2 | **허용 지연이 몇 초인가** | 15초가 안 되면 HLS 단일 경로로는 대체 불가. 프로토콜 자체를 재검토해야 함 |
 | 3 | 권한 단위가 센터인가 카메라인가 | 센터면 signed cookie로 단순, 카메라면 훨씬 복잡 |
 | 4 | 녹화 구간 재생이 필수인가 | 필수면 VOD 인덱서가 별도 과제로 추가 |
@@ -349,7 +349,7 @@ S3 Event는 중복·지연·순서 역전이 가능하므로 indexer는 idempote
 - **매니페스트 폴링 부하**: 동시 재생 stream 수 ÷ target_duration. 관제자 10명 ×
   16분할 = 40 GET/s. 일부 플레이어는 target duration의 절반마다 폴링해 두 배가
   된다.
-- **모니터링 API 노출**: `/channels`, `/metrics`를 고객 delivery 도메인에 함께
+- **모니터링 API 노출**: `/channels`, `/metrics`를 시청자 delivery 도메인에 함께
   노출해서는 안 된다.
 - **네이티브 플레이어 cookie 전달**: API 응답의 cookie가 AVPlayer/ExoPlayer의
   미디어 요청 cookie jar로 실제 전달되는지 반드시 검증해야 한다.
