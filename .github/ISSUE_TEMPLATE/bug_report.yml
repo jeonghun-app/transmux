@@ -1,0 +1,58 @@
+name: 버그 신고
+description: 재현 가능한 문제를 신고한다.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "보안 취약점은 공개 이슈 대신 [비공개 신고](https://github.com/jeonghun-app/transmux/security/advisories/new)를 사용한다. 로그와 설정에서 비밀 정보를 제거한다."
+  - type: input
+    id: version
+    attributes:
+      label: 버전 또는 커밋
+      description: 사용한 릴리스 버전 또는 커밋 해시를 적는다.
+      placeholder: "예: main의 커밋 해시"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 실행 환경
+      description: OS, Docker/Compose, 배포 방식, 관련 서비스 버전을 적는다.
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: 관련 설정
+      description: 비밀번호, 토큰, RTSP 주소, 호스트와 식별자를 가린 설정만 공유한다.
+      render: json
+    validations:
+      required: false
+  - type: textarea
+    id: steps
+    attributes:
+      label: 재현 절차
+      description: 문제를 재현할 수 있는 순서와 입력을 적는다.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 기대한 결과
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 실제 결과
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 로그 또는 화면
+      description: 자격증명, 토큰, 개인 정보와 영상 데이터를 제거한 자료만 첨부한다.
+      render: text
+    validations:
+      required: false
