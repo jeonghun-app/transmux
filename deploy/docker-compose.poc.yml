@@ -260,7 +260,6 @@ services:
 
   # S3-compatible stand-in. RustFS (Apache-2.0) pulls anonymously and
   # implements the conditional writes the ownership protocol depends on. The
-  # "minio" alias keeps the endpoint in configs/poc.json working. The
   # credentials match scripts/measure-*.sh, which join this network.
   s3:
     image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
@@ -269,9 +268,6 @@ services:
       RUSTFS_ACCESS_KEY: minioadmin
       RUSTFS_SECRET_KEY: minioadmin
       RUSTFS_CONSOLE_ENABLE: "false"
-    networks:
-      default:
-        aliases: [minio]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9000/health/ready"]
       interval: 3s

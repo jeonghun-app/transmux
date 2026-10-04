@@ -18,12 +18,18 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def credentials(filename):
-    return {
-        key: value for key, value in (
-            line.split("=", 1) for line in Path(filename).read_text().splitlines()
-            if line and not line.startswith("#") and "=" in line
-        )
-    }
+    # Accept the Compose .env forms people write by hand: "export KEY=v",
+    # spaces around "=", quoted values and comments.
+    values = {}
+    for line in Path(filename).read_text().splitlines():
+        match = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*?)\s*$", line)
+        if not match:
+            continue
+        key, value = match.groups()
+        quoted = re.fullmatch(r"""(['"])(.*?)\1(?:\s+#.*)?""", value)
+        value = quoted.group(2) if quoted else re.sub(r"\s+#.*$", "", value)
+        values[key] = value
+    return values
 
 
 def request(url, token="", body=None, headers=None, expected=200):
@@ -103,7 +109,9 @@ def object_tags(args, key):
         ["docker", "compose", "--env-file", args.env_file, "-f",
          str(ROOT / "deploy/docker-compose.solution.yml"), "-p", args.project,
          "exec", "-T", "s3", "sh", "-c",
-         'printf \'user = "%s:%s"\\n\' "$RUSTFS_ACCESS_KEY" "$RUSTFS_SECRET_KEY" '
+         # curl config values are quoted, so " and \ must be escaped.
+         'esc() { printf "%s" "$1" | sed \'s/[\\\\"]/\\\\&/g\'; }; '
+         'printf \'user = "%s:%s"\\n\' "$(esc "$RUSTFS_ACCESS_KEY")" "$(esc "$RUSTFS_SECRET_KEY")" '
          '| curl -fsS -K - --aws-sigv4 "aws:amz:us-east-1:s3" '
          '"http://127.0.0.1:9000/transmux/$1?tagging"',
          "verify", urllib.parse.quote(key, safe="/")],
