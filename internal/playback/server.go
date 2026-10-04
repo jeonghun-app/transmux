@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -42,20 +41,17 @@ type Server struct {
 	roster         []config.StaticCamera
 	rosterETag     string
 	rosterAt       time.Time
-	loginMu        sync.Mutex
-	loginRates     map[string]loginRate
+	loginClients   *loginLimiter
+	loginAccounts  *loginLimiter
+	loginUnknown   *loginLimiter
 	retentionMu    sync.Mutex
 	retention      RetentionStatus
 	background     context.Context
 	stopBackground context.CancelFunc
 	jobsMu         sync.Mutex
 	jobs           map[string]*exportJob
+	exportSpace    map[*exportSpace]struct{} // running export reservations, guarded by jobsMu
 	jobsWG         sync.WaitGroup
-}
-
-type loginRate struct {
-	At    time.Time
-	Count int
 }
 
 func NewServer(cfg Config, ingest config.Config, store storage.MediaStore, index *recording.Index,
@@ -101,9 +97,12 @@ func NewServer(cfg Config, ingest config.Config, store storage.MediaStore, index
 	s := &Server{cfg: cfg, ingest: ingest, store: store, index: index, auth: auth, log: log,
 		provider: provider, mediaSlots: make(chan struct{}, cfg.MaxStreams),
 		exportSlots: make(chan struct{}, cfg.Export.Workers), loginSlots: make(chan struct{}, 2),
-		querySlots: make(chan struct{}, 8), loginRates: make(map[string]loginRate)}
+		querySlots: make(chan struct{}, 8), loginClients: newLoginLimiter(loginClientLimit, loginOverflowLimit),
+		loginAccounts: newLoginLimiter(loginAccountLimit, loginAccountLimit),
+		loginUnknown:  newLoginLimiter(loginAccountLimit, loginAccountLimit)}
 	s.background, s.stopBackground = context.WithCancel(context.Background())
 	s.jobs = make(map[string]*exportJob)
+	s.exportSpace = make(map[*exportSpace]struct{})
 	if err := s.cleanupOrphanedExports(); err != nil {
 		s.stopBackground()
 		return nil, err
@@ -239,31 +238,19 @@ func (s *Server) headers(next http.Handler) http.Handler {
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	now := time.Now()
-	s.loginMu.Lock()
-	for key, value := range s.loginRates {
-		if now.Sub(value.At) >= time.Minute {
-			delete(s.loginRates, key)
-		}
-	}
-	entry := s.loginRates[host]
-	if entry.At.IsZero() {
-		entry.At = now
-	}
-	entry.Count++
-	_, exists := s.loginRates[host]
-	allowed := entry.Count <= 10 && (exists || len(s.loginRates) < 10000)
-	if exists || len(s.loginRates) < 10000 {
-		s.loginRates[host] = entry
-	}
-	s.loginMu.Unlock()
-	if !allowed || !take(s.loginSlots) {
+	limited := func() {
 		w.Header().Set("Retry-After", "60")
 		fail(w, http.StatusTooManyRequests, "login_rate_limit", "Wait a minute before signing in again.")
+	}
+	allowed := s.loginClients.allow(s.auth.ClientKey(r), time.Now())
+	if status, warn := s.loginClients.overflowWarning(time.Now()); warn {
+		s.log.Warn("login client table is full; new clients share the overflow limit",
+			"overflow_attempts", status.Used, "overflow_refused", status.Refused)
+	}
+	if !allowed {
+		limited()
 		return
 	}
-	defer release(s.loginSlots)
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -271,15 +258,40 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &body) {
 		return
 	}
+	// Configured accounts and hashed buckets of unknown names are kept in
+	// separate tables, so unknown names can never crowd out a real account.
+	key, known := s.auth.AccountKey(body.Username)
+	accounts := s.loginAccounts
+	if !known {
+		accounts = s.loginUnknown
+	}
+	// Count the attempt before verifying it, so concurrent guesses cannot
+	// pass the check together; only a verified failure keeps the count.
+	ticket, ok := accounts.reserve(key, time.Now())
+	if !ok {
+		limited()
+		return
+	}
+	if !take(s.loginSlots) {
+		accounts.refund(ticket)
+		limited()
+		return
+	}
+	defer release(s.loginSlots)
 	token, claims, err := s.auth.Login(body.Username, body.Password)
 	if err != nil {
 		fail(w, http.StatusUnauthorized, "invalid_credentials", "Username or password is incorrect.")
 		return
 	}
+	accounts.refund(ticket)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": token, "token_type": "Bearer", "expires_at": claims.ExpiresAt.Time,
 	})
 }
+
+// LoginStatus reports use of the shared overflow login bucket, so operators
+// can see when the client table is saturated.
+func (s *Server) LoginStatus() overflowStatus { return s.loginClients.status() }
 
 func (s *Server) loadRosterOnly(ctx context.Context) ([]config.StaticCamera, error) {
 	roster, _, err := s.loadRoster(ctx)

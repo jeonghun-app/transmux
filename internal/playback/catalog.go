@@ -123,6 +123,6 @@ func (s *Server) adminStatus(w http.ResponseWriter, r *http.Request, actor *Clai
 	writeJSON(w, http.StatusOK, map[string]any{
 		"index": s.scanner.Status(), "retention": retention,
 		"active_media_requests": len(s.mediaSlots), "active_exports": len(s.exportSlots),
-		"camera_management": s.managed != nil,
+		"camera_management": s.managed != nil, "login": s.LoginStatus(),
 	})
 }

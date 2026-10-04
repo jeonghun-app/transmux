@@ -138,20 +138,25 @@ func (f *fixture) request(t *testing.T, method, url, token string, body any, hea
 
 func (f *fixture) segment(t *testing.T, sequence uint64, pdt time.Time, duration time.Duration, body []byte, initURI string) recording.Segment {
 	t.Helper()
+	return f.cameraSegment(t, "cam1", sequence, pdt, duration, body, initURI)
+}
+
+func (f *fixture) cameraSegment(t *testing.T, cameraID string, sequence uint64, pdt time.Time, duration time.Duration, body []byte, initURI string) recording.Segment {
+	t.Helper()
 	pdt = time.UnixMilli(pdt.UnixMilli()).UTC()
 	extension := ".ts"
 	if initURI != "" {
 		extension = ".m4s"
 	}
 	uri := path.Join(pdt.Format("2006/01/02"), fmt.Sprintf("seg-%09d-%d%s", sequence, pdt.UnixMilli(), extension))
-	key := "archive/c1/cam1/" + uri
-	md := map[string]string{"center-id": "c1", "camera-id": "cam1", "sequence": strconv.FormatUint(sequence, 10),
+	key := "archive/c1/" + cameraID + "/" + uri
+	md := map[string]string{"center-id": "c1", "camera-id": cameraID, "sequence": strconv.FormatUint(sequence, 10),
 		"pdt-ms": strconv.FormatInt(pdt.UnixMilli(), 10), "duration-ms": strconv.FormatInt(duration.Milliseconds(), 10),
 		"discontinuity": "false", "init-uri": initURI}
 	if _, err := f.store.Put(context.Background(), storage.Object{Key: key, Body: body, Metadata: md}); err != nil {
 		t.Fatal(err)
 	}
-	record, err := recording.FromObject("archive", "c1", "cam1", storage.Entry{Key: key}, storage.ObjectInfo{Size: int64(len(body)), Metadata: md})
+	record, err := recording.FromObject("archive", "c1", cameraID, storage.Entry{Key: key}, storage.ObjectInfo{Size: int64(len(body)), Metadata: md})
 	if err != nil {
 		t.Fatal(err)
 	}

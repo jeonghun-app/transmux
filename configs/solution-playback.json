@@ -9,6 +9,7 @@
     "audience": "transmux-api",
     "access_ttl": "8h",
     "session_ttl": "15m",
+    "trusted_proxies": [],
     "users": [
       {
         "username": "admin",
@@ -50,6 +51,7 @@
     "max_duration": "2h",
     "timeout": "10m",
     "max_bytes": 4294967296,
-    "workers": 2
+    "workers": 2,
+    "min_free_bytes": 1073741824
   }
 }
