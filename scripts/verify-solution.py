@@ -12,17 +12,26 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def credentials(filename):
-    return {
-        key: value for key, value in (
-            line.split("=", 1) for line in Path(filename).read_text().splitlines()
-            if line and not line.startswith("#") and "=" in line
-        )
-    }
+    # Supported .env syntax: KEY=value, an optional leading "export", spaces
+    # around "=", a UTF-8 BOM, comments and simple '...' or "..." quoting.
+    # Escapes, variable references and multi-line values are not supported;
+    # the values make solution-env generates are URL-safe and unaffected.
+    values = {}
+    for line in Path(filename).read_text(encoding="utf-8-sig").splitlines():
+        match = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*?)\s*$", line)
+        if not match:
+            continue
+        key, value = match.groups()
+        quoted = re.fullmatch(r"""(['"])(.*?)\1(?:\s+#.*)?""", value)
+        value = quoted.group(2) if quoted else re.sub(r"\s+#.*$", "", value)
+        values[key] = value
+    return values
 
 
 def request(url, token="", body=None, headers=None, expected=200):
@@ -94,17 +103,36 @@ def run_media(image, directory, program, arguments):
     return result.stdout
 
 
+# Signed GetObjectTagging, run inside the storage container because S3 is not
+# published to the host. The secret comes from that container's environment
+# and reaches curl on stdin, never argv. curl config values are quoted, so
+# " and \ are escaped; a line break cannot be represented and is refused.
+TAGS_SCRIPT = (
+    "nl='\n'; cr=$(printf '\\r'); "
+    'case "$RUSTFS_ACCESS_KEY$RUSTFS_SECRET_KEY" in *"$nl"*|*"$cr"*) '
+    'echo "S3 credentials must not contain line breaks" >&2; exit 3 ;; esac; '
+    'esc() { printf "%s" "$1" | sed \'s/[\\\\"]/\\\\&/g\'; }; '
+    'printf \'user = "%s:%s"\\n\' "$(esc "$RUSTFS_ACCESS_KEY")" "$(esc "$RUSTFS_SECRET_KEY")" '
+    '| curl -fsS -K - --aws-sigv4 "aws:amz:us-east-1:s3" '
+    '"http://127.0.0.1:9000/transmux/$1?tagging"'
+)
+
+
 def object_tags(args, key):
     result = subprocess.run(
         ["docker", "compose", "--env-file", args.env_file, "-f",
          str(ROOT / "deploy/docker-compose.solution.yml"), "-p", args.project,
-         "exec", "-T", "minio", "sh", "-c",
-         'mc alias set verify http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null '
-         '&& mc tag list --json "verify/transmux/$1"', "verify", key],
+         "exec", "-T", "s3", "sh", "-c", TAGS_SCRIPT,
+         "verify", urllib.parse.quote(key, safe="/")],
         capture_output=True, text=True, timeout=15, check=False,
     )
+    assert result.returncode != 3, "S3 credentials must not contain line breaks"
     assert result.returncode == 0, "could not inspect media lifecycle tags"
-    return json.loads(result.stdout).get("tagset", {})
+    namespace = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+    return {
+        tag.findtext("s3:Key", namespaces=namespace): tag.findtext("s3:Value", namespaces=namespace)
+        for tag in ElementTree.fromstring(result.stdout).iterfind("s3:TagSet/s3:Tag", namespace)
+    }
 
 
 def download_playlist(url, raw, directory):
@@ -204,7 +232,7 @@ def main():
                 assert not object_tags(args, prefix + control), "control object is subject to media expiry"
             if camera == "entrance":
                 assert not object_tags(args, "_transmux/rosters/solution.json")
-                object_url = "http://minio:9000/transmux/recordings/demo-center/entrance/" + segments[0]["uri"]
+                object_url = "http://s3:9000/transmux/recordings/demo-center/entrance/" + segments[0]["uri"]
                 denied = subprocess.run([
                     "docker", "compose", "--env-file", args.env_file, "-f",
                     str(ROOT / "deploy/docker-compose.solution.yml"), "-p", args.project,

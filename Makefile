@@ -65,19 +65,19 @@ image: ## Build the runtime container image
 	  --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
 .PHONY: poc-up
-poc-up: image ## Bring up the full PoC stack: MediaMTX + fake camera + transmuxd + MinIO
-	$(DOCKER) compose -f deploy/docker-compose.poc.yml up -d --build
+poc-up: image ## Bring up the full PoC stack: MediaMTX + fake camera + transmuxd + RustFS (local S3)
+	$(DOCKER) compose -f deploy/docker-compose.poc.yml up -d --build --remove-orphans
 
 .PHONY: poc-up-capacity
 poc-up-capacity: image ## PoC stack plus the 1080p/D1/720p sources the capacity scripts need
-	$(DOCKER) compose -f deploy/docker-compose.poc.yml --profile capacity up -d --build
+	$(DOCKER) compose -f deploy/docker-compose.poc.yml --profile capacity up -d --build --remove-orphans
 
 .PHONY: poc-logs
 poc-logs: ## Follow transmuxd logs in the PoC stack
 	$(DOCKER) compose -f deploy/docker-compose.poc.yml logs -f transmuxd
 
 .PHONY: poc-verify
-poc-verify: ## Assert the PoC produced a playable, self-consistent stream in MinIO
+poc-verify: ## Assert the PoC produced a playable, self-consistent stream in the local S3 store
 	$(DOCKER) compose -f deploy/docker-compose.poc.yml exec -T verifier /verify.sh
 
 .PHONY: measure-cpu
@@ -97,7 +97,7 @@ solution-env: ## Generate local solution credentials (existing values are preser
 	python3 scripts/solution-env.py
 
 solution-up: solution-env ## Run private storage, ingest, playback console and three simulated cameras
-	$(DOCKER) compose --env-file .env.solution -f deploy/docker-compose.solution.yml up -d --build
+	$(DOCKER) compose --env-file .env.solution -f deploy/docker-compose.solution.yml up -d --build --remove-orphans
 
 solution-down: ## Stop the solution stack, preserving recordings and configuration
 	$(DOCKER) compose --env-file .env.solution -f deploy/docker-compose.solution.yml down

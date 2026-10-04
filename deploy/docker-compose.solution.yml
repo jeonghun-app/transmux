@@ -11,7 +11,7 @@ x-runtime: &runtime
 
 x-store-env: &store-env
   AWS_ACCESS_KEY_ID: transmuxdemo
-  AWS_SECRET_ACCESS_KEY: ${TRANSMUX_MINIO_PASSWORD:?Run make solution-env}
+  AWS_SECRET_ACCESS_KEY: ${TRANSMUX_S3_SECRET_KEY:?Run make solution-env}
   AWS_REGION: us-east-1
 
 x-publisher: &publisher
@@ -25,35 +25,61 @@ x-publisher: &publisher
   pids_limit: 128
 
 services:
-  minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
-    command: server /data
+  # S3-compatible stand-in for the private bucket. RustFS (Apache-2.0) is
+  # used because it pulls anonymously and implements the conditional writes
+  # (If-None-Match: *, If-Match) that leases, manifest fencing and the
+  # roster depend on. The image is pinned by digest.
+  s3:
+    image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
     environment:
-      MINIO_ROOT_USER: transmuxdemo
-      MINIO_ROOT_PASSWORD: ${TRANSMUX_MINIO_PASSWORD:?Run make solution-env}
-      MINIO_BROWSER: "off"
+      RUSTFS_ACCESS_KEY: transmuxdemo
+      RUSTFS_SECRET_KEY: ${TRANSMUX_S3_SECRET_KEY:?Run make solution-env}
+      RUSTFS_CONSOLE_ENABLE: "false"
     volumes:
-      - objects:/data
+      - s3-data:/data
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9000/health/ready"]
       interval: 3s
       timeout: 2s
       retries: 30
 
-  minio-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+  # Creates the bucket and removes any bucket policy, so it stays private.
+  # Uses the server image's curl with SigV4 instead of a separate client.
+  s3-init:
+    image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
     environment:
-      MINIO_ROOT_USER: transmuxdemo
-      MINIO_ROOT_PASSWORD: ${TRANSMUX_MINIO_PASSWORD:?Run make solution-env}
+      S3_ACCESS_KEY: transmuxdemo
+      S3_SECRET_KEY: ${TRANSMUX_S3_SECRET_KEY:?Run make solution-env}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null &&
-        mc mb --ignore-existing local/transmux &&
-        mc anonymous set none local/transmux
+        set -eu
+        bucket=http://s3:9000/transmux
+        # Credentials go through stdin so they never appear in argv. The curl
+        # config syntax needs " and \ escaped inside a quoted value and has
+        # no way to carry a line break, so such credentials are refused.
+        nl='
+        '
+        cr=$$(printf '\r')
+        case "$$S3_ACCESS_KEY$$S3_SECRET_KEY" in
+          *"$$nl"*|*"$$cr"*) echo "S3 credentials must not contain line breaks"; exit 1 ;;
+        esac
+        esc() { printf '%s' "$$1" | sed 's/[\\"]/\\&/g'; }
+        s3() { printf 'user = "%s:%s"\n' "$$(esc "$$S3_ACCESS_KEY")" "$$(esc "$$S3_SECRET_KEY")" |
+               curl -sS -K - --aws-sigv4 "aws:amz:us-east-1:s3" -o /dev/null -w '%{http_code}' "$$@"; }
+        code=$$(s3 -I "$$bucket")
+        [ "$$code" = 200 ] || { code=$$(s3 -X PUT "$$bucket"); [ "$$code" = 200 ] || { echo "create bucket: HTTP $$code"; exit 1; }; }
+        code=$$(s3 -X DELETE "$$bucket?policy")
+        case "$$code" in 200|204|404) ;; *) echo "remove bucket policy: HTTP $$code"; exit 1 ;; esac
+        code=$$(curl -sS -o /dev/null -w '%{http_code}' "$$bucket?list-type=2")
+        [ "$$code" = 403 ] || { echo "anonymous list returned HTTP $$code, expected 403"; exit 1; }
+        echo "bucket transmux ready (private)"
 
   mediamtx:
     image: bluenviron/mediamtx:1.21.0
@@ -172,7 +198,7 @@ services:
     <<: *runtime
     stop_grace_period: 45s
     depends_on:
-      minio-init:
+      s3-init:
         condition: service_completed_successfully
       mediamtx:
         condition: service_started
@@ -201,7 +227,7 @@ services:
     command: ["-config", "/etc/transmux/playback.json"]
     stop_grace_period: 30s
     depends_on:
-      minio-init:
+      s3-init:
         condition: service_completed_successfully
     environment:
       <<: *store-env
@@ -228,6 +254,6 @@ services:
       retries: 20
 
 volumes:
-  objects:
+  s3-data:
   ingest-state:
   playback-state:
