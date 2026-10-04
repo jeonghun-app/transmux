@@ -324,8 +324,11 @@ func (s *Scanner) ScanDay(ctx context.Context, cam config.StaticCamera, day time
 	if page.More && len(listed) > 0 {
 		upto = listed[len(listed)-1]
 	}
-	removed, err := s.Index.Reconcile(cam.CenterID, cam.CameraID, day,
+	removed, err := s.Index.Reconcile(ctx, cam.CenterID, cam.CameraID, day,
 		strings.TrimPrefix(state.Cursor, base), upto, listed, listedAt)
+	if errors.Is(err, context.DeadlineExceeded) && parent.Err() == nil {
+		return nil // the page budget went to a saved backfill batch
+	}
 	if err != nil {
 		return err
 	}

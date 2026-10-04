@@ -77,7 +77,7 @@ func TestRecordingsDeletedFromStorageDisappearFromTheIndex(t *testing.T) {
 	if err != nil || len(page.Entries) != 1 {
 		t.Fatalf("listing: %+v %v", page, err)
 	}
-	if n, err := f.index.Reconcile("c1", "cam1", day, "", "", []string{kept.URI}, time.Now().Add(2*time.Minute)); err != nil || n != 1 {
+	if n, err := f.index.Reconcile(context.Background(), "c1", "cam1", day, "", "", []string{kept.URI}, time.Now().Add(2*time.Minute)); err != nil || n != 1 {
 		t.Fatalf("reconcile: %d %v", n, err)
 	}
 	token := f.token(t, allPermissions())

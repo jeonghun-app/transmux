@@ -366,8 +366,10 @@ var reconcileGrace = time.Minute
 // means the listing reached the end of the day. S3 listings are strongly
 // consistent, so an object indexed before the listing began and missing from
 // it has been deleted, typically by a Lifecycle rule. An entry indexed after
-// the listing began may name an object written later and is kept.
-func (i *Index) Reconcile(center, camera string, day time.Time, after, upto string,
+// the listing began may name an object written later and is kept. When ctx
+// ends before a pending backfill finishes, nothing is removed and ctx's error
+// is returned; the backfill resumes from its saved position.
+func (i *Index) Reconcile(ctx context.Context, center, camera string, day time.Time, after, upto string,
 	listed []string, listedAt time.Time) (int, error) {
 	present := make(map[string]bool, len(listed))
 	for _, name := range listed {
@@ -375,8 +377,13 @@ func (i *Index) Reconcile(center, camera string, day time.Time, after, upto stri
 	}
 	before := uint64(max(0, listedAt.Add(-reconcileGrace).UnixMilli()))
 	name := partition(center, camera, day)
-	// Finish any backfill first, one short transaction per batch.
+	// Finish any backfill first, one short transaction per batch. Each
+	// batch saves its position, so a cancelled call resumes next time and
+	// nothing is reconciled against a partial name set.
 	for done := false; !done; {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		var err error
 		if done, err = i.migrateNames(name); err != nil {
 			return 0, err

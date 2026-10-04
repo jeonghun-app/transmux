@@ -38,6 +38,20 @@ func (s *slowStore) Head(ctx context.Context, key string) (storage.ObjectInfo, e
 	return s.FilesystemStore.Head(ctx, key)
 }
 
+// cancelAfter reports cancellation once Err has been called allowed times.
+type cancelAfter struct {
+	context.Context
+	allowed int
+	calls   atomic.Int64
+}
+
+func (c *cancelAfter) Err() error {
+	if c.calls.Add(1) > int64(c.allowed) {
+		return context.Canceled
+	}
+	return nil
+}
+
 func scannerFixture(t *testing.T) (*Index, *storage.FilesystemStore) {
 	t.Helper()
 	index, err := Open(filepath.Join(t.TempDir(), "index.db"))
@@ -176,7 +190,7 @@ func TestReconcileKeepsEntriesIndexedAfterTheListingAndMigratesOldPartitions(t *
 	if err := index.Put([]Segment{live}); err != nil {
 		t.Fatal(err)
 	}
-	if n, err := index.Reconcile("c1", "cam1", day, "", "", nil, listedAt); err != nil || n != 0 {
+	if n, err := index.Reconcile(context.Background(), "c1", "cam1", day, "", "", nil, listedAt); err != nil || n != 0 {
 		t.Fatalf("an object written after the listing was removed: %d %v", n, err)
 	}
 	// An index written before object names were tracked has no name bucket.
@@ -190,7 +204,7 @@ func TestReconcileKeepsEntriesIndexedAfterTheListingAndMigratesOldPartitions(t *
 		t.Fatal(err)
 	}
 	time.Sleep(5 * time.Millisecond)
-	n, err := index.Reconcile("c1", "cam1", day, "", "", []string{kept.URI}, time.Now())
+	n, err := index.Reconcile(context.Background(), "c1", "cam1", day, "", "", []string{kept.URI}, time.Now())
 	if err != nil || n != 1 {
 		t.Fatalf("migrated partition not reconciled: %d %v", n, err)
 	}
@@ -364,16 +378,37 @@ func TestObjectNameMigrationRunsInBoundedResumableBatches(t *testing.T) {
 	if got := names(); got != 1 {
 		t.Fatalf("backfill ran inside a live write: %d names", got)
 	}
-	if done, err := index.migrateNames(name); err != nil || done || names() != 1+migrationBatch {
-		t.Fatalf("first batch: done=%v err=%v names=%d", done, err, names())
-	}
 	time.Sleep(5 * time.Millisecond)
 	listed := []string{late.URI}
 	for _, r := range records[1:] {
 		listed = append(listed, r.URI)
 	}
-	// Reconcile resumes the backfill, then finds the one missing object.
-	if n, err := index.Reconcile("c1", "cam1", day, "", "", listed, time.Now()); err != nil || n != 1 {
+	// Cancellation after the first batch removes nothing and keeps the
+	// saved position across a restart.
+	ctx := &cancelAfter{Context: context.Background(), allowed: 1}
+	if n, err := index.Reconcile(ctx, "c1", "cam1", day, "", "", listed, time.Now()); !errors.Is(err, context.Canceled) || n != 0 {
+		t.Fatalf("cancelled reconcile: %d %v", n, err)
+	}
+	if got := names(); got != 1+migrationBatch {
+		t.Fatalf("first batch not saved: %d names", got)
+	}
+	if _, err := index.Get("c1", "cam1", records[0].URI); err != nil {
+		t.Fatalf("reconciled against a partial name set: %v", err)
+	}
+	filename := index.db.Path()
+	if err := index.Close(); err != nil {
+		t.Fatal(err)
+	}
+	index, err := Open(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	if done, err := index.migrateNames(name); err != nil || done || names() != 1+2*migrationBatch {
+		t.Fatalf("migration did not resume after reopening: done=%v err=%v names=%d", done, err, names())
+	}
+	// Reconcile finishes the backfill, then finds the one missing object.
+	if n, err := index.Reconcile(context.Background(), "c1", "cam1", day, "", "", listed, time.Now()); err != nil || n != 1 {
 		t.Fatalf("reconcile after migration: %d %v", n, err)
 	}
 	if got := names(); got != len(listed) {
