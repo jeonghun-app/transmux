@@ -1,12 +1,19 @@
 # Build output. The Makefile builds inside a container and writes to /tmp,
 # so nothing should land here, but keep the guard.
 /transmuxd
+/playbackd
 *.test
 *.out
 
 # Local configuration and scratch files produced by the measurement scripts.
 /configs/local*.json
 /tmp/
+/.env.solution
+/tests/browser/node_modules/
+/tests/browser/test-results/
+/tests/browser/playwright-report/
+/tests/browser/artifacts/
+__pycache__/
 
 # Editor and OS noise.
 .DS_Store

@@ -1,6 +1,5 @@
-# CI runs the same make targets a developer runs. Every one of them executes
-# inside a container (see the Makefile header), so there is no toolchain setup
-# here and no way for CI and local runs to drift apart.
+# Go and ffmpeg checks use the same container targets as local development.
+# The solution job additionally tests the real operator UI in Chromium.
 name: ci
 
 on:
@@ -23,6 +22,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - run: make fmt-check
       - run: make vet
       - run: make test
       # The race detector needs cgo, which the target arranges itself.
@@ -44,6 +44,15 @@ jobs:
         run: |
           docker run --rm -v "$PWD/configs:/c:ro" transmux:latest \
             -config /c/poc.json -validate
+      - name: validate solution configurations
+        run: |
+          docker run --rm \
+            -v "$PWD/configs/solution-ingest.json:/etc/transmux/config.json:ro" \
+            transmux:latest -validate
+          docker run --rm --entrypoint /usr/local/bin/playbackd \
+            -v "$PWD/configs/solution-ingest.json:/etc/transmux/config.json:ro" \
+            -v "$PWD/configs/solution-playback.json:/etc/transmux/playback.json:ro" \
+            transmux:latest -validate
 
   ffmpeg:
     name: tests that need a real ffmpeg
@@ -51,6 +60,46 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
-      # Self-contained: the tagged tests synthesise their own H.264 with
-      # lavfi and probe the resulting segments. No camera, no network.
+      # Tagged tests synthesise H.264/H.265 and AAC/G.711 inputs, then
+      # decode the resulting HLS and MP4. No external camera is needed.
       - run: make test-ffmpeg
+
+  solution:
+    name: private storage, playback and operator UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: tests/browser/package-lock.json
+      - run: make solution-up
+      - run: python3 scripts/verify-solution.py --restart
+      - run: npm ci
+        working-directory: tests/browser
+      - run: npx playwright install --with-deps chromium
+        working-directory: tests/browser
+      - run: npm test
+        working-directory: tests/browser
+      - name: service logs
+        if: always()
+        run: |
+          docker compose --env-file .env.solution \
+            -f deploy/docker-compose.solution.yml logs --no-color transmuxd playbackd
+      - name: UI screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solution-screenshots
+          path: |
+            tests/browser/artifacts/*.png
+            tests/browser/test-results/**/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: tear down isolated test data
+        if: always()
+        run: |
+          docker compose --env-file .env.solution \
+            -f deploy/docker-compose.solution.yml down -v

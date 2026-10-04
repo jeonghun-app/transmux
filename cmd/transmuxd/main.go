@@ -101,7 +101,7 @@ func run() error {
 
 	coordinator := upload.NewCoordinator(store, cfg.Upload, reg)
 
-	provider, err := camera.NewProvider(cfg.Cameras)
+	provider, err := camera.NewProvider(cfg.Cameras, store)
 	if err != nil {
 		return err
 	}
@@ -128,6 +128,7 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
+	serveErr := make(chan error, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -135,6 +136,8 @@ func run() error {
 			"note", "endpoints are unauthenticated; keep this listener internal")
 		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("monitoring API failed", "error", err)
+			serveErr <- fmt.Errorf("monitoring API failed: %w", err)
+			stop()
 		}
 	}()
 
@@ -145,7 +148,7 @@ func run() error {
 	}()
 
 	<-ctx.Done()
-	log.Info("shutdown signal received, draining channels")
+	log.Info("shutdown requested, draining channels")
 
 	// Stop serving before the channels go away so a probe does not observe a
 	// half-torn-down shard and trigger a restart loop.
@@ -156,6 +159,11 @@ func run() error {
 	}
 
 	wg.Wait()
+	select {
+	case err := <-serveErr:
+		return err
+	default:
+	}
 	log.Info("transmuxd stopped cleanly")
 	return nil
 }

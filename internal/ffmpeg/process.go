@@ -163,6 +163,7 @@ func isBenign(line string) bool {
 
 func (p *Process) drainStderr(r io.ReadCloser) {
 	defer close(p.stderrDrained)
+	defer r.Close()
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 8*1024), 256*1024)
 	logged := 0
@@ -188,11 +189,12 @@ func (p *Process) drainStderr(r io.ReadCloser) {
 		}
 		// Keep reading even when suppressed: the pipe must stay drained.
 	}
-	// An over-long line ends the scan early. Say so, because from here on
-	// ffmpeg can block writing to a pipe nobody is reading and the stall
-	// watchdog, not this goroutine, is what will notice.
+	// An over-long line ends Scanner early. Continue draining raw bytes:
+	// abandoning the pipe would block ffmpeg and make Wait hang until the
+	// watchdog killed an otherwise healthy stream.
 	if err := sc.Err(); err != nil {
-		p.log.Error("ffmpeg stderr reader stopped early", "error", err)
+		p.log.Warn("ffmpeg stderr logging stopped; continuing to drain output", "error", err)
+		_, _ = io.Copy(io.Discard, r)
 	}
 }
 

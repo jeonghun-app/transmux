@@ -1,14 +1,13 @@
 // Package config loads and validates transmuxd configuration.
 //
-// Configuration is JSON on purpose: the daemon deliberately keeps its
-// third-party dependency surface to the AWS SDK only, so the standard
-// library encoding/json is used instead of pulling in a YAML parser.
+// Configuration uses the standard library JSON decoder with strict fields.
 package config
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"os"
 	"strings"
@@ -53,12 +52,13 @@ type Config struct {
 
 	HTTPListen string `json:"http_listen"`
 
-	Segment  SegmentConfig  `json:"segment"`
-	FFmpeg   FFmpegConfig   `json:"ffmpeg"`
-	Storage  StorageConfig  `json:"storage"`
-	Upload   UploadConfig   `json:"upload"`
+	Segment   SegmentConfig   `json:"segment"`
+	FFmpeg    FFmpegConfig    `json:"ffmpeg"`
+	Storage   StorageConfig   `json:"storage"`
+	Upload    UploadConfig    `json:"upload"`
 	Reconnect ReconnectConfig `json:"reconnect"`
-	Cameras  CameraConfig   `json:"cameras"`
+	Lease     LeaseConfig     `json:"lease"`
+	Cameras   CameraConfig    `json:"cameras"`
 }
 
 type SegmentConfig struct {
@@ -71,7 +71,8 @@ type SegmentConfig struct {
 
 	// LocalListSize is ffmpeg's -hls_list_size. It defines how long a
 	// finished segment survives on the local spool before ffmpeg deletes
-	// it, i.e. the upload grace period (LocalListSize * TargetDuration).
+	// it. The grace period depends on the actual segment length, which is
+	// governed by the camera GOP rather than just TargetDuration.
 	LocalListSize int `json:"local_list_size"`
 
 	// MaxGOPSlack is added to TargetDuration when deciding that a channel
@@ -117,8 +118,11 @@ type StorageConfig struct {
 	Endpoint string `json:"endpoint"`
 	// ForcePathStyle is required for MinIO.
 	ForcePathStyle bool `json:"force_path_style"`
+	// TagMedia attaches lifecycle tags to immutable media only. Enabling it
+	// requires s3:PutObjectTagging in addition to the existing write role.
+	TagMedia bool `json:"tag_media"`
 
-	// KeyPrefix is prepended to every object key.
+	// KeyPrefix scopes channel media and leases; the shared roster has its own full key.
 	KeyPrefix string `json:"key_prefix"`
 
 	// ManifestName is the object name of the live playlist, stored at
@@ -138,7 +142,8 @@ type UploadConfig struct {
 	RetryMax    Duration `json:"retry_max"`
 
 	// MaxConcurrent bounds simultaneous PutObject calls across all
-	// channels so a shard cannot exhaust sockets or file descriptors.
+	// channels. Lease traffic has a separate bound of min(16, MaxConcurrent)
+	// so media uploads cannot starve ownership renewals.
 	MaxConcurrent int `json:"max_concurrent"`
 
 	// PutTimeout is the per-attempt request timeout.
@@ -156,8 +161,40 @@ type ReconnectConfig struct {
 	ResetAfter Duration `json:"reset_after"`
 }
 
+// LeaseConfig tunes the camera ownership lease.
+//
+// The lease stops two shards from ingesting the same camera, which would make
+// the published playlist flip between two sequence timelines. Because
+// segments are immutable and cached for a year, a reused key is a CDN cache
+// poisoning event rather than a harmless overwrite.
+//
+// There is deliberately no switch to turn it off and no way to change the
+// object name: either would let two shards use different lock namespaces and
+// reintroduce the bug.
+type LeaseConfig struct {
+	// TTL is how long a lease stays valid without renewal. It is also the
+	// worst-case gap before another shard may take over a dead one.
+	TTL Duration `json:"ttl"`
+
+	// RenewInterval is how often the owner extends the lease.
+	RenewInterval Duration `json:"renew_interval"`
+
+	// MaxClockSkew is the assumed bound on wall-clock disagreement between
+	// shards. A contender waits this long past expiry on top of the TTL, and
+	// the owner stops this long before it. No TTL lease can be safe without
+	// such a bound; hosts must run NTP.
+	MaxClockSkew Duration `json:"max_clock_skew"`
+
+	// OperationTimeout bounds one lease request. It is separate from
+	// upload.put_timeout because a lease record is a few hundred bytes while a
+	// segment is megabytes: sizing the two together would either make renewal
+	// hang far longer than its own interval or make segment uploads give up
+	// too early.
+	OperationTimeout Duration `json:"operation_timeout"`
+}
+
 type CameraConfig struct {
-	// Provider is "static" or "http".
+	// Provider is "static", "http", or "object".
 	Provider string `json:"provider"`
 
 	// Static is the inline camera list when Provider is "static".
@@ -168,6 +205,12 @@ type CameraConfig struct {
 	URL string `json:"url"`
 	// AuthHeader is sent verbatim as the Authorization header.
 	AuthHeader string `json:"auth_header"`
+	// ObjectKey is the shared, CAS-protected roster used by the management
+	// API. Static is the initial seed only; an existing roster always wins.
+	ObjectKey string `json:"object_key"`
+	// ShardFilter selects assigned entries from a shared roster. An empty
+	// filter preserves the original unfiltered-provider behavior.
+	ShardFilter string `json:"shard_filter"`
 	// PollInterval is how often the camera list is refreshed.
 	PollInterval Duration `json:"poll_interval"`
 	// RequestTimeout bounds a single provider request.
@@ -177,8 +220,17 @@ type CameraConfig struct {
 type StaticCamera struct {
 	CenterID string `json:"center_id"`
 	CameraID string `json:"camera_id"`
+	ShardID  string `json:"shard_id,omitempty"`
+	Name     string `json:"name,omitempty"`
 	RTSPURL  string `json:"rtsp_url"`
 	Enabled  *bool  `json:"enabled"`
+	// Audio: none (default), copy (AAC sources), or aac (e.g. G.711).
+	Audio string `json:"audio,omitempty"`
+	// Format: mpegts (default, H.264) or fmp4 (H.264/HEVC).
+	Format string `json:"format,omitempty"`
+	// VideoCodec declares the source codec for a compatible MP4 sample entry.
+	// Empty/auto preserves ffmpeg defaults; hevc requires fmp4 and selects hvc1.
+	VideoCodec string `json:"video_codec,omitempty"`
 }
 
 // Default returns a configuration with production-leaning defaults.
@@ -219,6 +271,12 @@ func Default() Config {
 			Max:        Duration{30 * time.Second},
 			Factor:     2.0,
 			ResetAfter: Duration{60 * time.Second},
+		},
+		Lease: LeaseConfig{
+			TTL:              Duration{45 * time.Second},
+			RenewInterval:    Duration{10 * time.Second},
+			MaxClockSkew:     Duration{2 * time.Second},
+			OperationTimeout: Duration{5 * time.Second},
 		},
 		Cameras: CameraConfig{
 			Provider:       "static",
@@ -293,6 +351,9 @@ func (c *Config) Validate() error {
 	// The watchdog threshold has to clear the same allowance the health check
 	// uses, or a camera whose long GOP is explicitly tolerated by
 	// max_gop_slack would still be killed and relaunched forever.
+	if c.Segment.TargetDuration.Duration > time.Duration(math.MaxInt64)-c.Segment.MaxGOPSlack.Duration {
+		return fmt.Errorf("segment.target_duration + segment.max_gop_slack overflows a duration")
+	}
 	gopAllowance := c.Segment.TargetDuration.Duration + c.Segment.MaxGOPSlack.Duration
 	if c.FFmpeg.StallTimeout.Duration <= gopAllowance {
 		return fmt.Errorf("ffmpeg.stall_timeout (%s) must exceed segment.target_duration + "+
@@ -322,6 +383,11 @@ func (c *Config) Validate() error {
 		if c.Storage.Bucket == "" {
 			return fmt.Errorf("storage.bucket is required for backend s3")
 		}
+		if c.Storage.Endpoint != "" {
+			if err := ValidateHTTPURL(c.Storage.Endpoint, "storage.endpoint"); err != nil {
+				return err
+			}
+		}
 	case "filesystem":
 		if c.Storage.Root == "" {
 			return fmt.Errorf("storage.root is required for backend filesystem")
@@ -336,9 +402,12 @@ func (c *Config) Validate() error {
 	// be a single path element: a separator or ".." would move the playlist
 	// out of the channel's own namespace.
 	if strings.ContainsAny(c.Storage.ManifestName, `/\`) || c.Storage.ManifestName == ".." ||
-		c.Storage.ManifestName == "." {
+		c.Storage.ManifestName == "." || c.Storage.ManifestName == "_transmux" || hasControl(c.Storage.ManifestName) {
 		return fmt.Errorf("storage.manifest_name %q must be a single path element",
 			c.Storage.ManifestName)
+	}
+	if err := validateKeyPrefix(c.Storage.KeyPrefix); err != nil {
+		return err
 	}
 	if c.Upload.MaxAttempts < 1 {
 		return fmt.Errorf("upload.max_attempts must be >= 1")
@@ -349,6 +418,9 @@ func (c *Config) Validate() error {
 	if c.Upload.PutTimeout.Duration <= 0 {
 		return fmt.Errorf("upload.put_timeout must be > 0, otherwise every request is " +
 			"cancelled before it is sent")
+	}
+	if c.Upload.PutTimeout.Duration > time.Duration(math.MaxInt64)-gopAllowance {
+		return fmt.Errorf("upload.put_timeout + segment gap allowance overflows a duration")
 	}
 	if c.Upload.RetryBase.Duration < 0 {
 		return fmt.Errorf("upload.retry_base must not be negative")
@@ -363,7 +435,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("reconnect.base must be > 0, otherwise a failing camera is " +
 			"retried in a tight loop")
 	}
-	if c.Reconnect.Factor < 1 {
+	if c.Reconnect.Factor < 1 || math.IsNaN(c.Reconnect.Factor) || math.IsInf(c.Reconnect.Factor, 0) {
 		return fmt.Errorf("reconnect.factor must be >= 1")
 	}
 	if c.Reconnect.Max.Duration < c.Reconnect.Base.Duration {
@@ -373,8 +445,48 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("reconnect.reset_after must be > 0, otherwise the backoff resets " +
 			"on a camera that connects and immediately stalls")
 	}
+	if c.Lease.TTL.Duration <= 0 {
+		return fmt.Errorf("lease.ttl must be > 0")
+	}
+	if c.Lease.RenewInterval.Duration <= 0 {
+		return fmt.Errorf("lease.renew_interval must be > 0")
+	}
+	if c.Lease.MaxClockSkew.Duration < 0 {
+		return fmt.Errorf("lease.max_clock_skew must not be negative")
+	}
+	if c.Lease.OperationTimeout.Duration <= 0 {
+		return fmt.Errorf("lease.operation_timeout must be > 0")
+	}
+	// A missed renewal must still leave room for the next one to complete
+	// before the owner's own deadline at ttl - skew. The second attempt starts
+	// at 2 x renew_interval and can take a full operation_timeout plus another
+	// operation_timeout to confirm a lost response, so the whole budget fits:
+	//
+	//	2*renew_interval + 2*operation_timeout + max_clock_skew < ttl
+	//
+	// Checking only 2*renew + 2*skew is not enough: ttl 25s, renew 10s, skew
+	// 1s, operation_timeout 9s passes that but cannot recover before its own
+	// deadline at 24s, because the second attempt may not finish until 29s.
+	// Subtract from the TTL so individually valid durations cannot wrap the
+	// combined budget and accidentally pass validation.
+	remaining := c.Lease.TTL.Duration - c.Lease.MaxClockSkew.Duration
+	if remaining <= 0 || c.Lease.OperationTimeout.Duration >= remaining/2 ||
+		c.Lease.RenewInterval.Duration > (remaining-2*c.Lease.OperationTimeout.Duration-1)/2 {
+		return fmt.Errorf("lease.ttl (%s) must exceed 2 x lease.renew_interval + "+
+			"2 x lease.operation_timeout + lease.max_clock_skew, otherwise one missed "+
+			"renewal cannot be recovered before the owner's own deadline",
+			c.Lease.TTL.Duration)
+	}
+	if c.Lease.OperationTimeout.Duration >= c.Lease.RenewInterval.Duration {
+		return fmt.Errorf("lease.operation_timeout (%s) must be shorter than "+
+			"lease.renew_interval (%s), or a renewal cannot finish before the next is due",
+			c.Lease.OperationTimeout.Duration, c.Lease.RenewInterval.Duration)
+	}
 	if c.Cameras.PollInterval.Duration <= 0 {
 		return fmt.Errorf("cameras.poll_interval must be > 0")
+	}
+	if c.Cameras.ShardFilter != "" && !ValidID(c.Cameras.ShardFilter) {
+		return fmt.Errorf("cameras.shard_filter must be a valid identifier")
 	}
 	if c.Cameras.RequestTimeout.Duration <= 0 {
 		return fmt.Errorf("cameras.request_timeout must be > 0, otherwise every roster " +
@@ -384,16 +496,38 @@ func (c *Config) Validate() error {
 		return err
 	}
 	switch c.Cameras.Provider {
-	case "static":
-		if len(c.Cameras.Static) == 0 {
+	case "static", "object":
+		if c.Cameras.Provider == "static" && len(c.Cameras.Static) == 0 {
 			return fmt.Errorf("cameras.static must list at least one camera")
+		}
+		if c.Cameras.Provider == "object" {
+			if err := ValidateRosterKey(c.Cameras.ObjectKey); err != nil {
+				return err
+			}
+		}
+		seen := make(map[string]bool)
+		for i, cam := range c.Cameras.Static {
+			if cam.Enabled != nil && !*cam.Enabled {
+				continue
+			}
+			if err := cam.Validate(); err != nil {
+				return fmt.Errorf("camera entry %d: %w", i, err)
+			}
+			key := cam.CenterID + "/" + cam.CameraID
+			if seen[key] {
+				return fmt.Errorf("duplicate camera %s in roster", key)
+			}
+			seen[key] = true
 		}
 	case "http":
 		if c.Cameras.URL == "" {
 			return fmt.Errorf("cameras.url is required for provider http")
 		}
+		if err := ValidateHTTPURL(c.Cameras.URL, "cameras.url"); err != nil {
+			return err
+		}
 	default:
-		return fmt.Errorf("cameras.provider must be static or http, got %q", c.Cameras.Provider)
+		return fmt.Errorf("cameras.provider must be static, http or object, got %q", c.Cameras.Provider)
 	}
 	return nil
 }

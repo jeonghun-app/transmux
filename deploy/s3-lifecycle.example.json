@@ -1,0 +1,28 @@
+{
+  "Rules": [
+    {
+      "ID": "transmux-media-30-days",
+      "Status": "Enabled",
+      "Filter": {
+        "And": {
+          "Prefix": "recordings/",
+          "Tags": [{"Key": "transmux-kind", "Value": "segment"}]
+        }
+      },
+      "Expiration": {"Days": 30},
+      "NoncurrentVersionExpiration": {"NoncurrentDays": 7}
+    },
+    {
+      "ID": "transmux-init-32-days",
+      "Status": "Enabled",
+      "Filter": {
+        "And": {
+          "Prefix": "recordings/",
+          "Tags": [{"Key": "transmux-kind", "Value": "init"}]
+        }
+      },
+      "Expiration": {"Days": 32},
+      "NoncurrentVersionExpiration": {"NoncurrentDays": 7}
+    }
+  ]
+}

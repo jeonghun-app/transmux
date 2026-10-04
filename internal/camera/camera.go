@@ -3,6 +3,7 @@
 package camera
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,22 +11,22 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 
 	"github.com/jeonghun-app/transmux/internal/config"
+	"github.com/jeonghun-app/transmux/internal/storage"
 )
-
-// idPattern restricts identifiers to characters that are safe in both an
-// S3 key and a filesystem path. This is the primary defence against a
-// provider injecting "../" or a shell metacharacter into a path.
-var idPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
 
 // Camera is one RTSP source assigned to this shard.
 type Camera struct {
-	CenterID string
-	CameraID string
-	RTSPURL  string
+	CenterID   string
+	CameraID   string
+	ShardID    string
+	RTSPURL    string
+	Name       string
+	Audio      string
+	Format     string
+	VideoCodec string
 }
 
 // Key uniquely identifies a camera within a center.
@@ -119,25 +120,11 @@ const minRedactablePassword = 4
 // Validate checks the fields that are interpolated into paths and command
 // arguments.
 func (c Camera) Validate() error {
-	if !idPattern.MatchString(c.CenterID) {
-		return fmt.Errorf("invalid center_id %q: must match %s", c.CenterID, idPattern)
-	}
-	if !idPattern.MatchString(c.CameraID) {
-		return fmt.Errorf("invalid camera_id %q: must match %s", c.CameraID, idPattern)
-	}
-	u, err := url.Parse(c.RTSPURL)
-	if err != nil {
-		return fmt.Errorf("camera %s: invalid rtsp_url: %w", c.Key(), err)
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "rtsp", "rtsps":
-	default:
-		return fmt.Errorf("camera %s: rtsp_url scheme must be rtsp or rtsps, got %q", c.Key(), u.Scheme)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("camera %s: rtsp_url has no host", c.Key())
-	}
-	return nil
+	return (config.StaticCamera{
+		CenterID: c.CenterID, CameraID: c.CameraID, RTSPURL: c.RTSPURL,
+		Name: c.Name, Audio: c.Audio, Format: c.Format, VideoCodec: c.VideoCodec,
+		ShardID: c.ShardID,
+	}).Validate()
 }
 
 // Provider returns the desired camera roster. Implementations must be safe
@@ -163,6 +150,7 @@ type HTTPProvider struct {
 	url        string
 	authHeader string
 	client     *http.Client
+	shard      string
 }
 
 func (p *HTTPProvider) Name() string { return "http" }
@@ -170,7 +158,7 @@ func (p *HTTPProvider) Name() string { return "http" }
 func (p *HTTPProvider) Cameras(ctx context.Context) ([]Camera, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create camera provider request: invalid URL or context")
 	}
 	req.Header.Set("Accept", "application/json")
 	if p.authHeader != "" {
@@ -193,32 +181,54 @@ func (p *HTTPProvider) Cameras(ctx context.Context) ([]Camera, error) {
 		return nil, fmt.Errorf("camera provider returned HTTP %d", resp.StatusCode)
 	}
 	// Bound the response so a misbehaving provider cannot exhaust memory.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	const maxRosterBytes = 8 << 20
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRosterBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("camera provider body: %w", err)
 	}
+	if len(body) > maxRosterBytes {
+		return nil, fmt.Errorf("camera provider payload exceeds %d bytes", maxRosterBytes)
+	}
 	var raw []config.StaticCamera
-	if err := json.Unmarshal(body, &raw); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("camera provider payload: %w", err)
 	}
-	return convert(raw)
+	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+		return nil, fmt.Errorf("camera provider payload has trailing content")
+	}
+	if raw == nil {
+		return nil, fmt.Errorf("camera provider payload must be an array; use [] for an empty roster")
+	}
+	cameras, err := convert(raw)
+	return assigned(cameras, p.shard), err
 }
 
 // NewProvider builds the provider selected by configuration.
-func NewProvider(cfg config.CameraConfig) (Provider, error) {
+func NewProvider(cfg config.CameraConfig, stores ...storage.ControlClient) (Provider, error) {
 	switch cfg.Provider {
 	case "static":
 		cams, err := convert(cfg.Static)
 		if err != nil {
 			return nil, err
 		}
-		return &StaticProvider{cameras: cams}, nil
+		return &StaticProvider{cameras: assigned(cams, cfg.ShardFilter)}, nil
 	case "http":
+		if err := config.ValidateHTTPURL(cfg.URL, "cameras.url"); err != nil {
+			return nil, err
+		}
 		return &HTTPProvider{
 			url:        cfg.URL,
 			authHeader: cfg.AuthHeader,
 			client:     &http.Client{Timeout: cfg.RequestTimeout.Duration},
+			shard:      cfg.ShardFilter,
 		}, nil
+	case "object":
+		if len(stores) != 1 {
+			return nil, fmt.Errorf("object camera provider requires a store")
+		}
+		return NewObjectProvider(cfg, stores[0])
 	default:
 		return nil, fmt.Errorf("unknown camera provider %q", cfg.Provider)
 	}
@@ -234,7 +244,8 @@ func convert(raw []config.StaticCamera) ([]Camera, error) {
 		if r.Enabled != nil && !*r.Enabled {
 			continue
 		}
-		c := Camera{CenterID: r.CenterID, CameraID: r.CameraID, RTSPURL: r.RTSPURL}
+		c := Camera{CenterID: r.CenterID, CameraID: r.CameraID, RTSPURL: r.RTSPURL,
+			Name: r.Name, Audio: r.Audio, Format: r.Format, VideoCodec: r.VideoCodec, ShardID: r.ShardID}
 		if err := c.Validate(); err != nil {
 			return nil, fmt.Errorf("camera entry %d: %w", i, err)
 		}
@@ -245,4 +256,17 @@ func convert(raw []config.StaticCamera) ([]Camera, error) {
 		out = append(out, c)
 	}
 	return out, nil
+}
+
+func assigned(cameras []Camera, shard string) []Camera {
+	if shard == "" {
+		return cameras
+	}
+	out := make([]Camera, 0, len(cameras))
+	for _, cam := range cameras {
+		if cam.ShardID == shard {
+			out = append(out, cam)
+		}
+	}
+	return out
 }

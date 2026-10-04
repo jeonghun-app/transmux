@@ -1,6 +1,5 @@
-# The end-to-end stack is too slow and too timing-sensitive to gate every
-# push, but it is the only check that proves the whole pipeline works, so it
-# runs on a schedule and on demand.
+# Keep the original ingest-only PoC and dependency scan on a schedule.
+# CI also runs the authenticated solution stack and browser checks.
 name: nightly
 
 on:
@@ -20,10 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: make poc-up
-      # The verifier waits for transmuxd's healthcheck, but segments only
-      # exist after a couple of GOPs have elapsed.
-      - name: let both channels reach steady state
-        run: sleep 60
+      # The verifier waits for both media publication and channel health.
       - run: make poc-verify
       - name: transmuxd logs
         if: always()
@@ -38,11 +34,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - run: go mod verify
-      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      - run: make vuln
 
 # Not here, deliberately: scripts/measure-capacity.sh and
 # scripts/measure-cpu.sh. They report absolute memory and CPU per channel and

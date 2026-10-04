@@ -102,3 +102,18 @@ func TestRenderSkipsEmptyFamilies(t *testing.T) {
 		t.Errorf("empty family should not be rendered\n%s", out)
 	}
 }
+
+func TestRenderUsesPrometheusEscapes(t *testing.T) {
+	r := NewRegistry()
+	r.Gauge("test", "help\nwith\\slash", Label{Name: "id", Value: "a\tb\n\"c\\"}).Set(1)
+	out := string(r.Render())
+	if !strings.Contains(out, "# HELP test help\\nwith\\\\slash\n") {
+		t.Errorf("invalid HELP escaping: %q", out)
+	}
+	if !strings.Contains(out, "id=\"a\tb\\n\\\"c\\\\\"") {
+		t.Errorf("invalid label escaping: %q", out)
+	}
+	if strings.Contains(out, `\t`) {
+		t.Error("Go-only escape would reject the entire Prometheus scrape")
+	}
+}

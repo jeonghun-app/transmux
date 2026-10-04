@@ -18,20 +18,28 @@ BUCKET="${BUCKET:-transmux-poc}"
 API="${API:-http://transmuxd:8080}"
 CENTER="${CENTER:-center-01}"
 CAMERAS="${CAMERAS:-cam-shortgop cam-longgop}"
+VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-90}"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "  ok: $*"; }
 
 echo "== 1. shard health =="
-health=$(wget -q -O- "$API/healthz") || fail "cannot reach $API/healthz"
+case "$VERIFY_TIMEOUT" in
+  ''|*[!0-9]*) fail "VERIFY_TIMEOUT must be a number of seconds" ;;
+esac
+deadline=$(($(date +%s) + VERIFY_TIMEOUT))
+while :; do
+  health=$(wget -q -T 5 -O- "$API/healthz" 2>/dev/null || true)
+  # The counts appear both at the top level and under "shard"; take the first.
+  total=$(echo "$health"   | tr -d ' ",' | awk -F: '/^channels_total:/{print $2; exit}')
+  healthy=$(echo "$health" | tr -d ' ",' | awk -F: '/^channels_healthy:/{print $2; exit}')
+  if [ "${total:-0}" -gt 0 ] && [ "$healthy" = "$total" ]; then
+    break
+  fi
+  [ "$(date +%s)" -lt "$deadline" ] || fail "channels did not become healthy within ${VERIFY_TIMEOUT}s: $health"
+  sleep 2
+done
 echo "$health"
-# The counts appear both at the top level and nested under "shard", so take
-# the first occurrence of each.
-total=$(echo "$health"   | tr -d ' ",' | awk -F: '/^channels_total:/{print $2; exit}')
-healthy=$(echo "$health" | tr -d ' ",' | awk -F: '/^channels_healthy:/{print $2; exit}')
-[ -n "$total" ] || fail "could not parse channels_total"
-[ "$total" -gt 0 ] || fail "no channels assigned"
-[ "$healthy" = "$total" ] || fail "$healthy of $total channels healthy"
 ok "$healthy/$total channels healthy"
 
 echo "== 2. credentials must not leak through the API =="
@@ -72,10 +80,12 @@ for cam in $CAMERAS; do
   ok "target duration $target covers the longest segment"
 
   # 4. decodable, and still the original codec
-  codec=$(ffprobe -v error -select_streams v:0 \
+  codec=$(timeout 30 ffprobe -v error -select_streams v:0 \
             -show_entries stream=codec_name -of csv=p=0 \
             "$manifest_url" 2>/dev/null | head -1 | tr -d '\r\n ')
   [ "$codec" = "h264" ] || fail "$cam: published codec is '$codec', expected an untouched h264"
+  timeout 30 ffmpeg -hide_banner -loglevel error -i "$manifest_url" -frames:v 1 -f null - \
+    >/dev/null 2>&1 || fail "$cam: the published stream could not decode a video frame"
   ok "playback via HLS works and the codec is still h264"
 done
 

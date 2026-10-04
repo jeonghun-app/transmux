@@ -26,18 +26,22 @@ type Manager struct {
 	reg      *metrics.Registry
 	log      *slog.Logger
 
+	// session identifies this process incarnation to the ownership lease. It
+	// must not survive a restart: a restarted task is a new owner.
+	session string
+
 	mu      sync.RWMutex
 	workers map[string]*entry
 	// ready flips true after the first successful roster load, which is what
 	// the readiness probe reports.
-	ready bool
-	lastReconcile time.Time
+	ready            bool
+	lastReconcile    time.Time
 	lastReconcileErr string
 
-	mChannels   *metrics.Metric
-	mReconcile  *metrics.Metric
+	mChannels     *metrics.Metric
+	mReconcile    *metrics.Metric
 	mReconcileErr *metrics.Metric
-	mRejected   *metrics.Metric
+	mRejected     *metrics.Metric
 }
 
 type entry struct {
@@ -55,6 +59,7 @@ func NewManager(cfg config.Config, provider camera.Provider, up ObjectClient, re
 		reg:      reg,
 		log:      log,
 		workers:  make(map[string]*entry),
+		session:  NewSessionID(),
 		mChannels: reg.Gauge("transmux_channels_running",
 			"Channels currently supervised by this shard.", shard),
 		mReconcile: reg.Counter("transmux_roster_reconcile_total",
@@ -128,7 +133,8 @@ func (m *Manager) reconcile(ctx context.Context) {
 			continue
 		}
 		// A changed RTSP URL means the source moved; restart the pipeline.
-		if newCam.RTSPURL != e.worker.Camera().RTSPURL {
+		oldCam := e.worker.Camera()
+		if newCam.RTSPURL != oldCam.RTSPURL || newCam.Audio != oldCam.Audio || newCam.Format != oldCam.Format || newCam.VideoCodec != oldCam.VideoCodec {
 			m.log.Info("camera source changed, restarting channel", "camera", key)
 			toStop = append(toStop, e)
 			delete(m.workers, key)
@@ -146,6 +152,10 @@ func (m *Manager) reconcile(ctx context.Context) {
 	for _, e := range toStop {
 		m.log.Info("stopping channel", "camera", e.worker.Camera().Key())
 		e.cancel()
+	}
+	// Start every drain before waiting. Serial cancellation would multiply
+	// the shutdown budget by the number of removed or changed cameras.
+	for _, e := range toStop {
 		<-e.done
 		e.worker.Cleanup()
 	}
@@ -168,7 +178,7 @@ func (m *Manager) reconcile(ctx context.Context) {
 }
 
 func (m *Manager) start(parent context.Context, c camera.Camera) {
-	w := NewWorker(c, m.cfg, m.uploader, m.reg, m.log)
+	w := NewWorker(c, m.cfg, m.uploader, m.reg, m.log, m.session)
 	ctx, cancel := context.WithCancel(parent)
 	e := &entry{worker: w, cancel: cancel, done: make(chan struct{})}
 
@@ -195,6 +205,7 @@ func (m *Manager) shutdown() {
 		entries = append(entries, e)
 	}
 	m.workers = make(map[string]*entry)
+	m.ready = false
 	m.mu.Unlock()
 
 	m.log.Info("shutting down channels", "count", len(entries))

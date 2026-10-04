@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Transmux · 영상 관제</title>
+  <link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/app.css">
+  <script src="/assets/hls.min.js" defer></script>
+  <script src="/assets/app.js" defer></script>
+</head>
+<body>
+<a class="skip-link" id="skip-link" href="#main" hidden>본문으로 이동</a>
+<section id="login-view" class="auth-page" aria-labelledby="login-heading">
+  <div class="auth-panel">
+    <div class="brand"><img src="/assets/mark.svg" width="32" height="32" alt=""><span>transmux<span class="brand-dot">.</span></span></div>
+    <p class="eyebrow">VIDEO OPERATIONS</p>
+    <h1 id="login-heading">영상 관제에 로그인</h1>
+    <p class="muted">연결된 카메라와 녹화 영상을 확인하세요.</p>
+    <form id="login-form">
+      <label for="username">아이디</label>
+      <input id="username" name="username" autocomplete="username" required maxlength="64">
+      <label for="password">비밀번호</label>
+      <div class="password-field">
+        <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="1024">
+        <button id="show-password" type="button" class="plain" aria-pressed="false">표시</button>
+      </div>
+      <p id="login-status" class="status" role="status" aria-atomic="true"></p>
+      <button type="submit" class="primary wide" id="login-button">로그인</button>
+    </form>
+    <p class="auth-footer">TRANSMUX / CAMERA CONTROL</p>
+  </div>
+</section>
+<div id="app" hidden>
+  <header class="topbar">
+    <a class="brand" href="#live"><img src="/assets/mark.svg" width="28" height="28" alt=""><span>transmux<span class="brand-dot">.</span></span></a>
+    <nav aria-label="주요 메뉴" class="main-nav">
+      <a href="#live" data-view="live">라이브 관제</a>
+      <a href="#recordings" data-view="recordings">녹화 조회</a>
+      <a href="#cameras" data-view="cameras" id="manage-nav" hidden>카메라 관리</a>
+    </nav>
+    <div class="account"><span id="account-name"></span><button id="logout" class="plain" type="button">로그아웃</button></div>
+  </header>
+  <main id="main" tabindex="-1">
+    <section id="view-live" class="view" aria-labelledby="live-heading">
+      <div class="page-heading">
+        <div><p class="eyebrow">MONITORING</p><h1 id="live-heading">라이브 관제</h1></div>
+        <div class="toolbar"><label for="layout">화면 분할</label><select id="layout"><option value="1">1 화면</option><option value="4" selected>4 화면</option><option value="9">9 화면</option><option value="16">16 화면</option></select><button id="stop-all" type="button" class="secondary">전체 닫기</button></div>
+      </div>
+      <div class="monitor-layout">
+        <aside class="camera-sidebar" aria-label="카메라 선택">
+          <div class="sidebar-heading"><h2>카메라</h2><span id="camera-count" class="count">0</span></div>
+          <label for="center-filter" class="sr-only">센터</label>
+          <select id="center-filter"><option value="">전체 센터</option></select>
+          <label for="camera-search" class="sr-only">카메라 검색</label>
+          <input id="camera-search" type="search" placeholder="카메라 이름 또는 ID 검색">
+          <p id="catalog-status" class="status compact" role="status" aria-atomic="true"></p>
+          <div id="camera-list" class="camera-list" aria-label="선택 가능한 카메라"></div>
+          <div class="sidebar-actions"><p id="selection-count" class="muted">선택한 카메라 0대</p><button id="watch-selected" class="primary wide" type="button">선택 영상 보기</button><button id="refresh-catalog" class="plain wide" type="button">목록 새로고침</button></div>
+        </aside>
+        <div class="monitor-stage">
+          <div class="stage-meta"><span class="live-indicator"><span class="dot"></span> LIVE VIEW</span><span id="live-count">시청 중 0대</span></div>
+          <p id="live-status" class="status compact" role="status" aria-atomic="true"></p>
+          <div id="video-grid" class="video-grid grid-4">
+            <div class="empty-stage"><img src="/assets/mark.svg" width="48" height="48" alt=""><h2>시청할 카메라를 선택하세요</h2><p>카메라를 선택한 다음 ‘선택 영상 보기’를 누르세요.</p></div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section id="view-recordings" class="view" aria-labelledby="recordings-heading" hidden>
+      <div class="page-heading"><div><p class="eyebrow">RECORDINGS</p><h1 id="recordings-heading">녹화 조회</h1></div><span id="timezone" class="muted"></span></div>
+      <div class="archive-layout">
+        <div class="archive-query panel">
+          <h2>조회 구간</h2>
+          <form id="recording-form">
+            <label for="recording-camera">카메라</label><select id="recording-camera" required></select>
+            <label for="recording-start">시작 시각</label><input id="recording-start" type="datetime-local" step="1" required>
+            <label for="recording-end">종료 시각</label><input id="recording-end" type="datetime-local" step="1" required>
+            <button id="recording-search" type="submit" class="primary wide">녹화 조회</button>
+          </form>
+          <p id="recording-status" class="status" role="status" aria-atomic="true"></p>
+          <div id="recording-periods" class="period-list"></div>
+        </div>
+        <div class="archive-main">
+          <div class="panel archive-player-panel">
+            <div class="panel-heading"><h2 id="archive-title">녹화 영상</h2><span class="muted" id="archive-range">조회할 카메라와 시간을 선택하세요.</span></div>
+            <video id="archive-video" controls playsinline preload="none" aria-label="선택한 녹화 영상"></video>
+            <p id="archive-player-status" class="status compact" role="status" aria-atomic="true"></p>
+            <div class="archive-actions"><button id="play-recording" class="primary" type="button" disabled>선택 구간 재생</button><button id="export-recording" class="secondary" type="button" disabled>MP4 내보내기</button><span class="muted">재생·다운로드 구간은 녹화 조각의 경계에 맞춰집니다.</span></div>
+          </div>
+          <section class="panel exports-panel" aria-labelledby="exports-heading">
+            <div class="panel-heading"><h2 id="exports-heading">내보내기</h2><button type="button" id="refresh-exports" class="plain">새로고침</button></div>
+            <p id="export-status" class="status compact" role="status" aria-atomic="true"></p>
+            <div id="export-list"><p class="muted">준비된 MP4 파일은 여기서 다운로드할 수 있습니다.</p></div>
+          </section>
+        </div>
+      </div>
+    </section>
+    <section id="view-cameras" class="view" aria-labelledby="manage-heading" hidden>
+      <div class="page-heading"><div><p class="eyebrow">CAMERA MANAGEMENT</p><h1 id="manage-heading">카메라 관리</h1></div><div class="toolbar"><button type="button" id="refresh-managed" class="secondary">새로고침</button><button type="button" id="add-camera" class="primary">카메라 추가</button></div></div>
+      <p id="manage-status" class="status" role="status" aria-atomic="true"></p>
+      <div class="panel table-scroll"><table><caption class="sr-only">관리할 수 있는 카메라 목록</caption><thead><tr><th scope="col">카메라</th><th scope="col">센터</th><th scope="col">수집 상태</th><th scope="col">영상 / 음성</th><th scope="col">최근 녹화</th><th scope="col">작업</th></tr></thead><tbody id="managed-list"></tbody></table></div>
+    </section>
+  </main>
+</div>
+<dialog id="camera-dialog" aria-labelledby="camera-dialog-title" aria-describedby="camera-dialog-description">
+  <div class="dialog-heading"><h2 id="camera-dialog-title">카메라 추가</h2><button type="button" id="close-camera-dialog" class="plain" aria-label="카메라 설정 닫기">닫기</button></div>
+  <p id="camera-dialog-description" class="muted">연결 정보와 저장 형식을 설정하세요.</p>
+  <form id="camera-form">
+    <div class="form-row"><div><label for="edit-center">센터 ID</label><input id="edit-center" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}"></div><div><label for="edit-id">카메라 ID</label><input id="edit-id" required maxlength="64" pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}"></div></div>
+    <label for="edit-name">카메라 이름</label><input id="edit-name" maxlength="100">
+    <label for="edit-shard">담당 수집 서버</label><select id="edit-shard" required></select>
+    <label for="edit-url">RTSP 주소</label><input id="edit-url" type="password" autocomplete="new-password" spellcheck="false" aria-describedby="url-help"><p id="url-help" class="help">카메라 제조사에서 제공한 rtsp:// 또는 rtsps:// 주소를 입력하세요.</p>
+    <label for="edit-codec">카메라 영상 코덱</label><select id="edit-codec" aria-describedby="codec-help"><option value="h264">H.264</option><option value="hevc">H.265 / HEVC</option><option value="auto">원본 설정 유지</option></select>
+    <p id="codec-help" class="help">카메라 설정과 같은 코덱을 선택하세요. H.265는 fMP4로 저장합니다.</p>
+    <div class="form-row"><div><label for="edit-format">저장 형식</label><select id="edit-format"><option value="mpegts">MPEG-TS · H.264</option><option value="fmp4">fMP4 · H.264 / H.265</option></select></div><div><label for="edit-audio">음성</label><select id="edit-audio"><option value="none">저장 안 함</option><option value="aac">AAC로 변환</option><option value="copy">AAC 원본 유지</option></select></div></div>
+    <label class="checkbox-label"><input id="edit-enabled" type="checkbox" checked>영상 수집 사용</label>
+    <p id="camera-save-status" class="status" role="status" aria-atomic="true"></p>
+    <div class="dialog-actions"><button id="cancel-camera-dialog" class="secondary" type="button">취소</button><button id="save-camera" class="primary" type="submit">카메라 저장</button></div>
+  </form>
+</dialog>
+<dialog id="disable-dialog" aria-labelledby="disable-heading">
+  <h2 id="disable-heading">영상 수집 중지</h2><p id="disable-description"></p><p class="muted">저장된 녹화 영상은 보존 기간 동안 계속 조회할 수 있습니다.</p>
+  <p id="disable-status" class="status" role="status" aria-atomic="true"></p>
+  <div class="dialog-actions"><button id="cancel-disable" class="secondary" type="button">돌아가기</button><button id="confirm-disable" class="danger" type="button">수집 중지</button></div>
+</dialog>
+</body>
+</html>

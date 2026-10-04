@@ -190,7 +190,7 @@ func (r *Registry) WriteTo(sb *strings.Builder) {
 		if len(f.series) == 0 {
 			continue
 		}
-		fmt.Fprintf(sb, "# HELP %s %s\n", f.name, f.help)
+		fmt.Fprintf(sb, "# HELP %s %s\n", f.name, escapeHelp.Replace(f.help))
 		fmt.Fprintf(sb, "# TYPE %s %s\n", f.name, f.kind)
 		keys := make([]string, 0, len(f.series))
 		for k := range f.series {
@@ -206,7 +206,7 @@ func (r *Registry) WriteTo(sb *strings.Builder) {
 					if i > 0 {
 						sb.WriteByte(',')
 					}
-					fmt.Fprintf(sb, "%s=%q", l.Name, l.Value)
+					fmt.Fprintf(sb, "%s=\"%s\"", l.Name, escapeLabel.Replace(l.Value))
 				}
 				sb.WriteByte('}')
 			}
@@ -214,6 +214,11 @@ func (r *Registry) WriteTo(sb *strings.Builder) {
 		}
 	}
 }
+
+// Prometheus accepts only backslash, quote and newline escapes in labels.
+// Go's %q adds escapes such as \t and \xNN that invalidate a scrape.
+var escapeLabel = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "\n", `\n`)
+var escapeHelp = strings.NewReplacer(`\`, `\\`, "\n", `\n`)
 
 // Render returns the exposition payload.
 func (r *Registry) Render() []byte {

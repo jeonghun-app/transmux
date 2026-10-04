@@ -24,28 +24,38 @@ type stubStore struct {
 	body     []byte
 }
 
-func (s *stubStore) Put(_ context.Context, obj storage.Object) error {
+func (s *stubStore) Put(_ context.Context, obj storage.Object) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attempts++
 	if s.attempts <= s.failFor {
 		if s.err != nil {
-			return s.err
+			return "", s.err
 		}
-		return errors.New("transient")
+		return "", errors.New("transient")
 	}
 	s.body = append([]byte(nil), obj.Body...)
-	return nil
+	return `"stub-etag"`, nil
 }
 
-func (s *stubStore) Get(context.Context, string) ([]byte, error) {
+func (s *stubStore) Get(context.Context, string) ([]byte, string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.attempts++
 	if s.attempts <= s.failFor {
-		return nil, errors.New("transient")
+		return nil, "", errors.New("transient")
 	}
-	return s.body, nil
+	return s.body, `"stub-etag"`, nil
+}
+
+func (s *stubStore) Head(context.Context, string) (storage.ObjectInfo, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attempts++
+	if s.attempts <= s.failFor {
+		return storage.ObjectInfo{}, errors.New("transient")
+	}
+	return storage.ObjectInfo{ETag: `"stub-etag"`, Size: int64(len(s.body))}, nil
 }
 
 func (s *stubStore) Describe() string { return "stub" }
@@ -66,7 +76,7 @@ func testCfg() config.UploadConfig {
 func TestPutRetriesThenSucceeds(t *testing.T) {
 	store := &stubStore{failFor: 2}
 	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
-	if err := c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")}); err != nil {
+	if _, err := c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
 	if got := store.count(); got != 3 {
@@ -77,7 +87,7 @@ func TestPutRetriesThenSucceeds(t *testing.T) {
 func TestPutGivesUpAfterMaxAttempts(t *testing.T) {
 	store := &stubStore{failFor: 99}
 	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
-	err := c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")})
+	_, err := c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")})
 	if !errors.Is(err, ErrGaveUp) {
 		t.Fatalf("err = %v, want ErrGaveUp", err)
 	}
@@ -91,7 +101,7 @@ func TestPutGivesUpAfterMaxAttempts(t *testing.T) {
 func TestGetReturnsNotFoundImmediately(t *testing.T) {
 	store := &notFoundStore{}
 	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
-	_, err := c.Get(context.Background(), "k")
+	_, _, err := c.Get(context.Background(), "k")
 	if !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
@@ -100,12 +110,19 @@ func TestGetReturnsNotFoundImmediately(t *testing.T) {
 	}
 }
 
-type notFoundStore struct{ attempts int }
+type notFoundStore struct {
+	attempts     int
+	headAttempts int
+}
 
-func (s *notFoundStore) Put(context.Context, storage.Object) error { return nil }
-func (s *notFoundStore) Get(context.Context, string) ([]byte, error) {
+func (s *notFoundStore) Put(context.Context, storage.Object) (string, error) { return "", nil }
+func (s *notFoundStore) Get(context.Context, string) ([]byte, string, error) {
 	s.attempts++
-	return nil, storage.ErrNotFound
+	return nil, "", storage.ErrNotFound
+}
+func (s *notFoundStore) Head(context.Context, string) (storage.ObjectInfo, error) {
+	s.headAttempts++
+	return storage.ObjectInfo{}, storage.ErrNotFound
 }
 func (s *notFoundStore) Describe() string { return "notfound" }
 
@@ -114,7 +131,7 @@ func TestPutStopsOnCancelledContext(t *testing.T) {
 	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := c.Put(ctx, storage.Object{Key: "k", Body: []byte("x")})
+	_, err := c.Put(ctx, storage.Object{Key: "k", Body: []byte("x")})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
@@ -165,7 +182,7 @@ func TestMaxConcurrentIsEnforced(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")})
+			_, _ = c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")})
 		}()
 	}
 	// Give the goroutines time to pile up on the semaphore.
@@ -182,13 +199,16 @@ type blockingStore struct {
 	release  chan struct{}
 }
 
-func (s *blockingStore) Put(context.Context, storage.Object) error {
+func (s *blockingStore) Put(context.Context, storage.Object) (string, error) {
 	s.inFlight <- struct{}{}
 	<-s.release
-	return nil
+	return `"blocking-etag"`, nil
 }
-func (s *blockingStore) Get(context.Context, string) ([]byte, error) { return nil, nil }
-func (s *blockingStore) Describe() string                           { return "blocking" }
+func (s *blockingStore) Get(context.Context, string) ([]byte, string, error) { return nil, "", nil }
+func (s *blockingStore) Head(context.Context, string) (storage.ObjectInfo, error) {
+	return storage.ObjectInfo{}, nil
+}
+func (s *blockingStore) Describe() string { return "blocking" }
 
 // TestPutFileReadsOnlyAfterAcquiringASlot is the memory bound. Reading the
 // segment before queueing makes resident bytes scale with channel count
@@ -216,7 +236,7 @@ func TestPutFileReadsOnlyAfterAcquiringASlot(t *testing.T) {
 		wg.Add(1)
 		go func(p string) {
 			defer wg.Done()
-			_, _ = c.PutFile(context.Background(), storage.Object{Key: "k"}, p)
+			_, _, _ = c.PutFile(context.Background(), storage.Object{Key: "k"}, p)
 		}(p)
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -236,7 +256,7 @@ func TestPutFileReadsOnlyAfterAcquiringASlot(t *testing.T) {
 // reclaimed the segment" (data loss) from "the store rejected it" (retry).
 func TestPutFileReportsAMissingFileVerbatim(t *testing.T) {
 	c := NewCoordinator(&stubStore{}, testCfg(), metrics.NewRegistry())
-	_, err := c.PutFile(context.Background(),
+	_, _, err := c.PutFile(context.Background(),
 		storage.Object{Key: "k"}, filepath.Join(t.TempDir(), "gone.ts"))
 	if !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("err = %v, want fs.ErrNotExist", err)
@@ -250,7 +270,7 @@ func TestPutFileReturnsTheUploadedSize(t *testing.T) {
 	if err := os.WriteFile(p, []byte("0123456789"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	n, err := c.PutFile(context.Background(), storage.Object{Key: "k"}, p)
+	n, _, err := c.PutFile(context.Background(), storage.Object{Key: "k"}, p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -269,7 +289,7 @@ func TestPutFileRetriesTheSameBytes(t *testing.T) {
 	if err := os.WriteFile(p, []byte("abc"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.PutFile(context.Background(), storage.Object{Key: "k"}, p); err != nil {
+	if _, _, err := c.PutFile(context.Background(), storage.Object{Key: "k"}, p); err != nil {
 		t.Fatalf("PutFile: %v", err)
 	}
 	if got := store.count(); got != 3 {
@@ -277,5 +297,121 @@ func TestPutFileRetriesTheSameBytes(t *testing.T) {
 	}
 	if string(store.body) != "abc" {
 		t.Errorf("stored body = %q, want the file re-sent unchanged", store.body)
+	}
+}
+
+// TestConditionalConflictIsNotRetried is the load-bearing property of the
+// retry loop. A refused precondition cannot become true by waiting, so
+// retrying it would burn the attempt budget and then surface a generic
+// ErrGaveUp -- burying the one signal that says another writer owns the object.
+func TestConditionalConflictIsNotRetried(t *testing.T) {
+	store := &conflictStore{}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	_, err := c.Put(context.Background(), storage.Object{
+		Key: "k", Body: []byte("x"),
+		Preconditions: storage.Preconditions{IfMatch: `"stale"`},
+	})
+	if !errors.Is(err, storage.ErrPreconditionFailed) {
+		t.Fatalf("err = %v, want ErrPreconditionFailed", err)
+	}
+	if store.attempts != 1 {
+		t.Errorf("attempts = %d, want 1: a conflict must not be retried", store.attempts)
+	}
+}
+
+type conflictStore struct{ attempts int }
+
+func (s *conflictStore) Put(context.Context, storage.Object) (string, error) {
+	s.attempts++
+	return "", storage.ErrPreconditionFailed
+}
+func (s *conflictStore) Get(context.Context, string) ([]byte, string, error) { return nil, "", nil }
+func (s *conflictStore) Head(context.Context, string) (storage.ObjectInfo, error) {
+	return storage.ObjectInfo{}, nil
+}
+func (s *conflictStore) Describe() string { return "conflict" }
+
+// TestConditionalWriteIsNotRetriedAfterAnAmbiguousFailure is the defect that
+// made the worker's whole ambiguity-resolution path dead code.
+//
+// A conditional write that lands and then loses its response must be reported
+// to the caller as-is. Retrying it makes the second attempt fail its own
+// now-consumed precondition, and the caller sees ErrPreconditionFailed --
+// indistinguishable from being overtaken by another writer, which it treats as
+// permanent loss of ownership. So a healthy channel would kill itself over a
+// dropped TCP connection.
+func TestConditionalWriteIsNotRetriedAfterAnAmbiguousFailure(t *testing.T) {
+	store := &ambiguousStore{}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+
+	_, err := c.Put(context.Background(), storage.Object{
+		Key: "c1/cam1/index.m3u8", Body: []byte("v2"),
+		Preconditions: storage.Preconditions{IfMatch: `"v1"`},
+	})
+	if err == nil {
+		t.Fatal("the ambiguous outcome must be reported, not hidden")
+	}
+	if errors.Is(err, storage.ErrPreconditionFailed) {
+		t.Fatal("a retry turned a lost response into a false conflict; the caller " +
+			"cannot tell that apart from losing ownership")
+	}
+	if store.attempts != 1 {
+		t.Errorf("attempts = %d, want 1: a conditional write must not be retried", store.attempts)
+	}
+	if !store.stored {
+		t.Error("precondition: the store should have recorded the landed write")
+	}
+}
+
+// TestUnconditionalWriteStillRetries: the no-retry rule must be scoped to
+// conditional writes, or every transient segment upload failure becomes fatal.
+func TestUnconditionalWriteStillRetries(t *testing.T) {
+	store := &stubStore{failFor: 2}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	if _, err := c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if store.count() != 3 {
+		t.Errorf("attempts = %d, want 3", store.count())
+	}
+}
+
+// ambiguousStore stores the object and then reports a transport failure: the
+// write landed, the response did not.
+type ambiguousStore struct {
+	attempts int
+	stored   bool
+}
+
+func (s *ambiguousStore) Put(context.Context, storage.Object) (string, error) {
+	s.attempts++
+	s.stored = true
+	return "", errors.New("connection reset by peer")
+}
+func (s *ambiguousStore) Get(context.Context, string) ([]byte, string, error) { return nil, "", nil }
+func (s *ambiguousStore) Head(context.Context, string) (storage.ObjectInfo, error) {
+	return storage.ObjectInfo{}, nil
+}
+func (s *ambiguousStore) Describe() string { return "ambiguous" }
+
+// TestHeadIsBoundedAndRetried: Head resolves conflicts while holding an upload
+// slot, so an unbounded one would wedge a channel and a slot together.
+func TestHeadIsBoundedAndRetried(t *testing.T) {
+	store := &stubStore{failFor: 2}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	if _, err := c.Head(context.Background(), "k"); err != nil {
+		t.Fatalf("Head: %v", err)
+	}
+	if store.count() != 3 {
+		t.Errorf("attempts = %d, want 3 (two transient failures then success)", store.count())
+	}
+
+	nf := &notFoundStore{}
+	c2 := NewCoordinator(nf, testCfg(), metrics.NewRegistry())
+	if _, err := c2.Head(context.Background(), "k"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if nf.headAttempts != 1 {
+		t.Errorf("attempts = %d, want 1: absence is an answer", nf.headAttempts)
 	}
 }

@@ -293,6 +293,9 @@ services:
   transmuxd:
     image: transmux:latest
     container_name: transmux-transmuxd
+    # Allow ffmpeg shutdown, the 15-second final drain and lease release.
+    # Compose's default 10 seconds can kill the daemon during that drain.
+    stop_grace_period: 45s
     depends_on:
       mediamtx:
         condition: service_started

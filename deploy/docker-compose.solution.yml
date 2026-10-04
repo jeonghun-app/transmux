@@ -1,0 +1,233 @@
+# Local, private-bucket replacement workflow. For production use managed S3
+# and terminate HTTPS in front of playbackd; see docs/solution.md.
+name: transmux-solution
+
+x-runtime: &runtime
+  image: transmux-solution:latest
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    target: runtime
+
+x-store-env: &store-env
+  AWS_ACCESS_KEY_ID: transmuxdemo
+  AWS_SECRET_ACCESS_KEY: ${TRANSMUX_MINIO_PASSWORD:?Run make solution-env}
+  AWS_REGION: us-east-1
+
+x-publisher: &publisher
+  <<: *runtime
+  entrypoint: ["/sbin/tini", "--", "ffmpeg"]
+  depends_on:
+    - mediamtx
+  restart: unless-stopped
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 128
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: transmuxdemo
+      MINIO_ROOT_PASSWORD: ${TRANSMUX_MINIO_PASSWORD:?Run make solution-env}
+      MINIO_BROWSER: "off"
+    volumes:
+      - objects:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: transmuxdemo
+      MINIO_ROOT_PASSWORD: ${TRANSMUX_MINIO_PASSWORD:?Run make solution-env}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" >/dev/null &&
+        mc mb --ignore-existing local/transmux &&
+        mc anonymous set none local/transmux
+
+  mediamtx:
+    image: bluenviron/mediamtx:1.21.0
+    volumes:
+      - ./mediamtx.solution.yml:/mediamtx.yml:ro
+
+  camera-entrance:
+    <<: *publisher
+    command:
+      - -nostdin
+      - -hide_banner
+      - -loglevel
+      - error
+      - -re
+      - -f
+      - lavfi
+      - -i
+      - testsrc2=size=640x360:rate=10
+      - -f
+      - lavfi
+      - -i
+      - sine=frequency=660:sample_rate=48000
+      - -c:v
+      - libx264
+      - -preset
+      - ultrafast
+      - -tune
+      - zerolatency
+      - -g
+      - "20"
+      - -sc_threshold
+      - "0"
+      - -b:v
+      - 1000k
+      - -c:a
+      - aac
+      - -b:a
+      - 64k
+      - -f
+      - rtsp
+      - -rtsp_transport
+      - tcp
+      - rtsp://mediamtx:8554/entrance
+
+  camera-warehouse:
+    <<: *publisher
+    command:
+      - -nostdin
+      - -hide_banner
+      - -loglevel
+      - error
+      - -re
+      - -f
+      - lavfi
+      - -i
+      - testsrc2=size=640x360:rate=10
+      - -f
+      - lavfi
+      - -i
+      - sine=frequency=440:sample_rate=8000
+      - -c:v
+      - libx264
+      - -preset
+      - ultrafast
+      - -tune
+      - zerolatency
+      - -g
+      - "80"
+      - -sc_threshold
+      - "0"
+      - -b:v
+      - 1000k
+      - -c:a
+      - pcm_mulaw
+      - -f
+      - rtsp
+      - -rtsp_transport
+      - tcp
+      - rtsp://mediamtx:8554/warehouse
+
+  camera-hevc:
+    <<: *publisher
+    command:
+      - -nostdin
+      - -hide_banner
+      - -loglevel
+      - error
+      - -re
+      - -f
+      - lavfi
+      - -i
+      - testsrc2=size=320x180:rate=10
+      - -f
+      - lavfi
+      - -i
+      - sine=frequency=880:sample_rate=8000
+      - -c:v
+      - libx265
+      - -preset
+      - ultrafast
+      - -tune
+      - zerolatency
+      - -x265-params
+      - pools=1:frame-threads=1:log-level=error
+      - -g
+      - "20"
+      - -c:a
+      - pcm_mulaw
+      - -f
+      - rtsp
+      - -rtsp_transport
+      - tcp
+      - rtsp://mediamtx:8554/hevc
+
+  transmuxd:
+    <<: *runtime
+    stop_grace_period: 45s
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+      mediamtx:
+        condition: service_started
+    environment: *store-env
+    volumes:
+      - ../configs/solution-ingest.json:/etc/transmux/config.json:ro
+      - ingest-state:/var/lib/transmux/state
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    tmpfs:
+      - /run/transmux/spool:size=256m,mode=0750,uid=10001,gid=10001
+      - /tmp:size=16m,mode=1777
+    ulimits:
+      nofile: {soft: 65535, hard: 65535}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8080/livez"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  playbackd:
+    <<: *runtime
+    entrypoint: ["/sbin/tini", "--", "/usr/local/bin/playbackd"]
+    command: ["-config", "/etc/transmux/playback.json"]
+    stop_grace_period: 30s
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *store-env
+      TRANSMUX_AUTH_SECRET: ${TRANSMUX_AUTH_SECRET:?Run make solution-env}
+      TRANSMUX_ADMIN_PASSWORD: ${TRANSMUX_ADMIN_PASSWORD:?Run make solution-env}
+      TRANSMUX_VIEWER_PASSWORD: ${TRANSMUX_VIEWER_PASSWORD:?Run make solution-env}
+      TRANSMUX_PUBLIC_URL: ${TRANSMUX_PUBLIC_URL:-http://localhost:8090}
+    volumes:
+      - ../configs/solution-ingest.json:/etc/transmux/config.json:ro
+      - ../configs/solution-playback.json:/etc/transmux/playback.json:ro
+      - playback-state:/var/lib/transmux/playback
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    ports:
+      - "127.0.0.1:${TRANSMUX_HTTP_PORT:-8090}:8090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:8090/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  objects:
+  ingest-state:
+  playback-state:

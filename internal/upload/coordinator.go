@@ -25,35 +25,48 @@ var ErrGaveUp = errors.New("upload exhausted all attempts")
 // hundred channels, unbounded concurrent PutObject calls would exhaust file
 // descriptors and sockets long before S3 pushed back.
 type Coordinator struct {
-	store storage.ObjectStore
-	cfg   config.UploadConfig
-	sem   chan struct{}
-	reg   *metrics.Registry
+	store      storage.ObjectStore
+	cfg        config.UploadConfig
+	sem        chan struct{}
+	controlSem chan struct{}
+	reg        *metrics.Registry
 
-	putTotal    *metrics.Metric
-	putFailures *metrics.Metric
-	putRetries  *metrics.Metric
-	putBytes    *metrics.Metric
-	inFlight    *metrics.Metric
+	putTotal     *metrics.Metric
+	putFailures  *metrics.Metric
+	putRetries   *metrics.Metric
+	putConflicts *metrics.Metric
+	putBytes     *metrics.Metric
+	inFlight     *metrics.Metric
 }
 
 func NewCoordinator(store storage.ObjectStore, cfg config.UploadConfig, reg *metrics.Registry) *Coordinator {
 	return &Coordinator{
-		store: store,
-		cfg:   cfg,
-		sem:   make(chan struct{}, cfg.MaxConcurrent),
-		reg:   reg,
+		store:      store,
+		cfg:        cfg,
+		sem:        make(chan struct{}, cfg.MaxConcurrent),
+		controlSem: make(chan struct{}, min(16, cfg.MaxConcurrent)),
+		reg:        reg,
 		putTotal: reg.Counter("transmux_object_put_total",
 			"Successful object store PUT operations."),
 		putFailures: reg.Counter("transmux_object_put_failures_total",
 			"Object store PUT operations that failed after all attempts."),
 		putRetries: reg.Counter("transmux_object_put_retries_total",
 			"Individual PUT attempts that failed and were retried."),
+		putConflicts: reg.Counter("transmux_object_put_conflicts_total",
+			"Conditional PUTs refused because another writer held the object. Never retried."),
 		putBytes: reg.Counter("transmux_object_put_bytes_total",
 			"Total bytes written to the object store."),
 		inFlight: reg.Gauge("transmux_object_put_in_flight",
 			"Object store PUT operations currently in flight."),
 	}
+}
+
+// LeaseClient reserves bounded capacity for ownership traffic independently
+// of segment uploads. Both clients share the store, metrics and retry rules.
+func (c *Coordinator) LeaseClient() storage.ControlClient {
+	control := *c
+	control.sem = c.controlSem
+	return &control
 }
 
 // Store exposes the backing store description for health output.
@@ -64,17 +77,17 @@ func (c *Coordinator) Store() storage.ObjectStore { return c.store }
 // The same key is reused across attempts so a retry after an ambiguous
 // failure simply overwrites identical bytes. Generating a fresh key per
 // attempt would leave orphaned objects that no manifest references.
-func (c *Coordinator) Put(ctx context.Context, obj storage.Object) error {
+func (c *Coordinator) Put(ctx context.Context, obj storage.Object) (string, error) {
 	// Check cancellation before the semaphore. A select with both cases ready
 	// picks at random, so without this a shutdown could still issue a request
 	// that is certain to fail.
 	if err := ctx.Err(); err != nil {
-		return err
+		return "", err
 	}
 	select {
 	case c.sem <- struct{}{}:
 	case <-ctx.Done():
-		return ctx.Err()
+		return "", ctx.Err()
 	}
 	defer func() { <-c.sem }()
 
@@ -93,97 +106,160 @@ func (c *Coordinator) Put(ctx context.Context, obj storage.Object) error {
 // A missing file is returned as-is so the caller can tell "ffmpeg reclaimed
 // it" (data loss, count it) from "the store rejected it" (retry it). The
 // bytes are returned because the caller needs the size it actually uploaded.
-func (c *Coordinator) PutFile(ctx context.Context, obj storage.Object, srcPath string) (int64, error) {
+func (c *Coordinator) PutFile(ctx context.Context, obj storage.Object, srcPath string) (int64, string, error) {
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	select {
 	case c.sem <- struct{}{}:
 	case <-ctx.Done():
-		return 0, ctx.Err()
+		return 0, "", ctx.Err()
 	}
 	defer func() { <-c.sem }()
 
 	body, err := os.ReadFile(srcPath)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	obj.Body = body
-	if err := c.attempts(ctx, obj); err != nil {
-		return 0, err
+	etag, err := c.attempts(ctx, obj)
+	if err != nil {
+		return 0, "", err
 	}
-	return int64(len(body)), nil
+	return int64(len(body)), etag, nil
+}
+
+// Head reads an object's metadata under the same concurrency bound.
+//
+// It exists to resolve an ambiguous conditional write: when a request times
+// out, the caller cannot know whether it landed, and a blind retry of a
+// conditional write would report a spurious conflict.
+//
+// It is bounded and retried like Get. An unbounded Head would be worse here
+// than elsewhere, because it runs while a channel is already stuck resolving a
+// conflict and it holds an upload slot the whole time.
+func (c *Coordinator) Head(ctx context.Context, key string) (storage.ObjectInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return storage.ObjectInfo{}, err
+	}
+	select {
+	case c.sem <- struct{}{}:
+	case <-ctx.Done():
+		return storage.ObjectInfo{}, ctx.Err()
+	}
+	defer func() { <-c.sem }()
+
+	var lastErr error
+	for attempt := 1; attempt <= c.cfg.MaxAttempts; attempt++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.PutTimeout.Duration)
+		info, err := c.store.Head(attemptCtx, key)
+		cancel()
+		if err == nil {
+			return info, nil
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			return storage.ObjectInfo{}, err
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return storage.ObjectInfo{}, ctx.Err()
+		}
+		if attempt < c.cfg.MaxAttempts {
+			if !sleepCtx(ctx, c.backoff(attempt)) {
+				return storage.ObjectInfo{}, ctx.Err()
+			}
+		}
+	}
+	return storage.ObjectInfo{}, fmt.Errorf("%w after %d attempts for %s: %v",
+		ErrGaveUp, c.cfg.MaxAttempts, key, lastErr)
 }
 
 // attempts runs the retry loop. The caller must already hold a semaphore slot.
-func (c *Coordinator) attempts(ctx context.Context, obj storage.Object) error {
+func (c *Coordinator) attempts(ctx context.Context, obj storage.Object) (string, error) {
 	c.inFlight.Add(1)
 	defer c.inFlight.Add(-1)
 
 	var lastErr error
 	for attempt := 1; attempt <= c.cfg.MaxAttempts; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.PutTimeout.Duration)
-		err := c.store.Put(attemptCtx, obj)
+		etag, err := c.store.Put(attemptCtx, obj)
 		cancel()
 		if err == nil {
 			c.putTotal.Inc()
 			c.putBytes.Add(float64(len(obj.Body)))
-			return nil
+			return etag, nil
+		}
+		// A refused precondition is an answer, not a fault. Retrying cannot
+		// make it true, and burning the retry budget here would bury the one
+		// signal that says another writer owns this object.
+		if errors.Is(err, storage.ErrPreconditionFailed) {
+			c.putConflicts.Inc()
+			return "", err
 		}
 		lastErr = err
+		// A conditional write must not be retried. If this attempt landed and
+		// only its response was lost, the retry would find its own
+		// precondition already consumed and report a conflict that never
+		// happened -- which the caller cannot tell apart from being overtaken.
+		// Only the caller knows the write ID it used, so only the caller can
+		// resolve the ambiguity, by reading back.
+		if obj.Preconditions.Conditional() {
+			c.putFailures.Inc()
+			return "", err
+		}
 		// A cancelled parent context means shutdown, not a transient fault.
 		if ctx.Err() != nil {
 			c.putFailures.Inc()
-			return fmt.Errorf("upload %s cancelled: %w", obj.Key, ctx.Err())
+			return "", fmt.Errorf("upload %s cancelled: %w", obj.Key, ctx.Err())
 		}
 		if attempt < c.cfg.MaxAttempts {
 			c.putRetries.Inc()
 			if !sleepCtx(ctx, c.backoff(attempt)) {
 				c.putFailures.Inc()
-				return fmt.Errorf("upload %s cancelled: %w", obj.Key, ctx.Err())
+				return "", fmt.Errorf("upload %s cancelled: %w", obj.Key, ctx.Err())
 			}
 		}
 	}
 	c.putFailures.Inc()
-	return fmt.Errorf("%w after %d attempts for %s: %v",
+	return "", fmt.Errorf("%w after %d attempts for %s: %v",
 		ErrGaveUp, c.cfg.MaxAttempts, obj.Key, lastErr)
 }
 
 // Get reads an object, retrying transient failures. ErrNotFound is returned
 // immediately: a missing key is an answer, not a fault.
-func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
+func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, string, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	select {
 	case c.sem <- struct{}{}:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, "", ctx.Err()
 	}
 	defer func() { <-c.sem }()
 
 	var lastErr error
 	for attempt := 1; attempt <= c.cfg.MaxAttempts; attempt++ {
 		attemptCtx, cancel := context.WithTimeout(ctx, c.cfg.PutTimeout.Duration)
-		body, err := c.store.Get(attemptCtx, key)
+		body, etag, err := c.store.Get(attemptCtx, key)
 		cancel()
 		if err == nil {
-			return body, nil
+			return body, etag, nil
 		}
 		if errors.Is(err, storage.ErrNotFound) {
-			return nil, err
+			return nil, "", err
 		}
 		lastErr = err
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, "", ctx.Err()
 		}
 		if attempt < c.cfg.MaxAttempts {
 			if !sleepCtx(ctx, c.backoff(attempt)) {
-				return nil, ctx.Err()
+				return nil, "", ctx.Err()
 			}
 		}
 	}
-	return nil, fmt.Errorf("%w after %d attempts for %s: %v",
+	return nil, "", fmt.Errorf("%w after %d attempts for %s: %v",
 		ErrGaveUp, c.cfg.MaxAttempts, key, lastErr)
 }
 
@@ -191,8 +267,16 @@ func (c *Coordinator) Get(ctx context.Context, key string) ([]byte, error) {
 // exponential matters here: several hundred channels failing at the same
 // instant would otherwise retry in lockstep.
 func (c *Coordinator) backoff(attempt int) time.Duration {
+	if c.cfg.RetryBase.Duration <= 0 || c.cfg.RetryMax.Duration <= 0 {
+		return 0
+	}
 	base := float64(c.cfg.RetryBase.Duration)
 	capped := math.Min(base*math.Pow(2, float64(attempt-1)), float64(c.cfg.RetryMax.Duration))
+	// float64 rounds MaxInt64 up to 1<<63; converting that back to int64
+	// or adding one to the bound would overflow and panic in Int63n.
+	if capped >= float64(math.MaxInt64) {
+		return time.Duration(rand.Int63())
+	}
 	return time.Duration(rand.Int63n(int64(capped) + 1))
 }
 

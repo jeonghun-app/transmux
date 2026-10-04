@@ -28,6 +28,7 @@ type LocalSegment struct {
 	Duration        time.Duration
 	ProgramDateTime time.Time // zero when ffmpeg did not emit the tag
 	Discontinuity   bool
+	InitName        string
 }
 
 // ParseLocal reads an ffmpeg-generated media playlist.
@@ -39,10 +40,11 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 
 	var (
-		out           []LocalSegment
-		pending       LocalSegment
+		out            []LocalSegment
+		pending        LocalSegment
 		havePendingInf bool
-		sawHeader     bool
+		sawHeader      bool
+		initName       string
 	)
 	for sc.Scan() {
 		line := strings.TrimSpace(sc.Text())
@@ -56,6 +58,7 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 				continue
 			}
 			pending.Name = line
+			pending.InitName = initName
 			out = append(out, pending)
 			pending = LocalSegment{}
 			havePendingInf = false
@@ -65,15 +68,11 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 		case line == "#EXTM3U":
 			sawHeader = true
 		case strings.HasPrefix(line, "#EXTINF:"):
-			v := strings.TrimPrefix(line, "#EXTINF:")
-			if i := strings.IndexByte(v, ','); i >= 0 {
-				v = v[:i]
-			}
-			secs, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+			duration, err := parseEXTINF(line)
 			if err != nil {
-				return nil, fmt.Errorf("invalid EXTINF %q: %w", line, err)
+				return nil, err
 			}
-			pending.Duration = time.Duration(secs * float64(time.Second))
+			pending.Duration = duration
 			havePendingInf = true
 		case strings.HasPrefix(line, "#EXT-X-PROGRAM-DATE-TIME:"):
 			raw := strings.TrimPrefix(line, "#EXT-X-PROGRAM-DATE-TIME:")
@@ -82,6 +81,11 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 			}
 		case line == "#EXT-X-DISCONTINUITY":
 			pending.Discontinuity = true
+		case strings.HasPrefix(line, "#EXT-X-MAP:"):
+			if line != `#EXT-X-MAP:URI="init.mp4"` {
+				return nil, fmt.Errorf("unsupported local initialization map")
+			}
+			initName = "init.mp4"
 		}
 	}
 	if err := sc.Err(); err != nil {
@@ -91,6 +95,23 @@ func ParseLocal(data []byte) ([]LocalSegment, error) {
 		return nil, fmt.Errorf("not an m3u8 playlist: missing #EXTM3U")
 	}
 	return out, nil
+}
+
+func parseEXTINF(line string) (time.Duration, error) {
+	v := strings.TrimPrefix(line, "#EXTINF:")
+	if i := strings.IndexByte(v, ','); i >= 0 {
+		v = v[:i]
+	}
+	secs, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil || math.IsNaN(secs) || math.IsInf(secs, 0) ||
+		secs <= 0 || secs >= float64(math.MaxInt64)/float64(time.Second) {
+		return 0, fmt.Errorf("invalid EXTINF duration %q", v)
+	}
+	d := time.Duration(secs * float64(time.Second))
+	if d < time.Millisecond {
+		return 0, fmt.Errorf("EXTINF duration %q is below manifest millisecond precision", v)
+	}
+	return d, nil
 }
 
 // parsePDT accepts both the RFC3339 form and ffmpeg's "+0000" offset form.
@@ -108,20 +129,59 @@ type PublishedSegment struct {
 	// Sequence is our monotonic media sequence number for the channel.
 	Sequence uint64
 	// URI is relative to the manifest's own location.
-	URI string
-	Duration time.Duration
+	URI             string
+	InitURI         string
+	Duration        time.Duration
 	ProgramDateTime time.Time
-	Discontinuity bool
+	Discontinuity   bool
 	// Bytes is the uploaded object size, used for logging and metrics.
 	Bytes int64
 }
 
-// RenderLive builds a live media playlist.
+// WriteIDComment is the playlist comment carrying the identity of the write
+// that produced this manifest body.
 //
-// discontinuitySequence must be the running count of discontinuities that
-// have already scrolled out of the window; players need it to keep their
-// timeline consistent across a reconnect.
-func RenderLive(segments []PublishedSegment, discontinuitySequence uint64) []byte {
+// It exists for two reasons. It guarantees that a fence write changes the
+// object's ETag even when the playlist entries are byte-identical, which is
+// what lets a new owner revoke a stale owner's compare-and-swap token. And it
+// lets a writer resolve an ambiguous PUT: if the stored manifest carries the
+// write ID it just attempted, the write landed despite the timeout.
+//
+// A line starting with "#" that is not an EXT tag is a comment per RFC 8216,
+// so players ignore it.
+const WriteIDComment = "# transmux-write-id: "
+
+// LastSequenceComment records the highest sequence this channel has ever
+// published, independently of what the window happens to contain.
+//
+// It exists because the window can legitimately be empty while the sequence is
+// far from zero: recovery drops the window when a checkpoint floor is ahead of
+// the manifest, and the ownership fence must still write a manifest. Without
+// this, that fence would publish EXT-X-MEDIA-SEQUENCE:0, and a later process
+// recovering from it would restart the sequence and reissue object keys that
+// are already live.
+const LastSequenceComment = "# transmux-last-sequence: "
+
+// Live is one rendered version of a channel's live playlist.
+type Live struct {
+	// Segments is the live window, oldest first.
+	Segments []PublishedSegment
+	// DiscontinuitySequence is the running count of discontinuities that have
+	// already scrolled out of the window; players need it to keep their
+	// timeline consistent across a reconnect.
+	DiscontinuitySequence uint64
+	// LastSequence is the highest sequence ever published for this channel. It
+	// is at least the highest sequence in Segments, and greater when the
+	// window has been dropped.
+	LastSequence uint64
+	// WriteID identifies this particular write. It must be unique per write for
+	// the ownership protocol to work; see WriteIDComment.
+	WriteID string
+}
+
+// RenderLive builds a live media playlist.
+func RenderLive(l Live) []byte {
+	segments, discontinuitySequence, writeID := l.Segments, l.DiscontinuitySequence, l.WriteID
 	var b strings.Builder
 	maxDur := time.Duration(0)
 	for _, s := range segments {
@@ -143,16 +203,38 @@ func RenderLive(segments []PublishedSegment, discontinuitySequence uint64) []byt
 	}
 
 	b.WriteString("#EXTM3U\n")
-	// Version 3 is the minimum that allows float EXTINF. Nothing here needs
-	// a higher version for MPEG-TS segments.
-	b.WriteString("#EXT-X-VERSION:3\n")
+	version := 3
+	for _, s := range segments {
+		if s.InitURI != "" {
+			version = 7
+			break
+		}
+	}
+	fmt.Fprintf(&b, "#EXT-X-VERSION:%d\n", version)
+	if writeID != "" {
+		b.WriteString(WriteIDComment)
+		b.WriteString(writeID)
+		b.WriteString("\n")
+	}
+	last := l.LastSequence
+	if len(segments) > 0 && segments[len(segments)-1].Sequence > last {
+		last = segments[len(segments)-1].Sequence
+	}
+	if last > 0 {
+		fmt.Fprintf(&b, "%s%d\n", LastSequenceComment, last)
+	}
 	fmt.Fprintf(&b, "#EXT-X-TARGETDURATION:%d\n", target)
 	fmt.Fprintf(&b, "#EXT-X-MEDIA-SEQUENCE:%d\n", mediaSeq)
 	fmt.Fprintf(&b, "#EXT-X-DISCONTINUITY-SEQUENCE:%d\n", discontinuitySequence)
+	var initURI string
 	for _, s := range segments {
 		if s.Discontinuity {
 			b.WriteString("#EXT-X-DISCONTINUITY\n")
 		}
+		if s.InitURI != "" && s.InitURI != initURI {
+			fmt.Fprintf(&b, "#EXT-X-MAP:URI=\"%s\"\n", s.InitURI)
+		}
+		initURI = s.InitURI
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\n", s.Duration.Seconds())
 		if !s.ProgramDateTime.IsZero() {
 			fmt.Fprintf(&b, "#EXT-X-PROGRAM-DATE-TIME:%s\n",
@@ -169,3 +251,10 @@ const ContentTypeManifest = "application/vnd.apple.mpegurl"
 
 // ContentTypeSegment is the media type for an MPEG-TS segment.
 const ContentTypeSegment = "video/mp2t"
+
+// RenderRecording creates a finite, segment-aligned VOD. Recording queries
+// may contain sequence gaps; VOD media sequence is independent of ingest.
+func RenderRecording(segments []PublishedSegment) []byte {
+	body := RenderLive(Live{Segments: segments})
+	return append(body, []byte("#EXT-X-ENDLIST\n")...)
+}

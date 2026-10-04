@@ -65,7 +65,7 @@ func TestRenderLiveParsePublishedRoundTrip(t *testing.T) {
 			Duration: 6500 * time.Millisecond, ProgramDateTime: pdt.Add(4 * time.Second),
 			Discontinuity: true},
 	}
-	rendered := RenderLive(original, 7)
+	rendered := RenderLive(Live{Segments: original, DiscontinuitySequence: 7, WriteID: "write-1"})
 
 	pub, err := ParsePublished(rendered)
 	if err != nil {
@@ -126,12 +126,12 @@ func TestParsePublishedRejectsEmptyAndGarbage(t *testing.T) {
 // another host, must not qualify.
 func TestParsePublishedRejectsAForeignPath(t *testing.T) {
 	cases := map[string]string{
-		"absolute url": "https://cdn.example/2026/08/31/seg-000000001-1.ts",
-		"leading slash": "/2026/08/31/seg-000000001-1.ts",
-		"bare basename": "seg-000000001-1.ts",
-		"wrong depth":   "2026/08/seg-000000001-1.ts",
-		"query string":  "2026/08/31/seg-000000001-1.ts?token=abc",
-		"dot segment":   "2026/08/../08/31/seg-000000001-1.ts",
+		"absolute url":     "https://cdn.example/2026/08/31/seg-000000001-1.ts",
+		"leading slash":    "/2026/08/31/seg-000000001-1.ts",
+		"bare basename":    "seg-000000001-1.ts",
+		"wrong depth":      "2026/08/seg-000000001-1.ts",
+		"query string":     "2026/08/31/seg-000000001-1.ts?token=abc",
+		"dot segment":      "2026/08/../08/31/seg-000000001-1.ts",
 		"non numeric date": "yyyy/mm/dd/seg-000000001-1.ts",
 	}
 	for name, uri := range cases {
