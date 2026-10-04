@@ -404,7 +404,7 @@ func (a *Auth) ClientKey(r *http.Request) string {
 			hops = append(hops, strings.Split(value, ",")...)
 		}
 		for n := len(hops) - 1; n >= 0; n-- {
-			hop, err := netip.ParseAddr(strings.TrimSpace(hops[n]))
+			hop, err := parseHop(strings.TrimSpace(hops[n]))
 			if err != nil {
 				break
 			}
@@ -419,4 +419,17 @@ func (a *Auth) ClientKey(r *http.Request) string {
 		return prefix.String()
 	}
 	return addr.String()
+}
+
+// parseHop accepts a bare address or, from proxies that append the client
+// port, "addr:port" and "[v6]:port".
+func parseHop(raw string) (netip.Addr, error) {
+	if addr, err := netip.ParseAddr(raw); err == nil {
+		return addr, nil
+	}
+	addrPort, err := netip.ParseAddrPort(raw)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	return addrPort.Addr(), nil
 }
