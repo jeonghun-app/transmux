@@ -1,10 +1,21 @@
 # The host has neither Go nor ffmpeg installed, so every target runs inside
 # a container. This also makes the build reproducible on a CI runner.
 
-VERSION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
+# A tagged commit reports its tag (v0.2.0); anything else reports the nearest
+# tag plus distance and hash, or just the hash when no tag is reachable.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 IMAGE   ?= transmux
 GOIMAGE ?= golang:1.26.8-alpine3.23
 DOCKER  ?= docker
+ACTIONLINT_IMAGE ?= rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+
+# Release archives land under tmp/, which is already ignored by git and
+# excluded from the image build context.
+DISTDIR ?= tmp/dist
+DIST_PLATFORMS ?= linux/amd64 linux/arm64
+
+LDFLAGS := -s -w -X main.version=$(VERSION)
 
 # Cache the module and build cache on the host so repeat runs are fast.
 GOCACHE_VOL := transmux-gocache
@@ -40,9 +51,36 @@ vuln: ## Verify modules and scan reachable Go vulnerabilities
 	$(RUNGO) $(GOIMAGE) go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
 .PHONY: build
-build: ## Compile ingest and playback services
-	$(RUNGO) $(GOIMAGE) go build -trimpath -o /tmp/transmuxd ./cmd/transmuxd
-	$(RUNGO) $(GOIMAGE) go build -trimpath -o /tmp/playbackd ./cmd/playbackd
+build: ## Compile ingest and playback services and print their embedded version
+	$(RUNGO) -e CGO_ENABLED=0 $(GOIMAGE) sh -c 'set -e; \
+	  go build -trimpath -ldflags "$(LDFLAGS)" -o /tmp/transmuxd ./cmd/transmuxd; \
+	  go build -trimpath -ldflags "$(LDFLAGS)" -o /tmp/playbackd ./cmd/playbackd; \
+	  printf "transmuxd %s\nplaybackd %s\n" "$$(/tmp/transmuxd -version)" "$$(/tmp/playbackd -version)"'
+
+# Static linux binaries per platform, packed as
+# $(DISTDIR)/transmux_<version>_<os>_<arch>.tar.gz plus SHA256SUMS. The release
+# workflow calls this with VERSION set to the pushed tag.
+.PHONY: dist
+dist: ## Cross-compile release archives and checksums into $(DISTDIR)
+	rm -rf $(DISTDIR) && mkdir -p $(DISTDIR)
+	$(RUNGO) -e CGO_ENABLED=0 -e SOURCE_DATE_EPOCH=$$(git log -1 --format=%ct 2>/dev/null || echo 0) \
+	  $(GOIMAGE) sh -c 'set -e; apk add --no-cache tar >/dev/null; \
+	  for p in $(DIST_PLATFORMS); do \
+	    os=$${p%/*}; arch=$${p#*/}; name=transmux_$(VERSION)_$${os}_$${arch}; \
+	    stage=/tmp/stage/$$name; mkdir -p $$stage; \
+	    for cmd in transmuxd playbackd; do \
+	      GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" -o $$stage/$$cmd ./cmd/$$cmd; \
+	    done; \
+	    for f in LICENSE NOTICE README.md README.en.md CHANGELOG.md; do [ ! -f $$f ] || cp $$f $$stage/; done; \
+	    tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@$$SOURCE_DATE_EPOCH \
+	      -C /tmp/stage -czf $(DISTDIR)/$$name.tar.gz $$name; \
+	  done; \
+	  cd $(DISTDIR) && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS; \
+	  chown -R $(shell id -u):$(shell id -g) /src/$(DISTDIR)'
+
+.PHONY: lint-actions
+lint-actions: ## Lint GitHub Actions workflows with actionlint
+	$(DOCKER) run --rm -v $(CURDIR):/repo -w /repo $(ACTIONLINT_IMAGE) -color
 
 .PHONY: test
 test: ## Unit tests
@@ -62,7 +100,8 @@ test-ffmpeg: ## Tests that need a real ffmpeg binary (build tag: ffmpeg)
 .PHONY: image
 image: ## Build the runtime container image
 	$(DOCKER) build -f deploy/Dockerfile --target runtime \
-	  --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
+	  --build-arg VERSION=$(VERSION) --build-arg REVISION=$(REVISION) \
+	  -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
 .PHONY: poc-up
 poc-up: image ## Bring up the full PoC stack: MediaMTX + fake camera + transmuxd + RustFS (local S3)

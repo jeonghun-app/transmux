@@ -1,0 +1,36 @@
+# Weekly update PRs, grouped so routine minor/patch bumps arrive as one PR
+# per ecosystem. Major versions stay separate PRs because they need review.
+#
+# Not covered: the Go toolchain image pinned in Makefile (GOIMAGE) and the
+# images in deploy/docker-compose.*.yml. Bump GOIMAGE together with the
+# golang base image in deploy/Dockerfile when Dependabot proposes it.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /tests/browser
+    schedule:
+      interval: weekly
+    groups:
+      browser-tests:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly

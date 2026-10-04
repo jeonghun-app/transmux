@@ -1,0 +1,156 @@
+# Publish a release when a v* tag is pushed: static linux/amd64 and
+# linux/arm64 binaries, SHA256SUMS, an SPDX SBOM, a GitHub Release whose notes
+# come from CHANGELOG.md, and a multi-arch image on ghcr.io.
+#
+# Every job starts with no token permissions and asks only for what it uses.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+# Never cancel a half-published release; a second push of the same tag waits.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  binaries:
+    name: binaries, checksums and SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # VERSION is the tag itself, so `transmuxd -version` prints e.g. v0.2.0.
+      - name: build release archives
+        run: make dist VERSION="$GITHUB_REF_NAME"
+      # The SBOM is generated from the built binaries rather than the source
+      # tree, so it lists exactly the Go modules linked into what ships and
+      # not the browser-test npm packages.
+      - name: unpack amd64 binaries for SBOM scan
+        run: |
+          mkdir -p tmp/sbom-input
+          tar -xzf "tmp/dist/transmux_${GITHUB_REF_NAME}_linux_amd64.tar.gz" -C tmp/sbom-input
+      - uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: tmp/sbom-input
+          format: spdx-json
+          output-file: tmp/dist/transmux_${{ github.ref_name }}_sbom.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: checksums
+        working-directory: tmp/dist
+        run: |
+          sha256sum -- *.tar.gz *.spdx.json > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: tmp/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    name: container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Only the runtime stage's apk install runs under emulation; Go
+      # cross-compiles on the native builder (see deploy/Dockerfile).
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # v1.2.3 -> 1.2.3, 1.2, 1, v1.2.3 and latest. A pre-release such as
+          # v1.2.3-rc.1 gets only 1.2.3-rc.1 and v1.2.3-rc.1. No floating
+          # major tag while on 0.x, where a minor bump may break.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref_name, 'v0.') }}
+            type=ref,event=tag
+          flavor: |
+            latest=auto
+          labels: |
+            org.opencontainers.image.title=transmux
+            org.opencontainers.image.licenses=Apache-2.0
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          target: runtime
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            REVISION=${{ github.sha }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          provenance: mode=max
+          sbom: true
+          push: true
+
+  release:
+    name: GitHub Release
+    needs: [binaries, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: tmp/dist
+      # Notes are the CHANGELOG section for this version (heading
+      # "## [0.2.0] - date"). A tag without a section fails here, which is
+      # deliberate: the changelog is the release's source of truth.
+      - name: extract release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            /^## \[/ { if (found) exit; if (index($0, "## [" v "]") == 1) { found = 1; next } }
+            /^\[[^]]+\]: / { if (found) exit }
+            found { print }
+          ' CHANGELOG.md > tmp/notes.md
+          if ! grep -q '[^[:space:]]' tmp/notes.md; then
+            echo "::error file=CHANGELOG.md::no '## [$version]' section"
+            exit 1
+          fi
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          case "$GITHUB_REF_NAME" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "transmux $GITHUB_REF_NAME" \
+            --notes-file tmp/notes.md \
+            "${prerelease[@]}" \
+            tmp/dist/*
