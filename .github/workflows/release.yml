@@ -5,8 +5,9 @@
 # Published versions are immutable. A version that already has a GitHub
 # Release, or whose image was built from a different commit, is refused; fix
 # forward with the next patch version. Re-running a failed run for the same
-# commit is allowed and simply finishes the missing pieces. The repository's
-# tag ruleset additionally forbids moving or deleting v* tags.
+# commit is allowed and simply finishes the missing pieces. Releases are never
+# drafted by hand; this workflow is the only thing that creates them. The
+# repository's tag ruleset additionally forbids moving or deleting v* tags.
 #
 # Every job starts with no token permissions and asks only for what it uses.
 name: release
@@ -52,6 +53,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      # Only commits that have landed on main are released, so a tag pushed on
+      # an unreviewed branch commit cannot publish anything.
+      - name: require the tagged commit on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME ($GITHUB_SHA) is not on origin/main"
+            exit 1
+          fi
       # Notes are the CHANGELOG section for this version (heading
       # "## [0.2.0] - date"). A tag without a section fails here, which is
       # deliberate: the changelog is the release's source of truth.

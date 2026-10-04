@@ -36,8 +36,10 @@ FROM alpine:3.23 AS runtime
 ARG VERSION=dev
 ARG REVISION=unknown
 # The licenses label covers transmux itself. The image also ships Alpine's
-# ffmpeg package under its own terms (GPL-2.0-or-later AND LGPL-2.1-or-later);
-# `apk info -a ffmpeg` inside the image shows the license and source origin.
+# ffmpeg, which is configured with --enable-gpl --enable-version3, so the
+# binaries in the image are effectively GPL-3.0-or-later (`ffmpeg -L`), even
+# though the apk metadata lists the source licences as GPL-2.0-or-later AND
+# LGPL-2.1-or-later. transmux only runs ffmpeg as a separate process.
 LABEL org.opencontainers.image.title="transmux" \
       org.opencontainers.image.description="RTSP to HLS ingest (transmuxd) and authenticated playback (playbackd)" \
       org.opencontainers.image.source="https://github.com/jeonghun-app/transmux" \
