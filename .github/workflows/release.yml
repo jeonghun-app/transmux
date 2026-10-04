@@ -164,9 +164,36 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       # A re-run for the same commit may overwrite its own image; an image of
       # this version built from any other commit is never replaced.
+      #
+      # Before the first release the package does not exist, and ghcr then
+      # answers the registry token request with 403 rather than "not found".
+      # So the packages API decides first: 404 means never published; any
+      # other API error fails.
       - name: refuse to replace an image from another commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
         run: |
           ref="${IMAGE,,}:${GITHUB_REF_NAME}"
+          package="${GITHUB_REPOSITORY#*/}"
+          package="${package,,}"
+          case "$(gh api "/users/$OWNER" --jq .type)" in
+            User) scope=users ;;
+            Organization) scope=orgs ;;
+            *) echo "::error::cannot determine the owner type of $OWNER"; exit 1 ;;
+          esac
+          if ! api=$(gh api "/$scope/$OWNER/packages/container/$package" --jq .name 2>&1); then
+            if ! grep -q 'HTTP 404' <<<"$api"; then
+              echo "$api"
+              exit 1
+            fi
+            # Never published as far as this token can see. If the registry
+            # can still show the tag, check it below anyway; otherwise go on.
+            if ! docker buildx imagetools inspect "$ref" >/dev/null 2>&1; then
+              echo "package $OWNER/$package not published yet"
+              exit 0
+            fi
+          fi
           if ! cfg=$(docker buildx imagetools inspect "$ref" --format '{{json .Image}}' 2>/tmp/inspect.err); then
             # Proceed only when the registry says this tag has no manifest:
             # buildx reports that as exactly "ERROR: <ref>: not found", and a
