@@ -8,6 +8,8 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-04
+
 ### Added
 
 - 릴리스 파이프라인: `v*` 태그를 푸시하면 linux/amd64·arm64 정적 바이너리
@@ -47,6 +49,26 @@
 - CI: `push`는 `main`에서만 실행해 PR 브랜치의 중복 실행을 없앴다.
   PR에서도 의존성 취약점 검사(`make vuln`)와 워크플로 린트를 실행한다.
   모든 액션을 커밋 SHA로 고정했다.
+- **호환성:** 재생 설정에서 `retention.enabled`가 켜져 있으면 `index.days`가
+  `retention.days` 이상이어야 한다. 인덱스는 `index.days`보다 오래된 날짜를
+  정리하므로, 더 짧으면 보존 중인 녹화가 조회되지 않는다. 기존 설정이 이 조건을
+  어기면 `playbackd`가 기동 시 오류를 낸다. `index.days`를 늘린다.
+- **호환성:** 녹화 인덱스가 이제 `index.days`보다 오래된 날짜를 정리한다
+  (`retention.enabled`와 무관). 전에는 한 번 인덱싱된 녹화가 계속 남았다.
+  S3 Lifecycle로 더 오래 보관하는 녹화를 조회해야 하면, 업그레이드 전에
+  `index.days`를 필요한 조회 기간 이상으로 늘린다.
+- 로컬 Compose 스택(solution·PoC)의 S3 서버를 MinIO에서 RustFS 1.0.1로 바꿨다.
+  MinIO 공개 이미지를 더 이상 익명으로 받을 수 없기 때문이다. 서비스 이름은
+  `s3`, 예제 설정의 endpoint는 `http://s3:9000`, solution 스택의 저장 볼륨은 `s3-data`다.
+  `.env.solution`에는 `TRANSMUX_S3_SECRET_KEY`가 자동으로 추가된다. 이전 로컬
+  녹화는 새 스택에서 보이지 않는다(정리 방법은 `docs/solution.md`).
+- 로그인 제한의 최종 정책: 실제 계정과 존재하지 않는 이름(비밀 키 HMAC으로 고정
+  4096개 버킷) 모두 실패한 시도만 1분에 10회로 센다. 검증 전에 시도를 먼저
+  세고 성공하면 되돌려 동시 요청에서도 상한을 지킨다. 클라이언트는 1분에
+  30회(IPv6는 /64), 추적 키가 10,000개를 넘으면 새 클라이언트는 공용 overflow
+  한도(1분 300회)를 함께 쓰며, `GET /v1/admin/status`의 `login`과 경고 로그로
+  관측한다.
+- CI가 문서의 상대 링크와 앵커를 검사한다(`docs/check-links.py`).
 - `SECURITY.md`를 취약점 신고 정책과 지원 버전으로 줄이고, 배포 하드닝 내용은
   `docs/deployment-security.md`로 옮겼다. 문서에서 특정 고객·사업 맥락을
   일반적인 서술로 바꿨다.
@@ -64,6 +86,10 @@
 - 동시 MP4 내보내기가 디스크 공간을 미리 예약한다. 합계가 가용량을 넘으면 뒤
   작업은 시작 전에 명확한 오류로 거절되고, 인덱스·세션 DB용 최소 여유 공간을
   남긴다.
+
+- 프록시가 `X-Forwarded-For`에 `addr:port`나 `[v6]:port`를 붙여도 클라이언트
+  주소를 읽는다. 전에는 그런 프록시 뒤의 모든 사용자가 프록시 주소 하나의
+  로그인 한도를 함께 썼다.
 
 ## [0.1.0] - 2026-10-04
 
@@ -99,5 +125,6 @@
 - 업로드 슬롯을 먼저 얻고 세그먼트를 읽어 힙 사용량이 채널 수가 아니라 동시
   업로드 수에 비례한다. 재연결 중에도 정체 지표가 갱신된다.
 
-[Unreleased]: https://github.com/jeonghun-app/transmux/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jeonghun-app/transmux/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/jeonghun-app/transmux/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jeonghun-app/transmux/releases/tag/v0.1.0

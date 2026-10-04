@@ -212,6 +212,9 @@ func TestPlaybackConfigValidatesProxiesAndFreeSpace(t *testing.T) {
 		"hostname":      func(c *Config) { c.Auth.TrustedProxies = []string{"proxy.internal/32"} },
 		"free too low":  func(c *Config) { c.Export.MinFreeBytes = 1 << 20 },
 		"free disabled": func(c *Config) { c.Export.MinFreeBytes = 0 },
+		"index shorter than retention": func(c *Config) {
+			c.Retention.Enabled, c.Retention.Days, c.Index.Days = true, 30, 29
+		},
 	} {
 		bad := cfg
 		change(&bad)
@@ -221,6 +224,7 @@ func TestPlaybackConfigValidatesProxiesAndFreeSpace(t *testing.T) {
 	}
 	good := cfg
 	good.Auth.TrustedProxies = []string{"10.0.0.0/8", "fd00::/8"}
+	good.Retention.Enabled, good.Retention.Days, good.Index.Days = true, 30, 30
 	if err := good.Validate(); err != nil {
 		t.Fatal(err)
 	}
