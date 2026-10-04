@@ -8,8 +8,13 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/netip"
 	"os"
 	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -52,10 +57,11 @@ type loginUser struct {
 }
 
 type Auth struct {
-	cfg   AuthConfig
-	key   []byte
-	users map[string]loginUser
-	dummy loginUser
+	cfg     AuthConfig
+	key     []byte
+	users   map[string]loginUser
+	dummy   loginUser
+	proxies []netip.Prefix
 }
 
 func NewAuth(cfg AuthConfig) (*Auth, error) {
@@ -63,7 +69,11 @@ func NewAuth(cfg AuthConfig) (*Auth, error) {
 	if len(key) < 32 {
 		return nil, fmt.Errorf("%s must contain at least 32 bytes of random signing material", cfg.SecretEnv)
 	}
-	a := &Auth{cfg: cfg, key: key, users: make(map[string]loginUser)}
+	proxies, err := parseTrustedProxies(cfg.TrustedProxies)
+	if err != nil {
+		return nil, err
+	}
+	a := &Auth{cfg: cfg, key: key, users: make(map[string]loginUser), proxies: proxies}
 	for _, u := range cfg.Users {
 		password := os.Getenv(u.PasswordEnv)
 		if len(password) < 12 || len(password) > 1024 {
@@ -168,4 +178,109 @@ func (a *Auth) Media(actor *Claims, center, camera, mode string, start, end time
 	}
 	token, err := a.sign(c)
 	return token, c, err
+}
+
+const (
+	// One client may try several accounts (an operator desk, an office NAT),
+	// while guessing against one account is bounded independently of how many
+	// addresses an attacker controls.
+	loginClientLimit  = 30
+	loginAccountLimit = 10
+	loginWindow       = time.Minute
+	loginTrackedKeys  = 10000
+)
+
+type loginRate struct {
+	At    time.Time
+	Count int
+}
+
+// loginLimiter is a fixed-window attempt counter. When the table is full a
+// new key is refused rather than evicting a key that is being limited.
+type loginLimiter struct {
+	mu      sync.Mutex
+	limit   int
+	entries map[string]loginRate
+}
+
+func newLoginLimiter(limit int) *loginLimiter {
+	return &loginLimiter{limit: limit, entries: make(map[string]loginRate)}
+}
+
+func (l *loginLimiter) allow(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for k, value := range l.entries {
+		if now.Sub(value.At) >= loginWindow {
+			delete(l.entries, k)
+		}
+	}
+	entry, exists := l.entries[key]
+	if !exists && len(l.entries) >= loginTrackedKeys {
+		return false
+	}
+	if entry.At.IsZero() {
+		entry.At = now
+	}
+	entry.Count++
+	l.entries[key] = entry
+	return entry.Count <= l.limit
+}
+
+func parseTrustedProxies(values []string) ([]netip.Prefix, error) {
+	prefixes := make([]netip.Prefix, 0, len(values))
+	for _, value := range values {
+		prefix, err := netip.ParsePrefix(value)
+		if err != nil {
+			return nil, fmt.Errorf("auth.trusted_proxies entries must be CIDRs such as 10.0.0.0/8")
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
+}
+
+func (a *Auth) trusted(addr netip.Addr) bool {
+	for _, prefix := range a.proxies {
+		if prefix.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// ClientKey identifies the login client for rate limiting. X-Forwarded-For
+// is honoured only when the connection comes from a configured proxy, and is
+// walked from the right so a client cannot choose its key by prepending
+// addresses. IPv6 clients are grouped by /64, the smallest routed allocation.
+func (a *Auth) ClientKey(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return "remote:" + host
+	}
+	addr = addr.Unmap().WithZone("")
+	if a.trusted(addr) {
+		var hops []string
+		for _, value := range r.Header.Values("X-Forwarded-For") {
+			hops = append(hops, strings.Split(value, ",")...)
+		}
+		for n := len(hops) - 1; n >= 0; n-- {
+			hop, err := netip.ParseAddr(strings.TrimSpace(hops[n]))
+			if err != nil {
+				break
+			}
+			addr = hop.Unmap().WithZone("")
+			if !a.trusted(addr) {
+				break
+			}
+		}
+	}
+	if addr.Is6() {
+		prefix, _ := addr.Prefix(64)
+		return prefix.String()
+	}
+	return addr.String()
 }

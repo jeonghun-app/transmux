@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -42,20 +41,16 @@ type Server struct {
 	roster         []config.StaticCamera
 	rosterETag     string
 	rosterAt       time.Time
-	loginMu        sync.Mutex
-	loginRates     map[string]loginRate
+	loginClients   *loginLimiter
+	loginAccounts  *loginLimiter
 	retentionMu    sync.Mutex
 	retention      RetentionStatus
 	background     context.Context
 	stopBackground context.CancelFunc
 	jobsMu         sync.Mutex
 	jobs           map[string]*exportJob
+	exportReserved int64 // bytes held by running export jobs, guarded by jobsMu
 	jobsWG         sync.WaitGroup
-}
-
-type loginRate struct {
-	At    time.Time
-	Count int
 }
 
 func NewServer(cfg Config, ingest config.Config, store storage.MediaStore, index *recording.Index,
@@ -101,7 +96,8 @@ func NewServer(cfg Config, ingest config.Config, store storage.MediaStore, index
 	s := &Server{cfg: cfg, ingest: ingest, store: store, index: index, auth: auth, log: log,
 		provider: provider, mediaSlots: make(chan struct{}, cfg.MaxStreams),
 		exportSlots: make(chan struct{}, cfg.Export.Workers), loginSlots: make(chan struct{}, 2),
-		querySlots: make(chan struct{}, 8), loginRates: make(map[string]loginRate)}
+		querySlots: make(chan struct{}, 8), loginClients: newLoginLimiter(loginClientLimit),
+		loginAccounts: newLoginLimiter(loginAccountLimit)}
 	s.background, s.stopBackground = context.WithCancel(context.Background())
 	s.jobs = make(map[string]*exportJob)
 	if err := s.cleanupOrphanedExports(); err != nil {
@@ -239,31 +235,14 @@ func (s *Server) headers(next http.Handler) http.Handler {
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	now := time.Now()
-	s.loginMu.Lock()
-	for key, value := range s.loginRates {
-		if now.Sub(value.At) >= time.Minute {
-			delete(s.loginRates, key)
-		}
-	}
-	entry := s.loginRates[host]
-	if entry.At.IsZero() {
-		entry.At = now
-	}
-	entry.Count++
-	_, exists := s.loginRates[host]
-	allowed := entry.Count <= 10 && (exists || len(s.loginRates) < 10000)
-	if exists || len(s.loginRates) < 10000 {
-		s.loginRates[host] = entry
-	}
-	s.loginMu.Unlock()
-	if !allowed || !take(s.loginSlots) {
+	limited := func() {
 		w.Header().Set("Retry-After", "60")
 		fail(w, http.StatusTooManyRequests, "login_rate_limit", "Wait a minute before signing in again.")
+	}
+	if !s.loginClients.allow(s.auth.ClientKey(r), time.Now()) {
+		limited()
 		return
 	}
-	defer release(s.loginSlots)
 	var body struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -271,6 +250,17 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &body) {
 		return
 	}
+	// Unknown names are counted too, so the limit does not reveal which
+	// accounts exist. Login rejects over-long names before hashing.
+	if len(body.Username) <= 64 && !s.loginAccounts.allow(body.Username, time.Now()) {
+		limited()
+		return
+	}
+	if !take(s.loginSlots) {
+		limited()
+		return
+	}
+	defer release(s.loginSlots)
 	token, claims, err := s.auth.Login(body.Username, body.Password)
 	if err != nil {
 		fail(w, http.StatusUnauthorized, "invalid_credentials", "Username or password is incorrect.")

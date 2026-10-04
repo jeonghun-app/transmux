@@ -17,46 +17,69 @@ var (
 	ErrSessionCapacity = errors.New("recording session capacity reached")
 )
 
+// SnapshotEntry is one playback session's immutable recording view.
+type SnapshotEntry struct {
+	ID       string
+	Expires  time.Time
+	Segments []hls.PublishedSegment
+}
+
 // Snapshot makes VOD immutable for a playback session. Backfill or a delayed
 // upload may improve the index while a viewer is watching; it must not change
 // that viewer's ENDLIST or give the token access to newly discovered objects.
 func (i *Index) Snapshot(id string, expires time.Time, segments []hls.PublishedSegment, capacity int) error {
-	body := hls.RenderRecording(segments)
+	return i.Snapshots([]SnapshotEntry{{ID: id, Expires: expires, Segments: segments}}, capacity)
+}
+
+// Snapshots stores every entry in one transaction. A multi-camera request
+// either receives all of its sessions or consumes no session capacity, so a
+// partial failure cannot leave unusable snapshots holding slots until expiry.
+func (i *Index) Snapshots(entries []SnapshotEntry, capacity int) error {
+	bodies := make([][]byte, len(entries))
+	for n, entry := range entries {
+		bodies[n] = hls.RenderRecording(entry.Segments)
+	}
 	return i.db.Update(func(tx *bolt.Tx) error {
 		root, err := tx.CreateBucketIfNotExists(snapshotsBucket)
 		if err != nil {
 			return err
 		}
-		if root.Sequence() >= uint64(capacity) {
+		if root.Sequence()+uint64(len(entries)) > uint64(capacity) {
 			return ErrSessionCapacity
 		}
-		bucket, err := root.CreateBucket([]byte(id))
-		if err != nil {
-			return err
-		}
-		if err := root.SetSequence(root.Sequence() + 1); err != nil {
-			return err
-		}
-		stamp := make([]byte, 8)
-		binary.BigEndian.PutUint64(stamp, uint64(expires.Unix()))
-		if err := bucket.Put([]byte("_expires"), stamp); err != nil {
-			return err
-		}
-		if err := bucket.Put([]byte("_manifest"), body); err != nil {
-			return err
-		}
-		for _, s := range segments {
-			if err := bucket.Put([]byte(s.URI), []byte{1}); err != nil {
+		for n, entry := range entries {
+			if err := putSnapshot(root, entry, bodies[n]); err != nil {
 				return err
 			}
-			if s.InitURI != "" {
-				if err := bucket.Put([]byte(s.InitURI), []byte{1}); err != nil {
-					return err
-				}
+		}
+		return root.SetSequence(root.Sequence() + uint64(len(entries)))
+	})
+}
+
+func putSnapshot(root *bolt.Bucket, entry SnapshotEntry, body []byte) error {
+	bucket, err := root.CreateBucket([]byte(entry.ID))
+	if err != nil {
+		return err
+	}
+	stamp := make([]byte, 8)
+	binary.BigEndian.PutUint64(stamp, uint64(entry.Expires.Unix()))
+	if err := bucket.Put([]byte("_expires"), stamp); err != nil {
+		return err
+	}
+	if err := bucket.Put([]byte("_manifest"), body); err != nil {
+		return err
+	}
+	for _, s := range entry.Segments {
+		if err := bucket.Put([]byte(s.URI), []byte{1}); err != nil {
+			return err
+		}
+		if s.InitURI != "" {
+			if err := bucket.Put([]byte(s.InitURI), []byte{1}); err != nil {
+				return err
 			}
 		}
-		return nil
-	})
+	}
+	return nil
 }
 
 func (i *Index) SnapshotManifest(id string) ([]byte, error) {

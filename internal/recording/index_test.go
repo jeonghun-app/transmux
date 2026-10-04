@@ -175,3 +175,37 @@ func TestRecordingSnapshotIsImmutableAndScopeIsExact(t *testing.T) {
 		t.Fatalf("cleanup did not release capacity: %v", err)
 	}
 }
+
+func TestRecordingSnapshotBatchIsAllOrNothing(t *testing.T) {
+	index, err := Open(filepath.Join(t.TempDir(), "index.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer index.Close()
+	day := time.Now().UTC().Format("2006/01/02")
+	segments := []hls.PublishedSegment{{URI: day + "/seg-000000001-1.ts", Duration: 4 * time.Second, ProgramDateTime: time.Now()}}
+	expires := time.Now().Add(time.Minute)
+	if err := index.Snapshot("held", expires, segments, 3); err != nil {
+		t.Fatal(err)
+	}
+	batch := []SnapshotEntry{{"a", expires, segments}, {"b", expires, segments}, {"c", expires, segments}}
+	if err := index.Snapshots(batch, 3); !errors.Is(err, ErrSessionCapacity) {
+		t.Fatalf("batch exceeded capacity: %v", err)
+	}
+	// A storage failure in the middle of a batch (duplicate ID) must also roll
+	// back the entries written before it.
+	if err := index.Snapshots([]SnapshotEntry{{"a", expires, segments}, {"held", expires, segments}}, 3); err == nil {
+		t.Fatal("duplicate snapshot accepted")
+	}
+	for _, id := range []string{"a", "b", "c"} {
+		if _, err := index.SnapshotManifest(id); err == nil {
+			t.Fatalf("failed batch left snapshot %s", id)
+		}
+	}
+	if err := index.Snapshots(batch[:2], 3); err != nil {
+		t.Fatalf("failed batches consumed capacity: %v", err)
+	}
+	if err := index.Snapshot("d", expires, segments, 3); !errors.Is(err, ErrSessionCapacity) {
+		t.Fatalf("batch did not count every session: %v", err)
+	}
+}

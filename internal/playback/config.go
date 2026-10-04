@@ -40,6 +40,9 @@ type AuthConfig struct {
 	AccessTTL  config.Duration `json:"access_ttl"`
 	SessionTTL config.Duration `json:"session_ttl"`
 	Users      []UserConfig    `json:"users"`
+	// TrustedProxies lists the CIDRs of reverse proxies whose X-Forwarded-For
+	// header identifies the login client. Empty means only RemoteAddr counts.
+	TrustedProxies []string `json:"trusted_proxies"`
 }
 
 type UserConfig struct {
@@ -66,6 +69,9 @@ type ExportConfig struct {
 	Timeout     config.Duration `json:"timeout"`
 	MaxBytes    int64           `json:"max_bytes"`
 	Workers     int             `json:"workers"`
+	// MinFreeBytes stays unreserved on the export volume, which also holds
+	// the recording index and session database in the reference deployment.
+	MinFreeBytes int64 `json:"min_free_bytes"`
 }
 
 type RetentionConfig struct {
@@ -90,7 +96,7 @@ func DefaultConfig() Config {
 			TempDir:     "/var/lib/transmux/playback/exports",
 			MaxDuration: config.Duration{Duration: 2 * time.Hour},
 			Timeout:     config.Duration{Duration: 10 * time.Minute},
-			MaxBytes:    4 << 30, Workers: 2,
+			MaxBytes:    4 << 30, Workers: 2, MinFreeBytes: 1 << 30,
 		},
 		Retention:  RetentionConfig{Days: 30, Interval: config.Duration{Duration: time.Hour}, Batch: 1000},
 		MaxStreams: 128, MaxSessions: 2000,
@@ -153,6 +159,12 @@ func (c Config) Validate() error {
 			return err
 		}
 	}
+	if len(c.Auth.TrustedProxies) > 64 {
+		return fmt.Errorf("auth.trusted_proxies exceeds 64 entries")
+	}
+	if _, err := parseTrustedProxies(c.Auth.TrustedProxies); err != nil {
+		return err
+	}
 	for _, origin := range c.AllowedOrigins {
 		if err := config.ValidateHTTPURL(origin, "allowed_origins"); err != nil {
 			return err
@@ -171,6 +183,9 @@ func (c Config) Validate() error {
 		c.Export.MaxBytes < 1<<20 || c.Export.MaxBytes > 100<<30 ||
 		c.Export.Workers < 1 || c.Export.Workers > 16 {
 		return fmt.Errorf("invalid export duration, timeout, byte limit or concurrency")
+	}
+	if c.Export.MinFreeBytes < 128<<20 || c.Export.MinFreeBytes > 1<<40 {
+		return fmt.Errorf("export.min_free_bytes must be 128MiB..1TiB")
 	}
 	if c.Retention.Days < 1 || c.Retention.Days > 365 ||
 		c.Retention.Interval.Duration < time.Minute || c.Retention.Interval.Duration > 24*time.Hour ||

@@ -133,7 +133,11 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request, actor *Cl
 		}
 		ready = append(ready, entry)
 	}
+	// Sign every session first and persist all recording snapshots in one
+	// transaction, so a later failure cannot strand snapshots for streams the
+	// caller never receives.
 	streams := make([]sessionView, 0, len(ready))
+	snapshots := make([]recording.SnapshotEntry, 0, len(ready))
 	for _, entry := range ready {
 		token, claims, err := s.auth.Media(actor, req.CenterID, entry.id, req.Mode, entry.start, req.End)
 		if err != nil {
@@ -144,20 +148,24 @@ func (s *Server) createSession(w http.ResponseWriter, r *http.Request, actor *Cl
 			URL: strings.TrimSuffix(s.cfg.PublicURL, "/") + "/media/" + token + "/" +
 				req.CenterID + "/" + entry.id + "/index.m3u8"}
 		if req.Mode == "recording" {
-			if err := s.index.Snapshot(claims.ID, claims.ExpiresAt.Time, entry.segments, s.cfg.MaxSessions); err != nil {
-				if errors.Is(err, recording.ErrSessionCapacity) {
-					fail(w, http.StatusTooManyRequests, "session_capacity", "Recording session capacity reached. Try again later.")
-				} else {
-					s.unavailable(w, "store recording session", err)
-				}
-				return
-			}
+			snapshots = append(snapshots, recording.SnapshotEntry{ID: claims.ID,
+				Expires: claims.ExpiresAt.Time, Segments: entry.segments})
 			start := entry.segments[0].ProgramDateTime
 			last := entry.segments[len(entry.segments)-1]
 			end := last.ProgramDateTime.Add(last.Duration)
 			view.Start, view.End, view.Segments = &start, &end, len(entry.segments)
 		}
 		streams = append(streams, view)
+	}
+	if len(snapshots) > 0 {
+		if err := s.index.Snapshots(snapshots, s.cfg.MaxSessions); err != nil {
+			if errors.Is(err, recording.ErrSessionCapacity) {
+				fail(w, http.StatusTooManyRequests, "session_capacity", "Recording session capacity reached. Try again later.")
+			} else {
+				s.unavailable(w, "store recording session", err)
+			}
+			return
+		}
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"mode": req.Mode, "streams": streams})
 }

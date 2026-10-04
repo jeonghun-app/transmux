@@ -74,6 +74,23 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request, actor *Claims) {
 		s.unavailable(w, "create export job", err)
 		return
 	}
+	planCtx, planCancel := context.WithTimeout(r.Context(), 20*time.Second)
+	plan, err := s.planExport(planCtx, req)
+	planCancel()
+	if err != nil {
+		release(s.exportSlots)
+		switch {
+		case errors.Is(err, recording.ErrTooMany) || errors.Is(err, errClipSize):
+			fail(w, http.StatusUnprocessableEntity, "export_too_large", "This range exceeds the export size limit. Select a shorter range.")
+		case errors.Is(err, errNoRecording):
+			fail(w, http.StatusNotFound, "recording_not_found", "No recording is indexed for this time range.")
+		case errors.Is(err, errFormatChanged):
+			fail(w, http.StatusConflict, "recording_format_changed", "The recording format changes within this range. Select a range with one format.")
+		default:
+			s.unavailable(w, "plan export", err)
+		}
+		return
+	}
 	ctx, cancel := context.WithTimeout(s.background, s.cfg.Export.Timeout.Duration)
 	job := &exportJob{ID: claims.ID, Actor: actor.Subject, Request: req, State: "processing",
 		Expires: time.Now().Add(s.cfg.Export.Timeout.Duration + time.Hour), Cancel: cancel}
@@ -87,6 +104,18 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request, actor *Claims) {
 		fail(w, http.StatusTooManyRequests, "export_capacity", "Export storage capacity reached. Remove old exports or try later.")
 		return
 	}
+	if err := s.reserveExportSpace(plan.reserve); err != nil {
+		s.jobsMu.Unlock()
+		cancel()
+		release(s.exportSlots)
+		if errors.Is(err, errExportSpace) {
+			w.Header().Set("Retry-After", "60")
+			fail(w, http.StatusInsufficientStorage, "export_storage_full", "Not enough disk space for this export. Wait for other exports to finish or remove old exports.")
+		} else {
+			s.unavailable(w, "check export disk space", err)
+		}
+		return
+	}
 	s.jobs[job.ID] = job
 	s.jobsWG.Add(1)
 	s.jobsMu.Unlock()
@@ -94,8 +123,10 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request, actor *Claims) {
 		defer s.jobsWG.Done()
 		defer cancel()
 		defer release(s.exportSlots)
-		result, err := s.buildClip(ctx, req)
+		result, err := s.buildClip(ctx, req, plan)
 		s.jobsMu.Lock()
+		// The finished clip is now visible to Statfs; scratch input is gone.
+		s.exportReserved -= plan.reserve
 		if job.State == "cancelled" {
 			s.jobsMu.Unlock()
 			if result.Directory != "" {
@@ -106,7 +137,7 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request, actor *Claims) {
 		if err != nil {
 			job.State = "failed"
 			job.Error = "export_failed"
-			if errors.Is(err, recording.ErrTooMany) || errors.Is(err, errClipSize) {
+			if errors.Is(err, errClipSize) {
 				job.Error = "export_too_large"
 			} else if ctx.Err() != nil {
 				job.Error = "export_timeout"
@@ -258,37 +289,72 @@ func (s *Server) pruneExports(now time.Time, all bool) {
 	}
 }
 
-var errClipSize = errors.New("export exceeds size limit")
+var (
+	errClipSize      = errors.New("export exceeds size limit")
+	errNoRecording   = errors.New("no recording indexed for this range")
+	errFormatChanged = errors.New("recording format changed within the range")
+	errExportSpace   = errors.New("insufficient export disk space")
+)
 
-func (s *Server) buildClip(ctx context.Context, req exportRequest) (clip, error) {
+type exportPlan struct {
+	segments []hls.PublishedSegment
+	// reserve is the peak scratch space: the copied inputs and the remuxed
+	// output together, with headroom for the +faststart pass.
+	reserve int64
+}
+
+func (s *Server) planExport(ctx context.Context, req exportRequest) (exportPlan, error) {
 	records, err := s.index.Query(ctx, req.CenterID, req.CameraID, req.Start, req.End, maxPlaybackSegments)
 	if err != nil {
-		return clip{}, err
+		return exportPlan{}, err
 	}
 	if len(records) == 0 {
-		return clip{}, fmt.Errorf("no recording indexed for this range")
+		return exportPlan{}, errNoRecording
 	}
 	segments, err := recording.Playlist(records)
 	if err != nil {
-		return clip{}, err
+		return exportPlan{}, fmt.Errorf("%w: %s", errFormatChanged, err.Error())
 	}
 	var total int64
 	for _, segment := range segments {
 		if segment.Bytes <= 0 || segment.Bytes > s.cfg.Export.MaxBytes-total {
-			return clip{}, errClipSize
+			return exportPlan{}, errClipSize
 		}
 		total += segment.Bytes
 	}
+	return exportPlan{segments: segments, reserve: 3 * total}, nil
+}
+
+// reserveExportSpace admits a job only if the volume can hold it together
+// with every running job's reservation and the configured free-space floor.
+// Statfs alone is not enough: concurrent jobs see the same free space before
+// any of them has written. The caller holds jobsMu.
+func (s *Server) reserveExportSpace(reserve int64) error {
 	if err := os.MkdirAll(s.cfg.Export.TempDir, 0o750); err != nil {
-		return clip{}, err
+		return err
 	}
+	available, err := diskAvailable(s.cfg.Export.TempDir)
+	if err != nil {
+		return err
+	}
+	if available < uint64(s.exportReserved)+uint64(reserve)+uint64(s.cfg.Export.MinFreeBytes) {
+		return errExportSpace
+	}
+	s.exportReserved += reserve
+	return nil
+}
+
+// diskAvailable is a variable so tests can model a nearly full volume.
+var diskAvailable = func(dir string) (uint64, error) {
 	var disk syscall.Statfs_t
-	if err := syscall.Statfs(s.cfg.Export.TempDir, &disk); err != nil {
-		return clip{}, err
+	if err := syscall.Statfs(dir, &disk); err != nil {
+		return 0, err
 	}
-	if uint64(disk.Bavail)*uint64(disk.Bsize) < uint64(3*total+(128<<20)) {
-		return clip{}, fmt.Errorf("insufficient export disk space")
-	}
+	return uint64(disk.Bavail) * uint64(disk.Bsize), nil
+}
+
+func (s *Server) buildClip(ctx context.Context, req exportRequest, plan exportPlan) (clip, error) {
+	segments := plan.segments
 	dir, err := os.MkdirTemp(s.cfg.Export.TempDir, "clip-"+s.index.Identity()+"-")
 	if err != nil {
 		return clip{}, err
