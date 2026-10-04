@@ -3,7 +3,7 @@
 # ---- build ----------------------------------------------------------------
 # The compiler always runs on the builder's native platform and cross-compiles
 # for the target, so a multi-arch build does not run Go under emulation.
-FROM --platform=$BUILDPLATFORM golang:1.26.8-alpine3.23 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.1-alpine3.23 AS build
 WORKDIR /src
 RUN apk add --no-cache git
 COPY go.mod go.sum ./
@@ -22,7 +22,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -trimpath \
 # ---- test -----------------------------------------------------------------
 # Built with --target test. ffmpeg is present so the integration tests can
 # generate a real H.264 stream and probe the resulting segments.
-FROM golang:1.26.8-alpine3.23 AS test
+FROM golang:1.27.1-alpine3.23 AS test
 WORKDIR /src
 RUN apk add --no-cache ffmpeg gcc musl-dev
 COPY go.mod go.sum ./
