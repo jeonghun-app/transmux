@@ -53,9 +53,13 @@
   `retention.days` 이상이어야 한다. 인덱스는 `index.days`보다 오래된 날짜를
   정리하므로, 더 짧으면 보존 중인 녹화가 조회되지 않는다. 기존 설정이 이 조건을
   어기면 `playbackd`가 기동 시 오류를 낸다. `index.days`를 늘린다.
+- **호환성:** 녹화 인덱스가 이제 `index.days`보다 오래된 날짜를 정리한다
+  (`retention.enabled`와 무관). 전에는 한 번 인덱싱된 녹화가 계속 남았다.
+  S3 Lifecycle로 더 오래 보관하는 녹화를 조회해야 하면, 업그레이드 전에
+  `index.days`를 필요한 조회 기간 이상으로 늘린다.
 - 로컬 Compose 스택(solution·PoC)의 S3 서버를 MinIO에서 RustFS 1.0.1로 바꿨다.
   MinIO 공개 이미지를 더 이상 익명으로 받을 수 없기 때문이다. 서비스 이름은
-  `s3`, 예제 설정의 endpoint는 `http://s3:9000`, 저장 볼륨은 `s3-data`다.
+  `s3`, 예제 설정의 endpoint는 `http://s3:9000`, solution 스택의 저장 볼륨은 `s3-data`다.
   `.env.solution`에는 `TRANSMUX_S3_SECRET_KEY`가 자동으로 추가된다. 이전 로컬
   녹화는 새 스택에서 보이지 않는다(정리 방법은 `docs/solution.md`).
 - 로그인 제한의 최종 정책: 실제 계정과 존재하지 않는 이름(비밀 키 HMAC으로 고정
