@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/netip"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,11 +108,8 @@ func TestConcurrentExportsReserveDiskSpace(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	f.app.jobsMu.Lock()
-	reserved := f.app.exportReserved
-	f.app.jobsMu.Unlock()
-	if reserved != 0 {
-		t.Fatalf("finished export kept %d reserved bytes", reserved)
+	if n := f.reservations(); n != 0 {
+		t.Fatalf("finished export kept %d reservations", n)
 	}
 	resp, raw = f.request(t, "POST", "/v1/exports", token, req, nil)
 	if resp.StatusCode != 202 {
@@ -158,7 +158,7 @@ func TestLoginLimitsAccountsAndClientsSeparately(t *testing.T) {
 		t.Fatalf("another user behind the proxy was blocked: %d", status)
 	}
 	// Guessing one account from many addresses is still bounded.
-	for n := 1; n < loginAccountLimit; n++ {
+	for n := 1; n <= loginAccountLimit; n++ {
 		if status := login(netip.AddrFrom4([4]byte{198, 51, 100, byte(n)}).String(), "admin", "wrong-password"); status != 401 {
 			t.Fatalf("guess %d: %d", n, status)
 		}
@@ -223,5 +223,168 @@ func TestPlaybackConfigValidatesProxiesAndFreeSpace(t *testing.T) {
 	good.Auth.TrustedProxies = []string{"10.0.0.0/8", "fd00::/8"}
 	if err := good.Validate(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func (f *fixture) reservations() int {
+	f.app.jobsMu.Lock()
+	defer f.app.jobsMu.Unlock()
+	return len(f.app.exportSpace)
+}
+
+func (f *fixture) waitReservations(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for f.reservations() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("reservations: got %d, want %d", f.reservations(), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestExportReservationIncludesInitializationFiles(t *testing.T) {
+	f := newFixture(t)
+	base := time.Now().Add(-time.Hour)
+	var last time.Time
+	for n := range 4 {
+		// Two segments per distinct initialization file.
+		initURI := fmt.Sprintf("%s/init-%064d.mp4", base.UTC().Format("2006/01/02"), n/2)
+		record := f.segment(t, uint64(n+1), base.Add(time.Duration(n)*4*time.Second), 4*time.Second, []byte("fragment"), initURI)
+		last = record.End()
+	}
+	plan, err := f.app.planExport(context.Background(), exportRequest{CenterID: "c1", CameraID: "cam1", Start: base, End: last})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := int64(4*len("fragment") + 2*maxInitBytes)
+	if want := 3*inputs + (4+2+2)*exportFileOverhead; plan.reserve != want {
+		t.Fatalf("reserve %d, want %d", plan.reserve, want)
+	}
+}
+
+func TestExportReservationCountsOnlyUnwrittenBytes(t *testing.T) {
+	f := newFixture(t)
+	f.app.cfg.Export.MinFreeBytes = 128 << 20
+	var available uint64
+	original := diskAvailable
+	diskAvailable = func(string) (uint64, error) { return available, nil }
+	t.Cleanup(func() { diskAvailable = original })
+	const reserve = 300 << 20
+	available = uint64(f.app.cfg.Export.MinFreeBytes) + reserve
+	f.app.jobsMu.Lock()
+	defer f.app.jobsMu.Unlock()
+	running, err := f.app.reserveExportSpace(reserve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The running job copied a third of its reservation, so Statfs now
+	// reports that much less; the same job must still fit alongside it.
+	running.written.Store(reserve / 3)
+	available = uint64(f.app.cfg.Export.MinFreeBytes) + reserve + reserve - reserve/3 - reserve/3
+	if _, err := f.app.reserveExportSpace(reserve); !errors.Is(err, errExportSpace) {
+		t.Fatalf("over-committed volume admitted: %v", err)
+	}
+	available += reserve / 3
+	if _, err := f.app.reserveExportSpace(reserve); err != nil {
+		t.Fatalf("written bytes were counted twice: %v", err)
+	}
+}
+
+func TestExportReservationIsReleasedOnCancelAndTimeout(t *testing.T) {
+	f := newFixture(t)
+	record := f.segment(t, 1, time.Now().Add(-time.Hour), 4*time.Second, []byte("media"), "")
+	f.app.store = blockingStore{f.app.store, make(chan struct{})}
+	token := f.token(t, allPermissions())
+	req := exportRequest{CenterID: "c1", CameraID: "cam1", Start: record.Start, End: record.End()}
+	resp, raw := f.request(t, "POST", "/v1/exports", token, req, nil)
+	if resp.StatusCode != 202 {
+		t.Fatalf("export: %d %s", resp.StatusCode, raw)
+	}
+	var started struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &started); err != nil {
+		t.Fatal(err)
+	}
+	f.waitReservations(t, 1)
+	if resp, _ := f.request(t, "DELETE", "/v1/exports/"+started.ID, token, nil, nil); resp.StatusCode != 200 {
+		t.Fatal("cancel failed")
+	}
+	f.waitReservations(t, 0)
+	f.app.cfg.Export.Timeout = config.Duration{Duration: 50 * time.Millisecond}
+	resp, raw = f.request(t, "POST", "/v1/exports", token, req, nil)
+	if resp.StatusCode != 202 {
+		t.Fatalf("export: %d %s", resp.StatusCode, raw)
+	}
+	if err := json.Unmarshal(raw, &started); err != nil {
+		t.Fatal(err)
+	}
+	f.waitReservations(t, 0)
+	if _, raw = f.request(t, "GET", "/v1/exports/"+started.ID, token, nil, nil); !bytes.Contains(raw, []byte("export_timeout")) {
+		t.Fatalf("export did not time out: %s", raw)
+	}
+}
+
+func TestLoginAccountLimitIgnoresUnknownNamesAndSuccesses(t *testing.T) {
+	f := newFixture(t)
+	now := time.Now()
+	// An attacker fills the client table with fresh addresses.
+	for n := range loginTrackedKeys {
+		f.app.loginClients.allow(fmt.Sprintf("flood-%d", n), now)
+	}
+	login := func(username, password string) int {
+		t.Helper()
+		resp, _ := f.request(t, "POST", "/v1/login", "", map[string]string{"username": username, "password": password}, nil)
+		return resp.StatusCode
+	}
+	if status := login("admin", "test-only-password"); status != 200 {
+		t.Fatalf("full client table refused a new client: %d", status)
+	}
+	// Unknown names are bounded by the client limit only.
+	if status := login("no-such-user", strings.Repeat("x", 2000)); status != 401 {
+		t.Fatalf("unknown account: %d", status)
+	}
+	f.app.loginAccounts.mu.Lock()
+	tracked := len(f.app.loginAccounts.entries)
+	f.app.loginAccounts.mu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("unknown names or successes entered the account table: %d", tracked)
+	}
+	for n := 0; n < loginAccountLimit; n++ {
+		if status := login("admin", "test-only-password"); status != 200 {
+			t.Fatalf("successful sign-in %d was counted: %d", n, status)
+		}
+	}
+	f.app.loginClients.mu.Lock()
+	overflow := f.app.loginClients.entries[loginOverflowKey].Count
+	f.app.loginClients.mu.Unlock()
+	if overflow != 2+loginAccountLimit {
+		t.Fatalf("overflow bucket counted %d attempts", overflow)
+	}
+}
+
+func TestLoginOverflowBucketHasItsOwnLimit(t *testing.T) {
+	l := newLoginLimiter(1, 2)
+	now := time.Now()
+	for n := range loginTrackedKeys {
+		if !l.allow(fmt.Sprintf("k%d", n), now) {
+			t.Fatal("first attempt refused")
+		}
+	}
+	if !l.allow("new-1", now) || !l.allow("new-2", now) || l.allow("new-3", now) {
+		t.Fatal("overflow bucket limit not applied")
+	}
+	if l.allow("k1", now) {
+		t.Fatal("tracked key escaped its limit")
+	}
+	if !l.allow("k1", now.Add(loginWindow)) {
+		t.Fatal("expired entry was not reset")
+	}
+	if !l.allow("new-4", now.Add(loginWindow)) {
+		t.Fatal("new key refused after the window")
+	}
+	if _, tracked := l.entries["new-4"]; !tracked {
+		t.Fatal("expired entries were not reclaimed for a new key")
 	}
 }

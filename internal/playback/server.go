@@ -49,7 +49,7 @@ type Server struct {
 	stopBackground context.CancelFunc
 	jobsMu         sync.Mutex
 	jobs           map[string]*exportJob
-	exportReserved int64 // bytes held by running export jobs, guarded by jobsMu
+	exportSpace    map[*exportSpace]struct{} // running export reservations, guarded by jobsMu
 	jobsWG         sync.WaitGroup
 }
 
@@ -96,10 +96,11 @@ func NewServer(cfg Config, ingest config.Config, store storage.MediaStore, index
 	s := &Server{cfg: cfg, ingest: ingest, store: store, index: index, auth: auth, log: log,
 		provider: provider, mediaSlots: make(chan struct{}, cfg.MaxStreams),
 		exportSlots: make(chan struct{}, cfg.Export.Workers), loginSlots: make(chan struct{}, 2),
-		querySlots: make(chan struct{}, 8), loginClients: newLoginLimiter(loginClientLimit),
-		loginAccounts: newLoginLimiter(loginAccountLimit)}
+		querySlots: make(chan struct{}, 8), loginClients: newLoginLimiter(loginClientLimit, loginOverflowLimit),
+		loginAccounts: newLoginLimiter(loginAccountLimit, loginAccountLimit)}
 	s.background, s.stopBackground = context.WithCancel(context.Background())
 	s.jobs = make(map[string]*exportJob)
+	s.exportSpace = make(map[*exportSpace]struct{})
 	if err := s.cleanupOrphanedExports(); err != nil {
 		s.stopBackground()
 		return nil, err
@@ -250,9 +251,10 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &body) {
 		return
 	}
-	// Unknown names are counted too, so the limit does not reveal which
-	// accounts exist. Login rejects over-long names before hashing.
-	if len(body.Username) <= 64 && !s.loginAccounts.allow(body.Username, time.Now()) {
+	// Only configured accounts have an account budget; unknown names are
+	// bounded by the client limit alone and cannot fill the account table.
+	account := s.auth.Known(body.Username)
+	if account && s.loginAccounts.exhausted(body.Username, time.Now()) {
 		limited()
 		return
 	}
@@ -263,6 +265,9 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	defer release(s.loginSlots)
 	token, claims, err := s.auth.Login(body.Username, body.Password)
 	if err != nil {
+		if account {
+			s.loginAccounts.fail(body.Username, time.Now())
+		}
 		fail(w, http.StatusUnauthorized, "invalid_credentials", "Username or password is incorrect.")
 		return
 	}

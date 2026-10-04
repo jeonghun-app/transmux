@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -104,7 +105,8 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request, actor *Claims) {
 		fail(w, http.StatusTooManyRequests, "export_capacity", "Export storage capacity reached. Remove old exports or try later.")
 		return
 	}
-	if err := s.reserveExportSpace(plan.reserve); err != nil {
+	space, err := s.reserveExportSpace(plan.reserve)
+	if err != nil {
 		s.jobsMu.Unlock()
 		cancel()
 		release(s.exportSlots)
@@ -123,10 +125,11 @@ func (s *Server) export(w http.ResponseWriter, r *http.Request, actor *Claims) {
 		defer s.jobsWG.Done()
 		defer cancel()
 		defer release(s.exportSlots)
-		result, err := s.buildClip(ctx, req, plan)
+		result, err := s.buildClip(ctx, req, plan, space)
 		s.jobsMu.Lock()
-		// The finished clip is now visible to Statfs; scratch input is gone.
-		s.exportReserved -= plan.reserve
+		// Whether it finished, failed, timed out or was cancelled, the job's
+		// scratch input is gone and any retained clip is visible to Statfs.
+		delete(s.exportSpace, space)
 		if job.State == "cancelled" {
 			s.jobsMu.Unlock()
 			if result.Directory != "" {
@@ -296,12 +299,30 @@ var (
 	errExportSpace   = errors.New("insufficient export disk space")
 )
 
+const (
+	// maxInitBytes bounds one fMP4 initialization file, as download enforces.
+	maxInitBytes = 1 << 20
+	// exportFileOverhead covers per-file filesystem allocation (partial
+	// blocks, inodes, directory entries) for every scratch file of a job.
+	exportFileOverhead = 64 << 10
+)
+
 type exportPlan struct {
 	segments []hls.PublishedSegment
-	// reserve is the peak scratch space: the copied inputs and the remuxed
-	// output together, with headroom for the +faststart pass.
+	// reserve is the peak scratch space: the copied segments and distinct
+	// initialization files three times over (inputs, remuxed output and
+	// headroom for the +faststart pass), plus per-file allocation overhead.
 	reserve int64
 }
+
+// exportSpace is one running job's reservation. written counts the bytes the
+// job has already copied, which Statfs already reports as used.
+type exportSpace struct {
+	reserve int64
+	written atomic.Int64
+}
+
+func (e *exportSpace) outstanding() int64 { return max(0, e.reserve-e.written.Load()) }
 
 func (s *Server) planExport(ctx context.Context, req exportRequest) (exportPlan, error) {
 	records, err := s.index.Query(ctx, req.CenterID, req.CameraID, req.Start, req.End, maxPlaybackSegments)
@@ -316,32 +337,46 @@ func (s *Server) planExport(ctx context.Context, req exportRequest) (exportPlan,
 		return exportPlan{}, fmt.Errorf("%w: %s", errFormatChanged, err.Error())
 	}
 	var total int64
+	inits := map[string]bool{}
 	for _, segment := range segments {
 		if segment.Bytes <= 0 || segment.Bytes > s.cfg.Export.MaxBytes-total {
 			return exportPlan{}, errClipSize
 		}
 		total += segment.Bytes
+		if segment.InitURI != "" {
+			inits[segment.InitURI] = true
+		}
 	}
-	return exportPlan{segments: segments, reserve: 3 * total}, nil
+	inputs := total + int64(len(inits))*maxInitBytes
+	// Segments, initialization files, the playlist and the output clip.
+	files := int64(len(segments)+len(inits)) + 2
+	return exportPlan{segments: segments, reserve: 3*inputs + files*exportFileOverhead}, nil
 }
 
 // reserveExportSpace admits a job only if the volume can hold it together
-// with every running job's reservation and the configured free-space floor.
-// Statfs alone is not enough: concurrent jobs see the same free space before
-// any of them has written. The caller holds jobsMu.
-func (s *Server) reserveExportSpace(reserve int64) error {
+// with what running jobs have reserved but not yet written, and still keep
+// the configured free-space floor. Statfs alone is not enough: concurrent
+// jobs see the same free space before any of them has written. Only copied
+// input is subtracted; output bytes stay reserved, which errs towards
+// refusing. The caller holds jobsMu.
+func (s *Server) reserveExportSpace(reserve int64) (*exportSpace, error) {
 	if err := os.MkdirAll(s.cfg.Export.TempDir, 0o750); err != nil {
-		return err
+		return nil, err
 	}
 	available, err := diskAvailable(s.cfg.Export.TempDir)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if available < uint64(s.exportReserved)+uint64(reserve)+uint64(s.cfg.Export.MinFreeBytes) {
-		return errExportSpace
+	need := uint64(reserve) + uint64(s.cfg.Export.MinFreeBytes)
+	for space := range s.exportSpace {
+		need += uint64(space.outstanding())
 	}
-	s.exportReserved += reserve
-	return nil
+	if available < need {
+		return nil, errExportSpace
+	}
+	space := &exportSpace{reserve: reserve}
+	s.exportSpace[space] = struct{}{}
+	return space, nil
 }
 
 // diskAvailable is a variable so tests can model a nearly full volume.
@@ -353,7 +388,7 @@ var diskAvailable = func(dir string) (uint64, error) {
 	return uint64(disk.Bavail) * uint64(disk.Bsize), nil
 }
 
-func (s *Server) buildClip(ctx context.Context, req exportRequest, plan exportPlan) (clip, error) {
+func (s *Server) buildClip(ctx context.Context, req exportRequest, plan exportPlan, space *exportSpace) (clip, error) {
 	segments := plan.segments
 	dir, err := os.MkdirTemp(s.cfg.Export.TempDir, "clip-"+s.index.Identity()+"-")
 	if err != nil {
@@ -371,7 +406,7 @@ func (s *Server) buildClip(ctx context.Context, req exportRequest, plan exportPl
 	for n, segment := range segments {
 		name := fmt.Sprintf("segment-%06d%s", n, path.Ext(segment.URI))
 		key := path.Join(s.ingest.Storage.KeyPrefix, req.CenterID, req.CameraID, segment.URI)
-		size, err := s.download(ctx, key, filepath.Join(dir, name), remaining)
+		size, err := s.download(ctx, key, filepath.Join(dir, name), remaining, &space.written)
 		if err != nil {
 			return clip{}, err
 		}
@@ -381,7 +416,7 @@ func (s *Server) buildClip(ctx context.Context, req exportRequest, plan exportPl
 			if !exists {
 				initName = fmt.Sprintf("init-%06d.mp4", len(inits))
 				key := path.Join(s.ingest.Storage.KeyPrefix, req.CenterID, req.CameraID, segment.InitURI)
-				size, err := s.download(ctx, key, filepath.Join(dir, initName), min(remaining, 1<<20))
+				size, err := s.download(ctx, key, filepath.Join(dir, initName), min(remaining, maxInitBytes), &space.written)
 				if err != nil {
 					return clip{}, err
 				}
@@ -466,7 +501,7 @@ func (s *Server) cleanupOrphanedExports() error {
 	return nil
 }
 
-func (s *Server) download(ctx context.Context, key, filename string, limit int64) (int64, error) {
+func (s *Server) download(ctx context.Context, key, filename string, limit int64, copied *atomic.Int64) (int64, error) {
 	stream, err := s.store.Open(ctx, key, "")
 	if err != nil {
 		return 0, err
@@ -493,6 +528,7 @@ func (s *Server) download(ctx context.Context, key, filename string, limit int64
 		if n > 0 {
 			count, err := file.Write(buffer[:n])
 			written += int64(count)
+			copied.Add(int64(count))
 			if err != nil {
 				return written, err
 			}

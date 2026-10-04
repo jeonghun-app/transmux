@@ -182,12 +182,16 @@ func (a *Auth) Media(actor *Claims, center, camera, mode string, start, end time
 
 const (
 	// One client may try several accounts (an operator desk, an office NAT),
-	// while guessing against one account is bounded independently of how many
-	// addresses an attacker controls.
-	loginClientLimit  = 30
-	loginAccountLimit = 10
-	loginWindow       = time.Minute
-	loginTrackedKeys  = 10000
+	// while failed guesses against one configured account are bounded
+	// independently of how many addresses an attacker controls. Reaching the
+	// account limit locks that account for the rest of its window; this is
+	// intended, and a successful sign-in is never counted.
+	loginClientLimit   = 30
+	loginAccountLimit  = 10
+	loginOverflowLimit = 300
+	loginWindow        = time.Minute
+	loginTrackedKeys   = 10000
+	loginOverflowKey   = "\x00overflow"
 )
 
 type loginRate struct {
@@ -195,36 +199,87 @@ type loginRate struct {
 	Count int
 }
 
-// loginLimiter is a fixed-window attempt counter. When the table is full a
-// new key is refused rather than evicting a key that is being limited.
+// loginLimiter is a fixed-window attempt counter. When the table is full of
+// live entries, new keys share one overflow bucket with its own limit, so
+// filling the table neither evicts a key that is being limited nor refuses
+// every newcomer outright.
 type loginLimiter struct {
-	mu      sync.Mutex
-	limit   int
-	entries map[string]loginRate
+	mu       sync.Mutex
+	limit    int
+	overflow int
+	entries  map[string]loginRate
 }
 
-func newLoginLimiter(limit int) *loginLimiter {
-	return &loginLimiter{limit: limit, entries: make(map[string]loginRate)}
+func newLoginLimiter(limit, overflow int) *loginLimiter {
+	return &loginLimiter{limit: limit, overflow: overflow, entries: make(map[string]loginRate)}
 }
 
-func (l *loginLimiter) allow(key string, now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// slot returns the key and limit that count an attempt for key. Expired
+// entries are reclaimed before a new key is sent to the overflow bucket.
+// The caller holds mu.
+func (l *loginLimiter) slot(key string, now time.Time) (string, int) {
+	if _, exists := l.entries[key]; exists || len(l.entries) < loginTrackedKeys {
+		return key, l.limit
+	}
 	for k, value := range l.entries {
 		if now.Sub(value.At) >= loginWindow {
 			delete(l.entries, k)
 		}
 	}
-	entry, exists := l.entries[key]
-	if !exists && len(l.entries) >= loginTrackedKeys {
-		return false
+	if len(l.entries) < loginTrackedKeys {
+		return key, l.limit
 	}
+	return loginOverflowKey, l.overflow
+}
+
+// current returns the live entry for key, treating an expired one as empty.
+func (l *loginLimiter) current(key string, now time.Time) loginRate {
+	entry := l.entries[key]
+	if now.Sub(entry.At) >= loginWindow {
+		return loginRate{}
+	}
+	return entry
+}
+
+func (l *loginLimiter) add(key string, now time.Time) int {
+	entry := l.current(key, now)
 	if entry.At.IsZero() {
 		entry.At = now
 	}
 	entry.Count++
 	l.entries[key] = entry
-	return entry.Count <= l.limit
+	return entry.Count
+}
+
+// allow counts the attempt and reports whether it is within the limit.
+func (l *loginLimiter) allow(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key, limit := l.slot(key, now)
+	return l.add(key, now) <= limit
+}
+
+// exhausted reports, without counting, whether key has no attempts left.
+func (l *loginLimiter) exhausted(key string, now time.Time) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key, limit := l.slot(key, now)
+	return l.current(key, now).Count >= limit
+}
+
+// fail counts one failed attempt against key.
+func (l *loginLimiter) fail(key string, now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key, _ = l.slot(key, now)
+	l.add(key, now)
+}
+
+// Known reports whether username is a configured login account. Only these
+// are tracked per account, so unknown names cannot fill the account table.
+func (a *Auth) Known(username string) bool {
+	_, exists := a.users[username]
+	return exists
 }
 
 func parseTrustedProxies(values []string) ([]netip.Prefix, error) {
