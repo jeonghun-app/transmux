@@ -36,7 +36,14 @@ var (
 	// capture day, in the lexical order an S3 listing uses. It lets a listed
 	// page be reconciled against the index without scanning a whole day.
 	objectsBucket = []byte("objects-v1")
+	// migrationsBucket holds, per partition still being backfilled into
+	// objectsBucket, the last segment record key already copied.
+	migrationsBucket = []byte("objects-migration-v1")
 )
+
+// migrationBatch bounds one backfill write transaction so that upgrading a
+// large index never blocks live indexing or session writes for long.
+const migrationBatch = 1000
 
 type Segment struct {
 	CenterID      string    `json:"center_id"`
@@ -104,7 +111,7 @@ func Open(filename string) (*Index, error) {
 	}
 	var id string
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{segmentsBucket, scansBucket, objectsBucket} {
+		for _, name := range [][]byte{segmentsBucket, scansBucket, objectsBucket, migrationsBucket} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -156,8 +163,8 @@ func objectValue(record []byte, indexed time.Time) []byte {
 }
 
 // objectNames returns the object-name bucket of one partition. A partition
-// written before that bucket existed is backfilled from its segment records
-// with a zero index time, so every existing entry is eligible to reconcile.
+// written before that bucket existed is queued for a resumable backfill; see
+// migrateNames.
 func objectNames(tx *bolt.Tx, name []byte) (*bolt.Bucket, error) {
 	root := tx.Bucket(objectsBucket)
 	if bucket := root.Bucket(name); bucket != nil {
@@ -167,17 +174,59 @@ func objectNames(tx *bolt.Tx, name []byte) (*bolt.Bucket, error) {
 	if err != nil {
 		return nil, err
 	}
-	segments := tx.Bucket(segmentsBucket).Bucket(name)
-	if segments == nil {
-		return bucket, nil
+	if segments := tx.Bucket(segmentsBucket).Bucket(name); segments != nil {
+		if err := tx.Bucket(migrationsBucket).Put(name, []byte{}); err != nil {
+			return nil, err
+		}
 	}
-	return bucket, segments.ForEach(func(key, raw []byte) error {
-		var s Segment
-		if err := json.Unmarshal(raw, &s); err != nil {
+	return bucket, nil
+}
+
+// migrateNames copies at most migrationBatch existing segment records of one
+// partition into its object-name bucket, with a zero index time so every one
+// is eligible to reconcile. It reports whether the partition is complete.
+// Names already present were written by a later Put and are kept.
+func (i *Index) migrateNames(name []byte) (bool, error) {
+	done := false
+	err := i.db.Update(func(tx *bolt.Tx) error {
+		names, err := objectNames(tx, name)
+		if err != nil {
 			return err
 		}
-		return bucket.Put([]byte(s.URI), objectValue(key, time.Time{}))
+		progress := tx.Bucket(migrationsBucket).Get(name)
+		segments := tx.Bucket(segmentsBucket).Bucket(name)
+		if progress == nil || segments == nil {
+			done = true
+			return tx.Bucket(migrationsBucket).Delete(name)
+		}
+		c := segments.Cursor()
+		k, raw := c.First()
+		if len(progress) > 0 {
+			k, raw = c.Seek(progress)
+			if k != nil && bytes.Equal(k, progress) {
+				k, raw = c.Next()
+			}
+		}
+		var last []byte
+		for n := 0; k != nil && n < migrationBatch; k, raw = c.Next() {
+			var s Segment
+			if err := json.Unmarshal(raw, &s); err != nil {
+				return err
+			}
+			if names.Get([]byte(s.URI)) == nil {
+				if err := names.Put([]byte(s.URI), objectValue(k, time.Time{})); err != nil {
+					return err
+				}
+			}
+			last, n = bytes.Clone(k), n+1
+		}
+		if k == nil {
+			done = true
+			return tx.Bucket(migrationsBucket).Delete(name)
+		}
+		return tx.Bucket(migrationsBucket).Put(name, last)
 	})
+	return done, err
 }
 
 func (i *Index) Put(segments []Segment) error {
@@ -325,16 +374,20 @@ func (i *Index) Reconcile(center, camera string, day time.Time, after, upto stri
 		present[name] = true
 	}
 	before := uint64(max(0, listedAt.Add(-reconcileGrace).UnixMilli()))
+	name := partition(center, camera, day)
+	// Finish any backfill first, one short transaction per batch.
+	for done := false; !done; {
+		var err error
+		if done, err = i.migrateNames(name); err != nil {
+			return 0, err
+		}
+	}
 	removed := 0
 	err := i.db.Update(func(tx *bolt.Tx) error {
-		name := partition(center, camera, day)
 		segments := tx.Bucket(segmentsBucket).Bucket(name)
-		if segments == nil {
+		names := tx.Bucket(objectsBucket).Bucket(name)
+		if segments == nil || names == nil || tx.Bucket(migrationsBucket).Get(name) != nil {
 			return nil
-		}
-		names, err := objectNames(tx, name)
-		if err != nil {
-			return err
 		}
 		type entry struct{ name, record []byte }
 		var stale []entry
@@ -376,19 +429,26 @@ func (i *Index) Reconcile(center, camera string, day time.Time, after, upto stri
 	return removed, err
 }
 
-// Prune drops whole capture days before cutoff with their scan state. The
-// scanner no longer reconciles those days against S3, so keeping them would
-// list recordings that may be gone and grow the file without bound. At most
+// partitionExpired reports whether every segment a capture day can hold ended
+// by horizon. A day holds segments that start before its end, and a segment
+// lasts at most MaxSegmentDuration.
+func partitionExpired(day, horizon time.Time) bool {
+	return !midnight(day).AddDate(0, 0, 1).Add(MaxSegmentDuration).After(horizon)
+}
+
+// Prune drops whole capture days whose segments all ended by horizon, with
+// their scan state. The scanner no longer reconciles those days against S3,
+// so keeping them would list recordings that may be gone and grow the file
+// without bound. A segment ending after horizon is never dropped. At most
 // limit days are dropped per call to keep each write transaction small.
-func (i *Index) Prune(cutoff time.Time, limit int) (int, error) {
-	cutoff = midnight(cutoff)
+func (i *Index) Prune(horizon time.Time, limit int) (int, error) {
 	expired := func(name []byte) bool {
 		parts := strings.Split(string(name), "/")
 		if len(parts) != 3 || !config.ValidID(parts[0]) || !config.ValidID(parts[1]) {
 			return false
 		}
 		day, err := time.Parse("20060102", parts[2])
-		return err == nil && day.Before(cutoff)
+		return err == nil && partitionExpired(day, horizon)
 	}
 	var names [][]byte
 	err := i.db.View(func(tx *bolt.Tx) error {
@@ -416,8 +476,10 @@ func (i *Index) Prune(cutoff time.Time, limit int) (int, error) {
 					}
 				}
 			}
-			if err := tx.Bucket(scansBucket).Delete(name); err != nil {
-				return err
+			for _, root := range [][]byte{scansBucket, migrationsBucket} {
+				if err := tx.Bucket(root).Delete(name); err != nil {
+					return err
+				}
 			}
 		}
 		return nil

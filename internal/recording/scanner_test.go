@@ -13,6 +13,7 @@ import (
 	bolt "go.etcd.io/bbolt"
 
 	"github.com/jeonghun-app/transmux/internal/config"
+	"github.com/jeonghun-app/transmux/internal/hls"
 	"github.com/jeonghun-app/transmux/internal/storage"
 )
 
@@ -213,40 +214,95 @@ func TestReconcileKeepsEntriesIndexedAfterTheListingAndMigratesOldPartitions(t *
 	}
 }
 
-func TestPassPrunesDaysOutsideTheIndexWindow(t *testing.T) {
+func TestPruneNeverDropsSegmentsEndingInsideTheWindow(t *testing.T) {
+	index, store := scannerFixture(t)
+	// 30-day window evaluated at 2026-10-04 12:00Z: the horizon is
+	// 2026-09-04 12:00Z, not midnight of a calendar day.
+	horizon := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC).AddDate(0, 0, -30)
+	recent := recordingFixture(t, store, 1, horizon.Add(6*time.Hour), 4*time.Second)      // 29d18h ago
+	crossing := recordingFixture(t, store, 2, horizon.Add(-2*time.Second), 4*time.Second) // ends inside
+	previous := recordingFixture(t, store, 3, time.Date(2026, 9, 3, 23, 59, 58, 0, time.UTC), 4*time.Second)
+	older := recordingFixture(t, store, 4, time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC), 4*time.Second)
+	if err := index.Put([]Segment{recent, crossing, previous, older}); err != nil {
+		t.Fatal(err)
+	}
+	present := func(s Segment) bool {
+		_, err := index.Get("c1", "cam1", s.URI)
+		return err == nil
+	}
+	// Shortly after midnight the previous day may still hold a segment that
+	// ends after the horizon (up to MaxSegmentDuration), so it is kept.
+	if _, err := index.Prune(time.Date(2026, 9, 4, 0, 30, 0, 0, time.UTC), 64); err != nil {
+		t.Fatal(err)
+	}
+	if !present(previous) || present(older) {
+		t.Fatal("prune ignored the maximum segment length")
+	}
+	if _, err := index.Prune(horizon, 64); err != nil {
+		t.Fatal(err)
+	}
+	if !present(recent) || !present(crossing) || present(previous) {
+		t.Fatalf("prune at %v: recent=%v crossing=%v previous=%v", horizon, present(recent), present(crossing), present(previous))
+	}
+}
+
+func TestScannerPrunesIndependentlyAndLivePassDoesNotRevive(t *testing.T) {
 	ctx := context.Background()
 	index, store := scannerFixture(t)
 	today := time.Now().UTC().Truncate(24 * time.Hour)
-	oldDay, keptDay := today.AddDate(0, 0, -3), today.AddDate(0, 0, -2)
-	for n, day := range []time.Time{oldDay, keptDay} {
-		if err := index.Put([]Segment{recordingFixture(t, store, uint64(n+1), day.Add(time.Hour), 4*time.Second)}); err != nil {
-			t.Fatal(err)
-		}
+	stale := recordingFixture(t, store, 1, today.AddDate(0, 0, -5).Add(time.Hour), 4*time.Second)
+	kept := recordingFixture(t, store, 2, today.AddDate(0, 0, -2).Add(time.Hour), 4*time.Second)
+	// More expired days than one transaction drops: one call catches up.
+	var many []Segment
+	for n := range 200 {
+		s := recordingFixture(t, store, uint64(10+n), today.AddDate(0, 0, -10-n).Add(time.Hour), 4*time.Second)
+		many = append(many, s)
+	}
+	if err := index.Put(append([]Segment{stale, kept}, many...)); err != nil {
+		t.Fatal(err)
+	}
+	for _, day := range []time.Time{stale.Start, kept.Start} {
 		if err := index.SaveScan("c1", "cam1", day, ScanState{Complete: true, ScannedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// A scanned day with no recordings still has scan state to prune.
-	empty := today.AddDate(0, 0, -40)
+	empty := today.AddDate(0, 0, -40) // a scanned day without recordings
 	if err := index.SaveScan("c2", "cam2", empty, ScanState{Complete: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := index.SaveCursor("retention/c1/cam1", "archive/c1/cam1/x"); err != nil {
 		t.Fatal(err)
 	}
+	// A camera that stopped long ago still has its last manifest.
+	manifest := hls.RenderLive(hls.Live{Segments: []hls.PublishedSegment{{Sequence: stale.Sequence, URI: stale.URI,
+		ProgramDateTime: stale.Start, Duration: 4 * time.Second}}})
+	if _, err := store.Put(ctx, storage.Object{Key: "archive/c1/cam1/index.m3u8", Body: manifest}); err != nil {
+		t.Fatal(err)
+	}
 	identity := index.Identity()
+	cam := config.StaticCamera{CenterID: "c1", CameraID: "cam1"}
 	scanner := &Scanner{Index: index, Store: store, Prefix: "archive", Days: 3, Workers: 2,
-		Roster: func(context.Context) ([]config.StaticCamera, error) { return nil, nil },
+		Roster: func(context.Context) ([]config.StaticCamera, error) { return []config.StaticCamera{cam}, nil },
 		Log:    slog.New(slog.NewTextHandler(io.Discard, nil))}
+	scanner.Prune(ctx)
 	scanner.Pass(ctx)
-	if countIndexed(t, index, oldDay) != 0 || countIndexed(t, index, keptDay) != 1 {
-		t.Fatal("prune did not follow the index window")
+	scanner.LivePass(ctx)
+	if _, err := index.Get("c1", "cam1", stale.URI); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("stale day survived or was revived: %v", err)
+	}
+	if _, err := index.Get("c1", "cam1", kept.URI); err != nil {
+		t.Fatalf("day inside the window pruned: %v", err)
+	}
+	for _, s := range many {
+		if _, err := index.Get("c1", "cam1", s.URI); !errors.Is(err, storage.ErrNotFound) {
+			t.Fatalf("prune did not catch up: %s", s.URI)
+		}
 	}
 	for _, check := range []struct {
 		center, camera string
 		day            time.Time
 		want           bool
-	}{{"c1", "cam1", oldDay, false}, {"c1", "cam1", keptDay, true}, {"c2", "cam2", empty, false}} {
+	}{{"c1", "cam1", stale.Start, false}, {"c1", "cam1", kept.Start, true}, {"c2", "cam2", empty, false}} {
 		state, err := index.ScanState(check.center, check.camera, check.day)
 		if err != nil || state.Complete != check.want {
 			t.Fatalf("scan state %v: %+v %v", check.day, state, err)
@@ -266,5 +322,64 @@ func TestPassPrunesDaysOutsideTheIndexWindow(t *testing.T) {
 	defer reopened.Close()
 	if reopened.Identity() != identity {
 		t.Fatal("prune removed the index identity")
+	}
+}
+
+func TestObjectNameMigrationRunsInBoundedResumableBatches(t *testing.T) {
+	defer func(grace time.Duration) { reconcileGrace = grace }(reconcileGrace)
+	reconcileGrace = 0
+	index, store := scannerFixture(t)
+	day := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -2)
+	var records []Segment
+	for n := 1; n <= 2*migrationBatch+500; n++ {
+		records = append(records, recordingFixture(t, store, uint64(n), day.Add(time.Duration(n)*time.Second), time.Second))
+	}
+	if err := index.Put(records); err != nil {
+		t.Fatal(err)
+	}
+	name := partition("c1", "cam1", day)
+	// Model an index written before object names were tracked.
+	if err := index.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(objectsBucket).DeleteBucket(name)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	names := func() int {
+		n := 0
+		if err := index.db.View(func(tx *bolt.Tx) error {
+			if b := tx.Bucket(objectsBucket).Bucket(name); b != nil {
+				n = b.Stats().KeyN
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// A later write queues the partition instead of copying it inline.
+	late := recordingFixture(t, store, 99999, day.Add(23*time.Hour), time.Second)
+	if err := index.Put([]Segment{late}); err != nil {
+		t.Fatal(err)
+	}
+	if got := names(); got != 1 {
+		t.Fatalf("backfill ran inside a live write: %d names", got)
+	}
+	if done, err := index.migrateNames(name); err != nil || done || names() != 1+migrationBatch {
+		t.Fatalf("first batch: done=%v err=%v names=%d", done, err, names())
+	}
+	time.Sleep(5 * time.Millisecond)
+	listed := []string{late.URI}
+	for _, r := range records[1:] {
+		listed = append(listed, r.URI)
+	}
+	// Reconcile resumes the backfill, then finds the one missing object.
+	if n, err := index.Reconcile("c1", "cam1", day, "", "", listed, time.Now()); err != nil || n != 1 {
+		t.Fatalf("reconcile after migration: %d %v", n, err)
+	}
+	if got := names(); got != len(listed) {
+		t.Fatalf("migration incomplete: %d of %d", got, len(listed))
+	}
+	if _, err := index.Get("c1", "cam1", records[0].URI); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("unlisted legacy entry kept: %v", err)
 	}
 }
