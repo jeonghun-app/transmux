@@ -70,7 +70,8 @@ The operator interface is at `http://localhost:8090`. Passwords for `admin` and
 [solution guide](docs/solution.md#로컬-실행) for accounts, port configuration, and
 browser verification.
 The RustFS migration changes the storage volume name from `objects` to
-`s3-data`; existing local recordings are not visible in the new stack.
+`s3-data`; existing local recordings are not visible in the new stack (see the
+[solution guide](docs/solution.md#로컬-실행) to remove or keep them).
 `make solution-env` automatically adds `TRANSMUX_S3_SECRET_KEY` to an existing
 `.env.solution` if missing and also runs as part of `make solution-up`.
 

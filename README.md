@@ -62,7 +62,7 @@ make solution-down    # 중지; 녹화·설정 볼륨은 보존
 자동 생성된 `.env.solution`에 있다. 계정·포트 설정과 브라우저 검증은
 [솔루션 가이드](docs/solution.md#로컬-실행)를 참고한다.
 RustFS 전환으로 저장 볼륨 이름은 `objects`에서 `s3-data`로 바뀌며, 기존 로컬
-녹화는 새 스택에서 보이지 않는다. `make solution-env`는 기존 `.env.solution`에
+녹화는 새 스택에서 보이지 않는다(정리·보존 방법은 [솔루션 가이드](docs/solution.md#로컬-실행)). `make solution-env`는 기존 `.env.solution`에
 `TRANSMUX_S3_SECRET_KEY`가 없으면 자동으로 추가하며 `make solution-up`에서도 실행된다.
 
 개발 검사:

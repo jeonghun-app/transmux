@@ -27,7 +27,13 @@ make solution-verify
 이 파일은 Git과 Docker 빌드 컨텍스트에서 제외된다. 파일 권한은 `0600`이다.
 `make solution-down`은 컨테이너를 중지하되 녹화·카메라 목록·인덱스 볼륨을 보존한다.
 RustFS 전환으로 저장 볼륨 이름은 `objects`에서 `s3-data`로 바뀌며, 기존 로컬
-녹화는 새 스택에서 보이지 않는다.
+녹화는 새 스택에서 보이지 않는다. `make solution-up`은 `--remove-orphans`로
+이전 MinIO 컨테이너를 정리한다. 같은 Compose 프로젝트에서 이 파일에 정의되지
+않은 다른 서비스도 함께 제거된다. 이전 `transmux-solution_objects` 볼륨은 남는다.
+이전 녹화가 필요 없으면
+`docker volume rm transmux-solution_objects transmux-solution_playback-state`로
+이전 데이터와 재생 인덱스를 함께 지운다. 이전 녹화를 보존하려면 업그레이드 전에
+이전 버전에서 MP4로 내보낸다.
 
 모의 카메라는 다음 경로를 실제 RTSP로 전송한다.
 
