@@ -1,6 +1,6 @@
 # Local PoC stack. Nothing here is production configuration.
 #
-#   cam-shortgop ─┐                              ┌─ MinIO (S3 stand-in)
+#   cam-shortgop ─┐                              ┌─ RustFS (S3 stand-in)
 #   cam-longgop  ─┴─> MediaMTX (RTSP) ─> transmuxd ─┘
 #
 # The two fake cameras differ in keyframe interval on purpose: cam-shortgop
@@ -258,36 +258,47 @@ services:
       - rtsp://mediamtx:8554/cam-720p
     restart: unless-stopped
 
-  minio:
-    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
-    container_name: transmux-minio
-    command: server /data --console-address ":9001"
+  # S3-compatible stand-in. RustFS (Apache-2.0) pulls anonymously and
+  # implements the conditional writes the ownership protocol depends on. The
+  # "minio" alias keeps the endpoint in configs/poc.json working. The
+  # credentials match scripts/measure-*.sh, which join this network.
+  s3:
+    image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+    container_name: transmux-s3
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "127.0.0.1:9001:9001"
+      RUSTFS_ACCESS_KEY: minioadmin
+      RUSTFS_SECRET_KEY: minioadmin
+      RUSTFS_CONSOLE_ENABLE: "false"
+    networks:
+      default:
+        aliases: [minio]
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9000/health/ready"]
       interval: 3s
       timeout: 2s
       retries: 20
 
-  minio-init:
-    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
-    container_name: transmux-minio-init
+  s3-init:
+    image: rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
+    container_name: transmux-s3-init
     depends_on:
-      minio:
+      s3:
         condition: service_healthy
     entrypoint: ["/bin/sh", "-c"]
     command:
-      # Anonymous download is enabled so the verifier can fetch the playlist
+      # Anonymous GetObject is granted so the verifier can fetch the playlist
       # with plain HTTP. This is a test-harness convenience only; a real
-      # bucket stays private and is fronted by CloudFront with OAC.
+      # bucket stays private and is served through playbackd.
       - |
-        mc alias set local http://minio:9000 minioadmin minioadmin &&
-        mc mb --ignore-existing local/transmux-poc &&
-        mc anonymous set download local/transmux-poc &&
+        set -eu
+        bucket=http://s3:9000/transmux-poc
+        s3() { curl -sS --user minioadmin:minioadmin --aws-sigv4 "aws:amz:us-east-1:s3" \
+                 -o /dev/null -w '%{http_code}' "$$@"; }
+        code=$$(s3 -I "$$bucket")
+        [ "$$code" = 200 ] || { code=$$(s3 -X PUT "$$bucket"); [ "$$code" = 200 ] || { echo "create bucket: HTTP $$code"; exit 1; }; }
+        printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::transmux-poc/*"]}]}' > /tmp/policy.json
+        code=$$(s3 -X PUT -T /tmp/policy.json "$$bucket?policy")
+        case "$$code" in 200|204) ;; *) echo "set bucket policy: HTTP $$code"; exit 1 ;; esac
         echo "bucket ready"
 
   transmuxd:
@@ -299,12 +310,12 @@ services:
     depends_on:
       mediamtx:
         condition: service_started
-      minio-init:
+      s3-init:
         condition: service_completed_successfully
     volumes:
       - ../configs/poc.json:/etc/transmux/config.json:ro
     environment:
-      # MinIO credentials. Production uses the ECS task role or EKS IRSA and
+      # Local S3 credentials. Production uses the ECS task role or EKS IRSA and
       # leaves these unset.
       AWS_ACCESS_KEY_ID: minioadmin
       AWS_SECRET_ACCESS_KEY: minioadmin

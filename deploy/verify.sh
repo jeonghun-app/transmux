@@ -13,7 +13,8 @@
 
 set -eu
 
-MINIO="${MINIO:-http://minio:9000}"
+# S3 is the object store endpoint; MINIO is still honoured for old callers.
+S3="${S3:-${MINIO:-http://s3:9000}}"
 BUCKET="${BUCKET:-transmux-poc}"
 API="${API:-http://transmuxd:8080}"
 CENTER="${CENTER:-center-01}"
@@ -50,7 +51,7 @@ ok "no credentials in /channels"
 
 for cam in $CAMERAS; do
   echo "== camera $cam =="
-  base="$MINIO/$BUCKET/$CENTER/$cam"
+  base="$S3/$BUCKET/$CENTER/$cam"
   manifest_url="$base/index.m3u8"
 
   manifest=$(wget -q -O- "$manifest_url") || fail "$cam: no manifest at $manifest_url"
@@ -90,9 +91,9 @@ for cam in $CAMERAS; do
 done
 
 echo "== 6. long-GOP camera really does produce longer segments =="
-short=$(wget -q -O- "$MINIO/$BUCKET/$CENTER/cam-shortgop/index.m3u8" \
+short=$(wget -q -O- "$S3/$BUCKET/$CENTER/cam-shortgop/index.m3u8" \
          | awk -F'[:,]' '/^#EXTINF:/ {if ($2+0 > m) m=$2+0} END {printf "%.3f", m}')
-long=$(wget -q -O- "$MINIO/$BUCKET/$CENTER/cam-longgop/index.m3u8" \
+long=$(wget -q -O- "$S3/$BUCKET/$CENTER/cam-longgop/index.m3u8" \
          | awk -F'[:,]' '/^#EXTINF:/ {if ($2+0 > m) m=$2+0} END {printf "%.3f", m}')
 echo "  shortgop longest=${short}s  longgop longest=${long}s"
 awk -v s="$short" -v l="$long" 'BEGIN{ if (l <= s) exit 1 }' \
