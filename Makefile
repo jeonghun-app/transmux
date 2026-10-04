@@ -17,7 +17,9 @@ DIST_PLATFORMS ?= linux/amd64 linux/arm64
 
 # VERSION and REVISION reach recipes only as environment variables and are
 # always quoted there; they are never pasted into shell code by make, so a
-# tag such as v1.0.0-`cmd` cannot run anything. CHECK_VERSION additionally
+# tag or git describe value such as v1.0.0-`cmd` cannot run anything. (A
+# VERSION= given on the make command line is still expanded by make itself,
+# so only pass trusted values there.) CHECK_VERSION additionally
 # limits VERSION to what a Go -X flag, a file name and (after mapping + to _)
 # a Docker tag can all carry.
 export VERSION REVISION

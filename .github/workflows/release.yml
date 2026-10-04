@@ -40,7 +40,10 @@ jobs:
       - id: tag
         name: validate tag
         run: |
-          re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'
+          # A prerelease identifier is a number without leading zeros or an
+          # alphanumeric string with at least one letter or hyphen.
+          id='(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)'
+          re="^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-${id}(\.${id})*)?$"
           if [[ ! "$GITHUB_REF_NAME" =~ $re ]]; then
             echo "::error::tag is not vMAJOR.MINOR.PATCH[-PRERELEASE]"
             exit 1
