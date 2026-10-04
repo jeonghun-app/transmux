@@ -61,6 +61,9 @@ make solution-down    # 중지; 녹화·설정 볼륨은 보존
 운영자 화면은 `http://localhost:8090`이다. `admin`과 `viewer`의 비밀번호는
 자동 생성된 `.env.solution`에 있다. 계정·포트 설정과 브라우저 검증은
 [솔루션 가이드](docs/solution.md#로컬-실행)를 참고한다.
+RustFS 전환으로 저장 볼륨 이름은 `objects`에서 `s3-data`로 바뀌며, 기존 로컬
+녹화는 새 스택에서 보이지 않는다. `make solution-env`는 기존 `.env.solution`에
+`TRANSMUX_S3_SECRET_KEY`가 없으면 자동으로 추가하며 `make solution-up`에서도 실행된다.
 
 개발 검사:
 
@@ -71,6 +74,8 @@ make vet           # 정적 검사
 make test          # 단위 테스트
 make race          # 동시성 검사
 make build         # 수집·재생 바이너리 빌드
+make dist          # 릴리스 묶음 생성
+make lint-actions  # 워크플로 수정 시 검사
 make vuln          # 모듈 무결성 및 도달 가능한 Go 취약점 검사
 make test-ffmpeg   # 실제 ffmpeg이 필요한 통합 테스트
 make image         # 런타임 이미지 빌드
@@ -79,7 +84,7 @@ make image         # 런타임 이미지 빌드
 기존 수집 전용 PoC와 용량 측정 구성도 유지한다.
 
 ```bash
-make poc-up        # 가짜 카메라 2대 + MediaMTX + transmuxd + MinIO
+make poc-up        # 가짜 카메라 2대 + MediaMTX + transmuxd + RustFS(S3 호환)
 make poc-up-capacity  # 위 + 용량 측정용 1080p/D1/720p 소스
 make poc-verify    # 종단 검증 (재생 가능성, 매니페스트 정합성)
 make poc-logs      # transmuxd 로그
@@ -87,7 +92,7 @@ make poc-down      # 정리
 ```
 
 `make poc-up`은 실제 IP 카메라와 실제 S3 없이 전체 파이프라인을 돌린다.
-MediaMTX가 카메라 역할을, MinIO가 S3 역할을 한다. 가짜 카메라 2대는
+MediaMTX가 카메라 역할을, RustFS(Apache-2.0, S3 호환)가 S3 역할을 한다. 가짜 카메라 2대는
 키프레임 간격이 다르다. `cam-shortgop`은 GOP 2초로 4초 목표를 지킬 수 있고,
 `cam-longgop`은 GOP 8초로 지킬 수 없다. 둘 다 정상 동작해야 한다.
 
@@ -132,7 +137,7 @@ playbackd -config /etc/transmux/playback.json -validate
 | `segment.max_gop_slack` | 누락 판정에 더하는 여유 | GOP가 긴 카메라를 고장으로 오인하지 않게 한다 |
 | `ffmpeg.stall_timeout` | 세그먼트 미생성 시 ffmpeg 종료 임계 | 버전 독립적인 주 단절 감지기 |
 | `ffmpeg.input_args` | `-i` 앞에 넣을 추가 인자 | 버전별 소켓 타임아웃 옵션을 넣는 자리 |
-| `storage.endpoint` / `force_path_style` | MinIO/LocalStack용 | 프로덕션에서는 비운다 |
+| `storage.endpoint` / `force_path_style` | RustFS 등 S3 호환 서버용 | AWS S3에서는 기본 설정을 사용한다 |
 | `storage.key_prefix` | 미디어·lease 객체의 접두사 | 앞뒤 `/`는 정규화한다. `/tenant/video/`는 `tenant/video`와 같으며 공유 카메라 목록 키에는 붙이지 않는다 |
 | `upload.max_concurrent` | 세그먼트·매니페스트 저장 요청 동시성 | 소유권 요청에는 별도로 `min(16, max_concurrent)`개의 슬롯을 예약해 업로드 적체가 lease 갱신을 막지 않게 한다 |
 | `storage.tag_media` | 보존용 `transmux-kind` 객체 태그 | 기본 꺼짐. 켜면 `s3:PutObjectTagging` 필요; 제어 객체에는 태그를 붙이지 않는다 |
@@ -151,18 +156,27 @@ playbackd -config /etc/transmux/playback.json -validate
 | 키 | 의미 | 주의 |
 |---|---|---|
 | `auth.trusted_proxies` | `X-Forwarded-For`를 신뢰할 프록시 CIDR 문자열 배열 | 기본 `[]`, 최대 64개. 비어 있으면 `RemoteAddr`만 사용. TLS 리버스 프록시 뒤 배포 시 실제 프록시 CIDR 지정 필수 |
-| `export.min_free_bytes` | 내보내기 볼륨에 남길 최소 여유 바이트 | 기본 `1073741824` (1GiB), 허용 범위 128MiB∼1TiB. 작업별 입력 크기의 3배를 기준으로 예약하고, 부족하면 시작 전에 `507 export_storage_full` (`Retry-After: 60`) 반환 |
+| `export.min_free_bytes` | 내보내기 볼륨에 남길 최소 여유 바이트 | 기본 `1073741824` (1GiB), 허용 범위 128MiB∼1TiB. 작업별 예약은 `3 × (세그먼트 바이트 합 + 서로 다른 초기화 파일 수 × 1MiB) + (파일 수 + 2) × 64KiB`다. 파일 수는 세그먼트와 서로 다른 초기화 파일 수의 합이며, 진행 중 작업은 아직 기록하지 않은 예약분만 합산한다. 부족하면 시작 전에 `507 export_storage_full` (`Retry-After: 60`) 반환 |
 
-로그인은 설정된 실제 계정의 실패한 시도만 계정별 10회/분으로 집계한다.
-성공한 로그인은 계정 한도에 포함하지 않으며, 한도를 소진하면 남은 고정 창
-(최대 1분) 동안 올바른 비밀번호도 `429`로 거절하는 잠금 정책을 적용한다.
+로그인은 실제 계정과 미존재 이름 모두 실패한 시도만 10회/분으로 집계한다.
+미존재 이름은 비밀 키 HMAC으로 고정 4,096개 버킷에 배정되어 한도를 공유할 수 있다.
+비밀번호 검증 전에 시도를 선계수하고 성공 시 되돌려 동시 요청에도 상한을 지킨다.
+한도를 소진하면 남은 고정 창(최대 1분) 동안 올바른 비밀번호도 `429`로 거절하는
+의도된 잠금 정책을 적용한다. 버킷을 대량으로 포화시키는 공격 없이는 응답으로
+계정 존재 여부를 구별하기 어렵지만, 완전한 은닉을 보장하지는 않는다.
+
 클라이언트 한도는 모든 로그인 시도에 30회/분이며 IPv6는 `/64` 단위로 묶는다.
-미존재 계정 이름에는 클라이언트 한도만 적용한다. 이 한도들은 설정 키가 없는 상수다.
+클라이언트 추적 키는 최대 10,000개이며, 가득 차면 신규 클라이언트는 공용 overflow
+버킷(300회/분)을 공유한다. 포화 시 신규 클라이언트가 함께 제한될 수 있으며,
+이 상태는 메트릭으로 관측할 수 있다. 이 한도들은 설정 키가 없는 상수다.
 내보내기의 즉시 오류 응답은 [솔루션 API 가이드](docs/solution.md#api)를 참고한다.
 
 자격증명은 AWS SDK의 기본 체인으로 읽는다. 프로덕션은 ECS task role 또는 EKS
-IRSA를 권장하며, MinIO 개발 환경은 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`를
+IRSA를 권장하며, 로컬 S3 호환 서버(RustFS) 개발 환경은 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`를
 사용한다. 임시 환경 자격증명을 사용할 때는 `AWS_SESSION_TOKEN`도 함께 전달된다.
+
+S3 호환 서버는 조건부 PUT(`If-None-Match: *`, `If-Match`)을 지원해야 한다.
+이 헤더를 무시하는 서버(예: Garage)에서는 소유권 펜싱이 동작하지 않는다.
 
 필요한 S3 권한은 ingest prefix의 `s3:PutObject`와 `s3:GetObject`다. 읽기 권한은
 매니페스트·lease 및 세그먼트의 충돌 확인용 HEAD까지 포함한다. 또한 없는 키에 대한

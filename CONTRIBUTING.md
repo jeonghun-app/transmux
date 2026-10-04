@@ -42,6 +42,14 @@ ffmpeg를 실제로 사용하는 테스트는 `make test-ffmpeg`로 실행한다
 `deploy/Dockerfile`의 `test` 이미지를 빌드하고 `ffmpeg` 빌드 태그 테스트를 실행한다.
 의존성 검사는 `make vuln`로 수행하며 야간 워크플로에도 포함된다.
 
+릴리스 묶음을 검증할 때는 `make dist`를 실행하고, 워크플로를 수정하면
+`make lint-actions`로 검사한다.
+
+```sh
+make dist
+make lint-actions
+```
+
 설정 파일을 바꾸면 CI의 `-validate` 검사와 같이 이미지 빌드 뒤 PoC와 솔루션의
 두 서비스를 확인한다.
 

@@ -38,13 +38,13 @@
 
 ## 집행
 
-모욕적이거나 괴롭힘 또는 그 외 하지말아야 할 행동을 발견하면 [@jeonghun-app](https://github.com/jeonghun-app)을 통해 집행 책임이 있는 커뮤니티 리더에게 보고한다. 모든 불만사항은 신속하고 공정하게 검토되고 조사될 것이다.
+모욕적이거나 괴롭힘 또는 그 외 하지말아야 할 행동을 발견하면 [GitHub 비공개 신고](https://github.com/jeonghun-app/transmux/security/advisories/new)를 통해 집행 책임이 있는 커뮤니티 리더에게 보고한다. 모든 불만사항은 신속하고 공정하게 검토되고 조사될 것이다.
 
 커뮤니티 리더는 사건의 보고자의 사생활과 안전을 존중할 의무가 있다.
 
-비공개 연락 경로가 필요한 경우 [저장소 이슈의 댓글](https://github.com/jeonghun-app/transmux/issues)에서
-유지관리자 `@jeonghun-app`에게 연락 방법만 문의한다. 신고 내용·개인 정보 등 민감한
-정보는 공개 댓글에 남기지 않는다.
+저장소의 **Security → Report a vulnerability**에서 GitHub private vulnerability
+reporting을 사용해 행동 강령 위반을 비공개로 신고한다.
+신고 내용·개인 정보 등 민감한 정보는 공개 이슈나 댓글에 남기지 않는다.
 
 ## 집행 지침
 

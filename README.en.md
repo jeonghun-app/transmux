@@ -69,6 +69,10 @@ The operator interface is at `http://localhost:8090`. Passwords for `admin` and
 `viewer` are in the generated `.env.solution`. See the
 [solution guide](docs/solution.md#로컬-실행) for accounts, port configuration, and
 browser verification.
+The RustFS migration changes the storage volume name from `objects` to
+`s3-data`; existing local recordings are not visible in the new stack.
+`make solution-env` automatically adds `TRANSMUX_S3_SECRET_KEY` to an existing
+`.env.solution` if missing and also runs as part of `make solution-up`.
 
 Development checks:
 
@@ -79,6 +83,8 @@ make vet           # Static analysis
 make test          # Unit tests
 make race          # Concurrency checks
 make build         # Build ingest and playback binaries
+make dist          # Create release bundles
+make lint-actions  # Check workflows when modified
 make vuln          # Check module integrity and reachable Go vulnerabilities
 make test-ffmpeg   # Integration tests requiring real ffmpeg
 make image         # Build runtime image
@@ -87,7 +93,7 @@ make image         # Build runtime image
 The earlier ingest-only PoC and capacity measurement setup remain available.
 
 ```bash
-make poc-up           # 2 simulated cameras + MediaMTX + transmuxd + MinIO
+make poc-up           # 2 simulated cameras + MediaMTX + transmuxd + RustFS (S3 compatible)
 make poc-up-capacity  # Above + 1080p/D1/720p sources for capacity measurements
 make poc-verify       # End-to-end verification (playability, manifest consistency)
 make poc-logs         # transmuxd logs
@@ -95,7 +101,7 @@ make poc-down         # Clean up
 ```
 
 `make poc-up` runs the complete pipeline without real IP cameras or real S3.
-MediaMTX acts as the cameras and MinIO as S3. The two simulated cameras have
+MediaMTX acts as the cameras and RustFS (Apache-2.0, S3 compatible) as S3. The two simulated cameras have
 different keyframe intervals. `cam-shortgop` has a 2-second GOP and can meet the
 4-second target; `cam-longgop` has an 8-second GOP and cannot. Both must operate
 normally.
@@ -142,7 +148,7 @@ Key ingest settings (`configs/solution-ingest.json`):
 | `segment.max_gop_slack` | Extra allowance when detecting missing segments | Prevents long-GOP cameras from being mistaken for failures |
 | `ffmpeg.stall_timeout` | Threshold for stopping ffmpeg when it produces no segments | Primary disconnection detector, independent of ffmpeg version |
 | `ffmpeg.input_args` | Additional arguments before `-i` | Place for version-specific socket timeout options |
-| `storage.endpoint` / `force_path_style` | For MinIO/LocalStack | Leave empty in production |
+| `storage.endpoint` / `force_path_style` | For S3-compatible servers such as RustFS | Use the default settings for AWS S3 |
 | `storage.key_prefix` | Prefix for media and lease objects | Leading and trailing `/` are normalized. `/tenant/video/` equals `tenant/video`; the prefix does not apply to shared camera roster keys |
 | `upload.max_concurrent` | Concurrent segment and manifest storage requests | Ownership requests reserve another `min(16, max_concurrent)` slots so an upload backlog cannot prevent lease renewal |
 | `storage.tag_media` | `transmux-kind` object tag for retention | Off by default. Enabling it requires `s3:PutObjectTagging`; control objects are not tagged |
@@ -161,21 +167,32 @@ Key playback settings (`configs/solution-playback.json`):
 | Key | Meaning | Notes |
 |---|---|---|
 | `auth.trusted_proxies` | Array of proxy CIDR strings trusted for `X-Forwarded-For` | Defaults to `[]`, with at most 64 entries. An empty array uses only `RemoteAddr`. Deployments behind a TLS reverse proxy must specify the actual proxy CIDRs |
-| `export.min_free_bytes` | Minimum free bytes to retain on the export volume | Defaults to `1073741824` (1GiB), with an allowed range of 128MiB–1TiB. Each job reserves space based on three times its input size; insufficient space returns `507 export_storage_full` (`Retry-After: 60`) before the job starts |
+| `export.min_free_bytes` | Minimum free bytes to retain on the export volume | Defaults to `1073741824` (1GiB), with an allowed range of 128MiB–1TiB. Each job reserves `3 × (sum of segment bytes + distinct initialization file count × 1MiB) + (file count + 2) × 64KiB`. File count is the sum of segments and distinct initialization files; running jobs contribute only their remaining unwritten reservations. Insufficient space returns `507 export_storage_full` (`Retry-After: 60`) before the job starts |
 
-Only failed attempts for configured accounts count toward the per-account limit
-of 10 per minute. Successful logins do not count toward that limit. Once it is
-exhausted, the account is locked for the remainder of its fixed window (up to
-one minute), and even the correct password receives `429`.
+Both configured accounts and nonexistent names are limited to 10 failed login
+attempts per minute. Nonexistent names are assigned by secret-key HMAC to a fixed
+set of 4,096 buckets and may share a limit. Attempts are counted before password
+verification and refunded on success, enforcing the limit even with concurrent
+requests. Once exhausted, the limit intentionally locks out logins for the
+remainder of the fixed window (up to 1 minute), returning `429` even for the
+correct password. Responses make account existence difficult to distinguish
+without an attack saturating many buckets, but do not guarantee complete concealment.
+
 The client limit covers all login attempts at 30 per minute, grouping IPv6
-addresses by `/64`. Nonexistent account names are subject only to the client
-limit. These limits are constants with no configuration keys. See the
+addresses by `/64`. At most 10,000 client keys are tracked. Once full, new clients
+share an overflow bucket limited to 300 per minute. Saturation can therefore
+limit new clients together; this state is observable through metrics.
+These limits are constants with no configuration keys. See the
 [solution API guide](docs/solution.md#api) for immediate export error responses.
 
 Credentials are read through the AWS SDK default chain. ECS task roles or EKS
-IRSA are recommended in production. MinIO development uses
+IRSA are recommended in production. Development with a local S3-compatible server (RustFS) uses
 `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. When using temporary environment
 credentials, pass `AWS_SESSION_TOKEN` as well.
+
+S3-compatible servers must support conditional PUT (`If-None-Match: *`,
+`If-Match`). Ownership fencing does not work with servers that ignore these
+headers, such as Garage.
 
 Required S3 permissions for the ingest prefix are `s3:PutObject` and
 `s3:GetObject`. Read permission includes HEAD checks for manifest, lease, and
