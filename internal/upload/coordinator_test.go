@@ -1,0 +1,187 @@
+package upload
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/jeonghun-app/transmux/internal/config"
+	"github.com/jeonghun-app/transmux/internal/metrics"
+	"github.com/jeonghun-app/transmux/internal/storage"
+)
+
+type stubStore struct {
+	mu       sync.Mutex
+	attempts int
+	failFor  int // fail the first n attempts
+	err      error
+	body     []byte
+}
+
+func (s *stubStore) Put(_ context.Context, obj storage.Object) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attempts++
+	if s.attempts <= s.failFor {
+		if s.err != nil {
+			return s.err
+		}
+		return errors.New("transient")
+	}
+	s.body = append([]byte(nil), obj.Body...)
+	return nil
+}
+
+func (s *stubStore) Get(context.Context, string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attempts++
+	if s.attempts <= s.failFor {
+		return nil, errors.New("transient")
+	}
+	return s.body, nil
+}
+
+func (s *stubStore) Describe() string { return "stub" }
+
+func (s *stubStore) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attempts
+}
+
+func testCfg() config.UploadConfig {
+	c := config.Default().Upload
+	c.RetryBase = config.Duration{Duration: time.Millisecond}
+	c.RetryMax = config.Duration{Duration: 2 * time.Millisecond}
+	return c
+}
+
+func TestPutRetriesThenSucceeds(t *testing.T) {
+	store := &stubStore{failFor: 2}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	if err := c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	if got := store.count(); got != 3 {
+		t.Errorf("attempts = %d, want 3", got)
+	}
+}
+
+func TestPutGivesUpAfterMaxAttempts(t *testing.T) {
+	store := &stubStore{failFor: 99}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	err := c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")})
+	if !errors.Is(err, ErrGaveUp) {
+		t.Fatalf("err = %v, want ErrGaveUp", err)
+	}
+	if got := store.count(); got != config.Default().Upload.MaxAttempts {
+		t.Errorf("attempts = %d, want %d", got, config.Default().Upload.MaxAttempts)
+	}
+}
+
+// TestGetReturnsNotFoundImmediately matters for recovery: a missing manifest
+// is an answer (new channel), not a fault to retry.
+func TestGetReturnsNotFoundImmediately(t *testing.T) {
+	store := &notFoundStore{}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	_, err := c.Get(context.Background(), "k")
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
+	if store.attempts != 1 {
+		t.Errorf("attempts = %d, want 1: a 404 must not be retried", store.attempts)
+	}
+}
+
+type notFoundStore struct{ attempts int }
+
+func (s *notFoundStore) Put(context.Context, storage.Object) error { return nil }
+func (s *notFoundStore) Get(context.Context, string) ([]byte, error) {
+	s.attempts++
+	return nil, storage.ErrNotFound
+}
+func (s *notFoundStore) Describe() string { return "notfound" }
+
+func TestPutStopsOnCancelledContext(t *testing.T) {
+	store := &stubStore{failFor: 99}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := c.Put(ctx, storage.Object{Key: "k", Body: []byte("x")})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if got := store.count(); got != 0 {
+		t.Errorf("attempts = %d, want 0: shutdown must not start new requests", got)
+	}
+}
+
+// TestBackoffNeverPanicsOnValidatedConfig is the regression guard for the
+// full-jitter bound. rand.Int63n panics on a non-positive argument, so a
+// configuration that passes Validate must never produce one.
+func TestBackoffNeverPanicsOnValidatedConfig(t *testing.T) {
+	full := config.Default()
+	full.Storage.Bucket = "b"
+	full.Cameras.Static = []config.StaticCamera{
+		{CenterID: "c", CameraID: "cam", RTSPURL: "rtsp://h/s"},
+	}
+	if err := full.Validate(); err != nil {
+		t.Fatalf("precondition: %v", err)
+	}
+	c := NewCoordinator(&stubStore{}, full.Upload, metrics.NewRegistry())
+	for attempt := 1; attempt <= 10; attempt++ {
+		if d := c.backoff(attempt); d < 0 {
+			t.Fatalf("attempt %d produced a negative delay %v", attempt, d)
+		}
+	}
+
+	// Zero base and zero cap is the degenerate case Validate still permits.
+	zero := full.Upload
+	zero.RetryBase = config.Duration{}
+	zero.RetryMax = config.Duration{}
+	c2 := NewCoordinator(&stubStore{}, zero, metrics.NewRegistry())
+	if d := c2.backoff(1); d != 0 {
+		t.Errorf("zero bounds should yield no delay, got %v", d)
+	}
+}
+
+// TestMaxConcurrentIsEnforced pins the reason the semaphore exists: several
+// hundred channels must not open unbounded simultaneous requests.
+func TestMaxConcurrentIsEnforced(t *testing.T) {
+	cfg := testCfg()
+	cfg.MaxConcurrent = 2
+	blocker := &blockingStore{inFlight: make(chan struct{}, 16), release: make(chan struct{})}
+	c := NewCoordinator(blocker, cfg, metrics.NewRegistry())
+
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = c.Put(context.Background(), storage.Object{Key: "k", Body: []byte("x")})
+		}()
+	}
+	// Give the goroutines time to pile up on the semaphore.
+	time.Sleep(50 * time.Millisecond)
+	if got := len(blocker.inFlight); got > 2 {
+		t.Errorf("%d concurrent puts, want at most 2", got)
+	}
+	close(blocker.release)
+	wg.Wait()
+}
+
+type blockingStore struct {
+	inFlight chan struct{}
+	release  chan struct{}
+}
+
+func (s *blockingStore) Put(context.Context, storage.Object) error {
+	s.inFlight <- struct{}{}
+	<-s.release
+	return nil
+}
+func (s *blockingStore) Get(context.Context, string) ([]byte, error) { return nil, nil }
+func (s *blockingStore) Describe() string                           { return "blocking" }

@@ -5,6 +5,7 @@ package camera
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,8 +31,14 @@ type Camera struct {
 // Key uniquely identifies a camera within a center.
 func (c Camera) Key() string { return c.CenterID + "/" + c.CameraID }
 
-// SafeURL returns the RTSP URL with any userinfo replaced by a literal mask.
-// Every log line, metric label and API response must use this, never RTSPURL.
+// SafeURL returns the RTSP URL stripped of everything that can carry a
+// secret. Every log line, metric label and API response must use this, never
+// RTSPURL.
+//
+// Userinfo is the obvious case, but cameras and NVRs also accept credentials
+// as query parameters, so the query and fragment are dropped wholesale rather
+// than filtered: a value that looks harmless today is not worth publishing
+// through an unauthenticated status endpoint.
 //
 // The mask is spliced in rather than assigned through url.User, because
 // url.URL.String percent-encodes userinfo and would emit "%2A%2A%2A".
@@ -41,14 +48,73 @@ func (c Camera) SafeURL() string {
 		return "rtsp://<unparseable>"
 	}
 	hadUser := u.User != nil
+	hadQuery := u.RawQuery != "" || u.ForceQuery
 	u.User = nil
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.Fragment = ""
+	u.RawFragment = ""
 	s := u.String()
+	if hadQuery {
+		s += "?<redacted>"
+	}
 	if !hadUser {
 		return s
 	}
 	scheme := u.Scheme + "://"
 	return scheme + "***@" + strings.TrimPrefix(s, scheme)
 }
+
+// redactURL removes credentials from a URL that may appear in an error
+// message or a log line. Unparseable input is dropped entirely rather than
+// echoed, since the point is to avoid printing a secret by accident.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<unparseable url>"
+	}
+	if u.User != nil {
+		u.User = url.User("***")
+	}
+	if u.RawQuery != "" || u.ForceQuery {
+		u.RawQuery = "<redacted>"
+		u.ForceQuery = false
+	}
+	u.Fragment = ""
+	return u.String()
+}
+
+// StderrRedactor returns a replacer that removes this camera's credentials
+// from arbitrary text, for use on ffmpeg's stderr.
+//
+// ffmpeg echoes the input URL in many of its own messages, so the raw URL and
+// the password on its own are both replaced. A very short password is left
+// alone: replacing a two-character string everywhere would corrupt unrelated
+// log content for no real gain, and such a password is not protectable here
+// anyway.
+func (c Camera) StderrRedactor() func(string) string {
+	var pairs []string
+	if c.RTSPURL != "" {
+		pairs = append(pairs, c.RTSPURL, c.SafeURL())
+	}
+	if u, err := url.Parse(c.RTSPURL); err == nil && u.User != nil {
+		// Longest first: the full userinfo before the bare password.
+		if ui := u.User.String(); ui != "" {
+			pairs = append(pairs, ui+"@", "***@")
+		}
+		if pass, ok := u.User.Password(); ok && len(pass) >= minRedactablePassword {
+			pairs = append(pairs, pass, "***")
+		}
+	}
+	if len(pairs) == 0 {
+		return func(s string) string { return s }
+	}
+	return strings.NewReplacer(pairs...).Replace
+}
+
+// minRedactablePassword is the shortest password worth substituting out of
+// free-form text.
+const minRedactablePassword = 4
 
 // Validate checks the fields that are interpolated into paths and command
 // arguments.
@@ -112,6 +178,14 @@ func (p *HTTPProvider) Cameras(ctx context.Context) ([]Camera, error) {
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
+		// A *url.Error carries the full request URL, which may contain an
+		// access token in its query. The manager stores this string and the
+		// unauthenticated status endpoint serves it, so redact it here.
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			return nil, fmt.Errorf("camera provider request to %s: %w",
+				redactURL(uerr.URL), uerr.Err)
+		}
 		return nil, fmt.Errorf("camera provider request: %w", err)
 	}
 	defer resp.Body.Close()

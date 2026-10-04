@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -110,18 +111,29 @@ func run() error {
 
 	handler := health.NewHandler(mgr, reg, store.Describe(), log)
 	srv := &http.Server{
-		Addr:              cfg.HTTPListen,
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// Bind synchronously. A monitoring API that failed to bind used to be a
+	// logged warning, leaving the daemon running with no liveness probe, no
+	// readiness probe and no metrics: the orchestrator would consider the
+	// shard healthy precisely because it could not ask.
+	listener, err := net.Listen("tcp", cfg.HTTPListen)
+	if err != nil {
+		return fmt.Errorf("bind monitoring API on %s: %w", cfg.HTTPListen, err)
 	}
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Info("monitoring API listening", "addr", cfg.HTTPListen,
+		log.Info("monitoring API listening", "addr", listener.Addr().String(),
 			"note", "endpoints are unauthenticated; keep this listener internal")
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("monitoring API failed", "error", err)
 		}
 	}()

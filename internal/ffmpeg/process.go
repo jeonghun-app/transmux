@@ -27,6 +27,7 @@ import (
 type Process struct {
 	cmd    *exec.Cmd
 	log    *slog.Logger
+	redact func(string) string
 	done   chan struct{}
 	waitMu sync.Mutex
 	err    error
@@ -35,7 +36,11 @@ type Process struct {
 }
 
 // Start launches ffmpeg. The returned Process is already running.
-func Start(binary string, args []string, log *slog.Logger) (*Process, error) {
+//
+// redact is applied to every stderr line before it is logged. ffmpeg echoes
+// its input URL in many of its own error messages, so without it a camera
+// password would end up in the container log.
+func Start(binary string, args []string, log *slog.Logger, redact func(string) string) (*Process, error) {
 	cmd := exec.Command(binary, args...)
 	// Own process group so signals reach children too.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -52,6 +57,7 @@ func Start(binary string, args []string, log *slog.Logger) (*Process, error) {
 	p := &Process{
 		cmd:           cmd,
 		log:           log,
+		redact:        redact,
 		done:          make(chan struct{}),
 		stderrDrained: make(chan struct{}),
 	}
@@ -165,6 +171,9 @@ func (p *Process) drainStderr(r io.ReadCloser) {
 		if line == "" {
 			continue
 		}
+		if p.redact != nil {
+			line = p.redact(line)
+		}
 		if isBenign(line) {
 			p.log.Debug("ffmpeg", "message", line)
 			continue
@@ -178,6 +187,12 @@ func (p *Process) drainStderr(r io.ReadCloser) {
 			logged++
 		}
 		// Keep reading even when suppressed: the pipe must stay drained.
+	}
+	// An over-long line ends the scan early. Say so, because from here on
+	// ffmpeg can block writing to a pipe nobody is reading and the stall
+	// watchdog, not this goroutine, is what will notice.
+	if err := sc.Err(); err != nil {
+		p.log.Error("ffmpeg stderr reader stopped early", "error", err)
 	}
 }
 

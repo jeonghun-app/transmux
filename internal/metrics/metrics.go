@@ -87,21 +87,41 @@ func (r *Registry) Gauge(name, help string, labels ...Label) *Metric {
 	return r.metric(kindGauge, name, help, labels)
 }
 
-// DropSeries removes every series whose labels include the given label.
-// Used when a channel is removed so its series do not linger forever.
-func (r *Registry) DropSeries(match Label) {
+// DropSeries removes every series carrying all of the given labels. Used when
+// a channel is removed so its series do not linger forever.
+//
+// All labels must match, not any one of them: camera_id alone is not unique
+// across centers, so matching on it would delete another center's series while
+// that channel is still running and holding its metric handles.
+func (r *Registry) DropSeries(match ...Label) {
+	if len(match) == 0 {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for _, f := range r.families {
 		for key, m := range f.series {
-			for _, l := range m.labels {
-				if l == match {
-					delete(f.series, key)
-					break
-				}
+			if hasAllLabels(m.labels, match) {
+				delete(f.series, key)
 			}
 		}
 	}
+}
+
+func hasAllLabels(have, want []Label) bool {
+	for _, w := range want {
+		found := false
+		for _, h := range have {
+			if h == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *Registry) metric(k kind, name, help string, labels []Label) *Metric {
