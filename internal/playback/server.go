@@ -295,18 +295,13 @@ func (s *Server) loadRoster(ctx context.Context) ([]config.StaticCamera, string,
 	var roster []config.StaticCamera
 	var etag string
 	var err error
-	switch {
-	case s.managed != nil:
-		roster, etag, err = s.managed.Load(ctx)
-	case s.ingest.Cameras.Provider == "static":
-		roster = append([]config.StaticCamera{}, s.ingest.Cameras.Static...)
+	switch provider := s.provider.(type) {
+	case *camera.ObjectProvider:
+		roster, etag, err = provider.Load(ctx)
+	case *camera.HTTPProvider:
+		roster, err = provider.Load(ctx)
 	default:
-		var cams []camera.Camera
-		cams, err = s.provider.Cameras(ctx)
-		for _, cam := range cams {
-			roster = append(roster, config.StaticCamera{CenterID: cam.CenterID, CameraID: cam.CameraID,
-				RTSPURL: cam.RTSPURL, Name: cam.Name, Audio: cam.Audio, Format: cam.Format, ShardID: cam.ShardID})
-		}
+		roster = append([]config.StaticCamera{}, s.ingest.Cameras.Static...)
 	}
 	if err != nil {
 		return nil, "", err

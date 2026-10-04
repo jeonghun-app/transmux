@@ -11,6 +11,9 @@ import (
 
 func TestDefaultIsValid(t *testing.T) {
 	c := Default()
+	if c.HTTPListen != "127.0.0.1:8080" {
+		t.Errorf("http_listen = %q, want loopback by default", c.HTTPListen)
+	}
 	c.Storage.Bucket = "b"
 	c.Cameras.Static = []StaticCamera{{CenterID: "c", CameraID: "cam", RTSPURL: "rtsp://h/s"}}
 	if err := c.Validate(); err != nil {
@@ -83,6 +86,45 @@ func TestLoadRoundTrip(t *testing.T) {
 	// Fields absent from the file must keep their defaults.
 	if cfg.Upload.MaxAttempts != 3 {
 		t.Errorf("upload.max_attempts = %d, want the default 3", cfg.Upload.MaxAttempts)
+	}
+	if cfg.HTTPListen != "127.0.0.1:8080" {
+		t.Errorf("http_listen = %q, want the default loopback address", cfg.HTTPListen)
+	}
+}
+
+func TestLoadNormalizesKeyPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		prefix string
+		want   string
+	}{
+		{"", ""},
+		{"/", ""},
+		{"///", ""},
+		{"tenant/video", "tenant/video"},
+		{"/tenant/video", "tenant/video"},
+		{"tenant/video/", "tenant/video"},
+		{"/tenant/video/", "tenant/video"},
+		{"///tenant/video///", "tenant/video"},
+	} {
+		t.Run(tc.prefix, func(t *testing.T) {
+			cfg := valid()
+			cfg.Storage.KeyPrefix = tc.prefix
+			raw, err := json.Marshal(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "config.json")
+			if err := os.WriteFile(path, raw, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if loaded.Storage.KeyPrefix != tc.want {
+				t.Errorf("key_prefix = %q, want %q", loaded.Storage.KeyPrefix, tc.want)
+			}
+		})
 	}
 }
 
@@ -193,10 +235,12 @@ func TestValidateRejectsBadListenAddress(t *testing.T) {
 			t.Errorf("http_listen %q: expected rejection", addr)
 		}
 	}
-	c := valid()
-	c.HTTPListen = "127.0.0.1:8080"
-	if err := c.Validate(); err != nil {
-		t.Errorf("loopback bind must be accepted: %v", err)
+	for _, addr := range []string{"127.0.0.1:8080", ":8080"} {
+		c := valid()
+		c.HTTPListen = addr
+		if err := c.Validate(); err != nil {
+			t.Errorf("http_listen %q must be accepted: %v", addr, err)
+		}
 	}
 }
 
@@ -229,13 +273,20 @@ func TestLoadRejectsTrailingContent(t *testing.T) {
 	}
 }
 
-func TestPocConfigIsValid(t *testing.T) {
-	cfg, err := Load(filepath.Join("..", "..", "configs", "poc.json"))
-	if err != nil {
-		t.Fatalf("the checked-in PoC config must validate: %v", err)
-	}
-	if cfg.ShardID == "" {
-		t.Error("shard_id should be set by the PoC config")
+func TestContainerIngestConfigsAreValid(t *testing.T) {
+	for _, name := range []string{"poc.json", "solution-ingest.json"} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := Load(filepath.Join("..", "..", "configs", name))
+			if err != nil {
+				t.Fatalf("the checked-in config must validate: %v", err)
+			}
+			if cfg.ShardID == "" {
+				t.Error("shard_id should be set by the config")
+			}
+			if cfg.HTTPListen != ":8080" {
+				t.Errorf("container http_listen = %q, want explicit :8080", cfg.HTTPListen)
+			}
+		})
 	}
 }
 

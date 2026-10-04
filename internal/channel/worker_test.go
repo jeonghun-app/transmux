@@ -619,10 +619,21 @@ func TestBackoffGrowsAndResets(t *testing.T) {
 
 func TestObjectKeyHonoursPrefix(t *testing.T) {
 	w := newTestWorker(t, &fakeStore{})
-	w.cfg.Storage.KeyPrefix = "/live/"
-	got := w.objectKey("2026/08/31/seg-1.ts")
-	if got != "live/c1/cam1/2026/08/31/seg-1.ts" {
-		t.Errorf("objectKey = %q", got)
+	path := filepath.Join(t.TempDir(), "config.json")
+	body := `{"storage":{"bucket":"b","key_prefix":"/tenant/video/"},"cameras":{` +
+		`"static":[{"center_id":"c1","camera_id":"cam1","rtsp_url":"rtsp://h/s"}]}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.cfg.Storage.KeyPrefix = cfg.Storage.KeyPrefix
+	for _, rel := range []string{"2026/08/31/seg-1.ts", "index.m3u8", LeaseObjectName} {
+		if got := w.objectKey(rel); got != "tenant/video/c1/cam1/"+rel {
+			t.Errorf("objectKey(%q) = %q", rel, got)
+		}
 	}
 }
 

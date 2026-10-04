@@ -156,6 +156,61 @@ type HTTPProvider struct {
 func (p *HTTPProvider) Name() string { return "http" }
 
 func (p *HTTPProvider) Cameras(ctx context.Context) ([]Camera, error) {
+	roster, err := p.fetch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cameras, err := convert(roster)
+	return assigned(cameras, p.shard), err
+}
+
+// Load returns this shard's catalog, including disabled cameras, so retained
+// recordings remain accessible after ingestion stops.
+func (p *HTTPProvider) Load(ctx context.Context) ([]config.StaticCamera, error) {
+	raw, err := p.fetch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	roster := make([]config.StaticCamera, 0, len(raw))
+	seen := make(map[string]int, len(raw))
+	for i, cam := range raw {
+		enabled := cam.Enabled == nil || *cam.Enabled
+		if enabled {
+			if err := cam.Validate(); err != nil {
+				return nil, fmt.Errorf("camera entry %d: %w", i, err)
+			}
+		} else if !config.ValidID(cam.CenterID) || !config.ValidID(cam.CameraID) ||
+			(cam.ShardID != "" && !config.ValidID(cam.ShardID)) {
+			// Disabled entries may have no source, but their paths must be safe.
+			continue
+		}
+		key := cam.CenterID + "/" + cam.CameraID
+		if at, exists := seen[key]; exists {
+			if !enabled {
+				continue
+			}
+			if roster[at].Enabled == nil || *roster[at].Enabled {
+				return nil, fmt.Errorf("duplicate camera %s in roster", key)
+			}
+			roster[at] = cam
+			continue
+		}
+		seen[key] = len(roster)
+		roster = append(roster, cam)
+	}
+	if p.shard == "" {
+		return roster, nil
+	}
+	out := make([]config.StaticCamera, 0, len(roster))
+	for _, cam := range roster {
+		if cam.ShardID == p.shard {
+			out = append(out, cam)
+		}
+	}
+	return out, nil
+}
+
+func (p *HTTPProvider) fetch(ctx context.Context) ([]config.StaticCamera, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create camera provider request: invalid URL or context")
@@ -201,8 +256,7 @@ func (p *HTTPProvider) Cameras(ctx context.Context) ([]Camera, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("camera provider payload must be an array; use [] for an empty roster")
 	}
-	cameras, err := convert(raw)
-	return assigned(cameras, p.shard), err
+	return raw, nil
 }
 
 // NewProvider builds the provider selected by configuration.
