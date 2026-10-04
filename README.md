@@ -1,7 +1,12 @@
 # transmux — RTSP → HLS 경량 트랜스먹싱 모듈
 
-Wowza Streaming Engine 대체. IP 카메라의 RTSP(H.264)를 **트랜스코딩 없이**
-HLS 세그먼트로 잘라 S3에 저장한다. 코덱은 건드리지 않는다(`-c:v copy`).
+**Wowza Streaming Engine의 ingest 경로를 대체한다.** IP 카메라의 RTSP(H.264)를
+**트랜스코딩 없이** HLS 세그먼트로 잘라 S3에 저장한다. 코덱은 건드리지 않는다
+(`-c:v copy`).
+
+전달·재생 경로(CDN, 시청자 인증, 재생 URL 발급, 과거 영상 조회)는 구현되어 있지
+않으므로, 이것만으로 Wowza를 전부 대체할 수는 없다. 무엇이 대체되고 무엇이
+남았는지는 [docs/wowza-coverage.md](docs/wowza-coverage.md)에 기능별로 정리했다.
 
 ```
 IP 카메라 ──RTSP/TCP──> ffmpeg (stream copy) ──> tmpfs 스풀 ──> Go 업로더 ──> S3

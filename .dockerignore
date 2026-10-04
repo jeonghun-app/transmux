@@ -1,0 +1,13 @@
+# Build context hygiene. Both the build and test stages do `COPY . .`, so
+# without this the .git directory and any local scratch files end up in the
+# image build context.
+.git
+.github
+.gitignore
+
+# Documentation is not needed to compile or test.
+docs
+*.md
+
+# Local scratch configuration, matching .gitignore.
+configs/local*.json

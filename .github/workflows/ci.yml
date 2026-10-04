@@ -1,0 +1,56 @@
+# CI runs the same make targets a developer runs. Every one of them executes
+# inside a container (see the Makefile header), so there is no toolchain setup
+# here and no way for CI and local runs to drift apart.
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push supersedes an in-flight run on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: vet, test, race, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: make vet
+      - run: make test
+      # The race detector needs cgo, which the target arranges itself.
+      - run: make race
+      - run: make build
+
+  config:
+    name: validate the checked-in config
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: make image
+      # -validate returns before ffmpeg is probed or anything is dialled, so
+      # this is a pure schema check. It matters because unknown keys are a
+      # startup error: a typo in an example config would break users, not
+      # silently fall back to a default.
+      - name: transmuxd -validate configs/poc.json
+        run: |
+          docker run --rm -v "$PWD/configs:/c:ro" transmux:latest \
+            -config /c/poc.json -validate
+
+  ffmpeg:
+    name: tests that need a real ffmpeg
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      # Self-contained: the tagged tests synthesise their own H.264 with
+      # lavfi and probe the resulting segments. No camera, no network.
+      - run: make test-ffmpeg
