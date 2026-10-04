@@ -341,7 +341,7 @@ func TestLoginAccountLimitIgnoresUnknownNamesAndSuccesses(t *testing.T) {
 	if status := login("admin", "test-only-password"); status != 200 {
 		t.Fatalf("full client table refused a new client: %d", status)
 	}
-	// Unknown names are bounded by the client limit only.
+	// Unknown names are counted in their own bucket table.
 	if status := login("no-such-user", strings.Repeat("x", 2000)); status != 401 {
 		t.Fatalf("unknown account: %d", status)
 	}
@@ -350,6 +350,12 @@ func TestLoginAccountLimitIgnoresUnknownNamesAndSuccesses(t *testing.T) {
 	f.app.loginAccounts.mu.Unlock()
 	if tracked != 0 {
 		t.Fatalf("unknown names or successes entered the account table: %d", tracked)
+	}
+	f.app.loginUnknown.mu.Lock()
+	unknown := len(f.app.loginUnknown.entries)
+	f.app.loginUnknown.mu.Unlock()
+	if unknown != 1 {
+		t.Fatalf("unknown name failure was not counted: %d buckets", unknown)
 	}
 	for n := 0; n < loginAccountLimit; n++ {
 		if status := login("admin", "test-only-password"); status != 200 {
@@ -386,5 +392,54 @@ func TestLoginOverflowBucketHasItsOwnLimit(t *testing.T) {
 	}
 	if _, tracked := l.entries["new-4"]; !tracked {
 		t.Fatal("expired entries were not reclaimed for a new key")
+	}
+}
+
+func TestLoginUnknownNamesAreLimitedLikeAccounts(t *testing.T) {
+	f := newFixture(t)
+	// A fixed bucket key makes the name-to-bucket mapping deterministic.
+	f.app.auth.buckets = bytes.Repeat([]byte{7}, 32)
+	login := func(username, password string) (int, []byte) {
+		t.Helper()
+		resp, body := f.request(t, "POST", "/v1/login", "", map[string]string{"username": username, "password": password}, nil)
+		return resp.StatusCode, body
+	}
+	ghost, _ := f.app.auth.AccountKey("ghost")
+	others := []string{}
+	for n := 0; len(others) < 3; n++ {
+		name := fmt.Sprintf("other-%d", n)
+		if key, _ := f.app.auth.AccountKey(name); key != ghost {
+			others = append(others, name)
+		}
+	}
+	// Exhaust several other unknown buckets, as an attacker would.
+	for _, name := range others {
+		key, _ := f.app.auth.AccountKey(name)
+		for n := 0; n < loginAccountLimit; n++ {
+			f.app.loginUnknown.fail(key, time.Now())
+		}
+	}
+	for n := 0; n < loginAccountLimit; n++ {
+		if status, _ := login("ghost", "wrong-password"); status != 401 {
+			t.Fatalf("unknown failure %d: %d", n, status)
+		}
+		if status, _ := login("admin", "wrong-password"); status != 401 {
+			t.Fatalf("account failure %d: %d", n, status)
+		}
+	}
+	unknownStatus, unknownBody := login("ghost", "wrong-password")
+	knownStatus, knownBody := login("admin", "test-only-password")
+	if unknownStatus != 429 || knownStatus != 429 || !bytes.Equal(unknownBody, knownBody) {
+		t.Fatalf("unknown and real accounts are distinguishable: %d %s / %d %s", unknownStatus, unknownBody, knownStatus, knownBody)
+	}
+	// A fresh window for admin: other unknown names' failures never touch it.
+	f.app.loginAccounts.mu.Lock()
+	clear(f.app.loginAccounts.entries)
+	f.app.loginAccounts.mu.Unlock()
+	if status, _ := login("admin", "test-only-password"); status != 200 {
+		t.Fatalf("unknown-name failures blocked a real account: %d", status)
+	}
+	if status, _ := login(others[0], "wrong-password"); status != 429 {
+		t.Fatalf("exhausted unknown bucket was not limited: %d", status)
 	}
 }

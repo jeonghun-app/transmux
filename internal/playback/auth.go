@@ -1,10 +1,12 @@
 package playback
 
 import (
+	"crypto/hmac"
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +65,7 @@ type Auth struct {
 	users   map[string]loginUser
 	dummy   loginUser
 	proxies []netip.Prefix
+	buckets []byte // HMAC key mapping unknown usernames to login buckets
 }
 
 func NewAuth(cfg AuthConfig) (*Auth, error) {
@@ -90,6 +94,10 @@ func NewAuth(cfg AuthConfig) (*Auth, error) {
 		a.users[u.Username] = loginUser{salt, hash, u.Grants}
 	}
 	a.dummy = loginUser{salt: make([]byte, 16), hash: make([]byte, 32)}
+	a.buckets = make([]byte, 32)
+	if _, err := rand.Read(a.buckets); err != nil {
+		return nil, err
+	}
 	return a, nil
 }
 
@@ -192,6 +200,10 @@ const (
 	loginWindow        = time.Minute
 	loginTrackedKeys   = 10000
 	loginOverflowKey   = "\x00overflow"
+	// loginUnknownBuckets fixes the memory spent on names that are not
+	// configured accounts; it is below loginTrackedKeys, so that table can
+	// never fill.
+	loginUnknownBuckets = 4096
 )
 
 type loginRate struct {
@@ -275,11 +287,20 @@ func (l *loginLimiter) fail(key string, now time.Time) {
 	l.add(key, now)
 }
 
-// Known reports whether username is a configured login account. Only these
-// are tracked per account, so unknown names cannot fill the account table.
-func (a *Auth) Known(username string) bool {
-	_, exists := a.users[username]
-	return exists
+// AccountKey returns the account budget key for username and whether it is
+// a configured account. Unknown names are mapped by a per-process secret
+// HMAC onto a fixed set of buckets that follow the same rules, so they cannot
+// exhaust memory or lock out a real account, and the 429 after repeated
+// failures does not reveal whether an account exists. An attacker cannot
+// aim names at one bucket without the secret.
+func (a *Auth) AccountKey(username string) (string, bool) {
+	if _, exists := a.users[username]; exists {
+		return username, true
+	}
+	mac := hmac.New(sha256.New, a.buckets)
+	mac.Write([]byte(username))
+	bucket := binary.BigEndian.Uint64(mac.Sum(nil)) % loginUnknownBuckets
+	return strconv.FormatUint(bucket, 10), false
 }
 
 func parseTrustedProxies(values []string) ([]netip.Prefix, error) {

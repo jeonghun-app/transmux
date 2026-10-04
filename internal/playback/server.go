@@ -43,6 +43,7 @@ type Server struct {
 	rosterAt       time.Time
 	loginClients   *loginLimiter
 	loginAccounts  *loginLimiter
+	loginUnknown   *loginLimiter
 	retentionMu    sync.Mutex
 	retention      RetentionStatus
 	background     context.Context
@@ -97,7 +98,8 @@ func NewServer(cfg Config, ingest config.Config, store storage.MediaStore, index
 		provider: provider, mediaSlots: make(chan struct{}, cfg.MaxStreams),
 		exportSlots: make(chan struct{}, cfg.Export.Workers), loginSlots: make(chan struct{}, 2),
 		querySlots: make(chan struct{}, 8), loginClients: newLoginLimiter(loginClientLimit, loginOverflowLimit),
-		loginAccounts: newLoginLimiter(loginAccountLimit, loginAccountLimit)}
+		loginAccounts: newLoginLimiter(loginAccountLimit, loginAccountLimit),
+		loginUnknown:  newLoginLimiter(loginAccountLimit, loginAccountLimit)}
 	s.background, s.stopBackground = context.WithCancel(context.Background())
 	s.jobs = make(map[string]*exportJob)
 	s.exportSpace = make(map[*exportSpace]struct{})
@@ -251,10 +253,14 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &body) {
 		return
 	}
-	// Only configured accounts have an account budget; unknown names are
-	// bounded by the client limit alone and cannot fill the account table.
-	account := s.auth.Known(body.Username)
-	if account && s.loginAccounts.exhausted(body.Username, time.Now()) {
+	// Configured accounts and hashed buckets of unknown names are kept in
+	// separate tables, so unknown names can never crowd out a real account.
+	key, known := s.auth.AccountKey(body.Username)
+	accounts := s.loginAccounts
+	if !known {
+		accounts = s.loginUnknown
+	}
+	if accounts.exhausted(key, time.Now()) {
 		limited()
 		return
 	}
@@ -265,9 +271,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	defer release(s.loginSlots)
 	token, claims, err := s.auth.Login(body.Username, body.Password)
 	if err != nil {
-		if account {
-			s.loginAccounts.fail(body.Username, time.Now())
-		}
+		accounts.fail(key, time.Now())
 		fail(w, http.StatusUnauthorized, "invalid_credentials", "Username or password is incorrect.")
 		return
 	}
