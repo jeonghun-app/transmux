@@ -8,7 +8,8 @@
 # Local configuration and scratch files produced by the measurement scripts.
 /configs/local*.json
 /tmp/
-/.env.solution
+# Also covers the temporary copies scripts/solution-env.py writes.
+/.env.solution*
 /tests/browser/node_modules/
 /tests/browser/test-results/
 /tests/browser/playwright-report/

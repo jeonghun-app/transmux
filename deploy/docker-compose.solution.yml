@@ -62,7 +62,14 @@ services:
         set -eu
         bucket=http://s3:9000/transmux
         # Credentials go through stdin so they never appear in argv. The curl
-        # config syntax needs " and \ escaped inside a quoted value.
+        # config syntax needs " and \ escaped inside a quoted value and has
+        # no way to carry a line break, so such credentials are refused.
+        nl='
+        '
+        cr=$$(printf '\r')
+        case "$$S3_ACCESS_KEY$$S3_SECRET_KEY" in
+          *"$$nl"*|*"$$cr"*) echo "S3 credentials must not contain line breaks"; exit 1 ;;
+        esac
         esc() { printf '%s' "$$1" | sed 's/[\\"]/\\&/g'; }
         s3() { printf 'user = "%s:%s"\n' "$$(esc "$$S3_ACCESS_KEY")" "$$(esc "$$S3_SECRET_KEY")" |
                curl -sS -K - --aws-sigv4 "aws:amz:us-east-1:s3" -o /dev/null -w '%{http_code}' "$$@"; }

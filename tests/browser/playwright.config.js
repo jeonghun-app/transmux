@@ -3,11 +3,13 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const filename = process.env.TRANSMUX_TEST_ENV || path.resolve(__dirname, "../../.env.solution");
-// Accept the Compose .env forms people write by hand: "export KEY=v", spaces
-// around "=", quoted values and comments. Mirrors scripts/verify-solution.py.
+// Supported .env syntax, as in scripts/verify-solution.py: KEY=value, an
+// optional leading "export", spaces around "=", a UTF-8 BOM, comments and
+// simple '...' or "..." quoting. Escapes, variable references and multi-line
+// values are not supported; generated values are URL-safe and unaffected.
 function parseEnv(text) {
   const values = {};
-  for (const line of text.split(/\r?\n/)) {
+  for (const line of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
     const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_.-]*)\s*=\s*(.*?)\s*$/.exec(line);
     if (!match) continue;
     const quoted = /^(['"])(.*?)\1(?:\s+#.*)?$/.exec(match[2]);
