@@ -15,7 +15,18 @@ ACTIONLINT_IMAGE ?= rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47e
 DISTDIR ?= tmp/dist
 DIST_PLATFORMS ?= linux/amd64 linux/arm64
 
-LDFLAGS := -s -w -X main.version=$(VERSION)
+# VERSION and REVISION reach recipes only as environment variables and are
+# always quoted there; they are never pasted into shell code by make, so a
+# tag such as v1.0.0-`cmd` cannot run anything. CHECK_VERSION additionally
+# limits VERSION to what a Go -X flag, a file name and (after mapping + to _)
+# a Docker tag can all carry.
+export VERSION REVISION
+CHECK_VERSION = case "$$VERSION" in ''|[.-]*|*[!0-9A-Za-z._+-]*) \
+	  echo "invalid VERSION: must be [0-9A-Za-z._+-] and not start with . or -" >&2; \
+	  exit 1;; esac
+
+# Expanded by the shell inside the build container, not by make.
+LDFLAGS := -s -w -X main.version=$$VERSION
 
 # Cache the module and build cache on the host so repeat runs are fast.
 GOCACHE_VOL := transmux-gocache
@@ -52,7 +63,8 @@ vuln: ## Verify modules and scan reachable Go vulnerabilities
 
 .PHONY: build
 build: ## Compile ingest and playback services and print their embedded version
-	$(RUNGO) -e CGO_ENABLED=0 $(GOIMAGE) sh -c 'set -e; \
+	@$(CHECK_VERSION)
+	$(RUNGO) -e CGO_ENABLED=0 -e VERSION $(GOIMAGE) sh -c 'set -e; \
 	  go build -trimpath -ldflags "$(LDFLAGS)" -o /tmp/transmuxd ./cmd/transmuxd; \
 	  go build -trimpath -ldflags "$(LDFLAGS)" -o /tmp/playbackd ./cmd/playbackd; \
 	  printf "transmuxd %s\nplaybackd %s\n" "$$(/tmp/transmuxd -version)" "$$(/tmp/playbackd -version)"'
@@ -62,18 +74,19 @@ build: ## Compile ingest and playback services and print their embedded version
 # workflow calls this with VERSION set to the pushed tag.
 .PHONY: dist
 dist: ## Cross-compile release archives and checksums into $(DISTDIR)
+	@$(CHECK_VERSION)
 	rm -rf $(DISTDIR) && mkdir -p $(DISTDIR)
-	$(RUNGO) -e CGO_ENABLED=0 -e SOURCE_DATE_EPOCH=$$(git log -1 --format=%ct 2>/dev/null || echo 0) \
+	$(RUNGO) -e CGO_ENABLED=0 -e VERSION -e SOURCE_DATE_EPOCH=$$(git log -1 --format=%ct 2>/dev/null || echo 0) \
 	  $(GOIMAGE) sh -c 'set -e; apk add --no-cache tar >/dev/null; \
 	  for p in $(DIST_PLATFORMS); do \
-	    os=$${p%/*}; arch=$${p#*/}; name=transmux_$(VERSION)_$${os}_$${arch}; \
-	    stage=/tmp/stage/$$name; mkdir -p $$stage; \
+	    os=$${p%/*}; arch=$${p#*/}; name="transmux_$${VERSION}_$${os}_$${arch}"; \
+	    stage="/tmp/stage/$$name"; mkdir -p "$$stage"; \
 	    for cmd in transmuxd playbackd; do \
-	      GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" -o $$stage/$$cmd ./cmd/$$cmd; \
+	      GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "$(LDFLAGS)" -o "$$stage/$$cmd" ./cmd/$$cmd; \
 	    done; \
-	    for f in LICENSE NOTICE README.md README.en.md CHANGELOG.md; do [ ! -f $$f ] || cp $$f $$stage/; done; \
+	    for f in LICENSE NOTICE README.md README.en.md CHANGELOG.md; do [ ! -f $$f ] || cp $$f "$$stage/"; done; \
 	    tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@$$SOURCE_DATE_EPOCH \
-	      -C /tmp/stage -czf $(DISTDIR)/$$name.tar.gz $$name; \
+	      -C /tmp/stage -czf "$(DISTDIR)/$$name.tar.gz" "$$name"; \
 	  done; \
 	  cd $(DISTDIR) && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS; \
 	  chown -R $(shell id -u):$(shell id -g) /src/$(DISTDIR)'
@@ -98,10 +111,14 @@ test-ffmpeg: ## Tests that need a real ffmpeg binary (build tag: ffmpeg)
 	  go test ./... -count=1 -tags ffmpeg -v -timeout 10m
 
 .PHONY: image
+# Docker tags cannot contain '+', so SemVer build metadata (v1.0.0+build.1)
+# is kept in the binary version but mapped to '_' in the image tag.
 image: ## Build the runtime container image
+	@$(CHECK_VERSION)
+	tag=$$(printf '%s' "$$VERSION" | tr '+' '_'); \
 	$(DOCKER) build -f deploy/Dockerfile --target runtime \
-	  --build-arg VERSION=$(VERSION) --build-arg REVISION=$(REVISION) \
-	  -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
+	  --build-arg VERSION="$$VERSION" --build-arg REVISION="$$REVISION" \
+	  -t "$(IMAGE):$$tag" -t $(IMAGE):latest .
 
 .PHONY: poc-up
 poc-up: image ## Bring up the full PoC stack: MediaMTX + fake camera + transmuxd + RustFS (local S3)

@@ -13,7 +13,10 @@
 - 릴리스 파이프라인: `v*` 태그를 푸시하면 linux/amd64·arm64 정적 바이너리
   (`transmuxd`, `playbackd`) 묶음, `SHA256SUMS`, SPDX SBOM을 첨부한
   GitHub Release와 `ghcr.io/jeonghun-app/transmux` 멀티아키텍처 이미지를
-  게시한다. 릴리스 노트는 이 파일의 해당 버전 절에서 가져온다.
+  게시한다. 릴리스 노트는 이 파일의 해당 버전 절에서 가져온다. 태그는
+  `vMAJOR.MINOR.PATCH[-PRERELEASE]` 형식만 받고, 이미 게시된 버전은 다시
+  게시하지 않는다(수정은 다음 패치 버전으로 한다). `latest` 이미지 태그는
+  정식 버전에만 붙는다.
 - `make dist`(릴리스 묶음과 체크섬 생성), `make lint-actions`(컨테이너로
   actionlint 실행).
 - 런타임 이미지에 OCI 라벨(`source`, `version`, `revision`, `licenses`
