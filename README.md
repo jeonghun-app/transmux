@@ -29,6 +29,7 @@ make test-ffmpeg   # 실제 ffmpeg이 필요한 통합 테스트
 make image         # 런타임 이미지 빌드
 
 make poc-up        # 가짜 카메라 2대 + MediaMTX + transmuxd + MinIO
+make poc-up-capacity  # 위 + 용량 측정용 1080p/D1/720p 소스
 make poc-verify    # 종단 검증 (재생 가능성, 매니페스트 정합성)
 make poc-logs      # transmuxd 로그
 make poc-down      # 정리
@@ -42,7 +43,7 @@ MediaMTX가 카메라 역할을, MinIO가 S3 역할을 한다. 가짜 카메라 
 용량 측정:
 
 ```bash
-make poc-up
+make poc-up-capacity                              # 1080p/D1/720p 소스까지 포함
 ./scripts/measure-capacity.sh 2 10 25 50          # 메모리, FD, 프로세스 수
 ./scripts/measure-cpu.sh --profile hd 1 10 25 50  # CPU (cgroup 정밀 측정)
 ```
@@ -50,7 +51,11 @@ make poc-up
 `measure-cpu.sh`는 `docker stats` 대신 cgroup v2 `cpu.stat`을 읽어 실제 소비된
 CPU 시간을 측정하고, ffmpeg과 supervisor를 분리해 보여주며, 채널 수에 대한
 기울기를 회귀로 구해 마진 비용을 낸다. 프로파일은 `shortgop`(GOP 2초),
-`longgop`(GOP 8초), `hd`(1080p 4Mbps)다.
+`longgop`(GOP 8초), `d1`(704×480 0.5Mbps), `hd720`(720p 1Mbps),
+`hd`(1080p 4Mbps)다. `d1`·`hd720`·`hd`는 `poc-up-capacity`로 띄운 소스가
+필요하고, 스크립트가 측정 전에 실제 스트림을 프로브해 publisher가 없으면
+거부한다 — publisher 없는 경로는 RTSP 계층에서 오류가 아니라 그냥 무음이므로
+유휴 채널의 CPU를 측정한 값이 나오기 때문이다.
 
 ## 설정
 
@@ -136,8 +141,12 @@ S3 일시 장애로 liveness를 실패시키면 오케스트레이터가 컨테�
 | 카메라 단절 | `transmux_channel_state` = 3 또는 4, `transmux_channel_reconnects_total` 증가 |
 | 세그먼트 누락 | `transmux_channel_segment_gap_alarm` = 1 |
 | 세그먼트 유실(업로드 전 회수) | `transmux_channel_segments_lost_total` 증가 |
-| S3 장애 | `transmux_channel_upload_failures_total` 증가 + `state` = 2(receiving) |
-| 세그먼트는 저장됐지만 재생에 안 보임 | `segments_published_total`은 오르는데 `last_manifest_timestamp`가 정지 |
+| S3 장애 | `transmux_channel_segment_upload_failures_total` 증가 + `state` = 2(receiving) |
+| 세그먼트는 저장됐지만 재생에 안 보임 | `transmux_channel_manifest_upload_failures_total` 증가, `seconds_since_manifest` 상승 |
+| 스풀 고갈 임박 | `transmux_channel_spool_oldest_seconds`가 `local_list_size × 세그먼트 길이`에 접근 |
+| 채널 영구 정지 | `transmux_channel_failed_total` 증가 (운영자 개입 필요) |
+| 종료 시 flush 실패 | `transmux_channel_final_drain_failures_total` 증가 |
+| 카메라가 PDT를 안 줌 | `transmux_channel_missing_pdt_total` 증가 (날짜 디렉터리가 업로드 시각으로 대체됨) |
 | 카메라 장애와 S3 장애 구분 | `last_ffmpeg_segment_timestamp` vs `last_segment_timestamp` |
 
 마지막 항목이 중요하다. ffmpeg은 세그먼트를 만들고 있는데 발행 시각만
@@ -147,7 +156,11 @@ S3 일시 장애로 liveness를 실패시키면 오케스트레이터가 컨테�
 세그먼트가 플레이어에 보이려면 매니페스트가 갱신되어야 하고, 그 시각은
 `transmux_channel_last_manifest_timestamp_seconds`가 알려준다. 세그먼트 PUT은
 되는데 매니페스트 PUT만 실패하는 상태가 실제로 존재하므로 두 신호를 분리해서
-본다.
+본다. `upload_failures_total`은 둘의 합계로 남겨두었다.
+
+`seconds_since_segment`, `seconds_since_manifest`, `segment_gap_alarm`은 스크랩
+시점에 계산한다. 저장된 게이지로 두면 재연결 backoff 중이나 `failed` 상태에서
+갱신이 멈춰, 정작 필요한 순간에 오래된 값을 보게 된다.
 
 ## 알려진 제약과 미구현
 
@@ -183,7 +196,10 @@ PoC 스택에서 실제로 확인한 항목이다.
 - 카메라 단절 시 지수 backoff(full jitter, `[base/2, min(base×factor^n, max)]`)로
   재연결, 시퀀스 되돌림 없음, `EXT-X-DISCONTINUITY` 삽입, 유실 0
 - 오브젝트 스토어 30초 장애 중 ffmpeg 재시작 없음, 복구 후 스풀에 남은
-  세그먼트 전부 업로드, 유실 0
+  세그먼트 전부 업로드, 유실 0. 재측정(35초 중단) 기록: 스풀 9파일 7.0MB까지
+  누적, `spool_oldest_seconds` 34초, `seconds_since_manifest` 38초,
+  `reconnects_total` 0, 복구 후 `segments_published_total` 53 → 70,
+  `segments_lost_total` 0
 - SIGTERM 시 남은 세그먼트를 최대 15초 동안 flush 후 종료(그 안에 스토어가
   응답하지 않으면 남은 것은 유실로 로깅된다), 좀비 프로세스 0, exit code 0
 - 카메라가 전혀 없는 상태에서 25채널을 띄워도 크래시 없음

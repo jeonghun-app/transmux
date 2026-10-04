@@ -4,8 +4,8 @@ package ffmpeg
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strconv"
-	"time"
 
 	"github.com/jeonghun-app/transmux/internal/config"
 )
@@ -17,6 +17,18 @@ const SegmentPattern = "seg-%06d.ts"
 
 // LocalPlaylistName is the playlist ffmpeg maintains on the spool.
 const LocalPlaylistName = "local.m3u8"
+
+// ValidSegmentName reports whether a name from the local playlist is one
+// ffmpeg could have written for SegmentPattern.
+//
+// The playlist is a file on disk and its contents are joined onto the spool
+// path, so it is treated as untrusted input: a crafted entry must not be able
+// to reach outside the channel's own directory.
+func ValidSegmentName(name string) bool {
+	return segmentNamePattern.MatchString(name)
+}
+
+var segmentNamePattern = regexp.MustCompile(`^seg-\d{1,10}\.ts$`)
 
 // Spec describes one transmux invocation.
 type Spec struct {
@@ -77,10 +89,14 @@ func OutputArgs(s Spec) ([]string, error) {
 	if s.Segment.LocalListSize <= 0 {
 		return nil, fmt.Errorf("local_list_size must be > 0")
 	}
-	hlsTime := int(s.Segment.TargetDuration.Duration / time.Second)
-	if hlsTime < 1 {
-		hlsTime = 1
+	// Rendered as a decimal rather than truncated to whole seconds: a 1500ms
+	// target used to become "1", silently halving the segment length the
+	// operator asked for.
+	secs := s.Segment.TargetDuration.Duration.Seconds()
+	if secs < 1 {
+		secs = 1
 	}
+	hlsTime := strconv.FormatFloat(secs, 'f', -1, 64)
 	return []string{
 		// Video only for now. Audio needs a per-codec HLS policy (AAC is
 		// fine in MPEG-TS, G.711 is not) and cameras vary, so it is an
@@ -90,7 +106,7 @@ func OutputArgs(s Spec) ([]string, error) {
 		"-c:v", "copy",
 
 		"-f", "hls",
-		"-hls_time", strconv.Itoa(hlsTime),
+		"-hls_time", hlsTime,
 		"-hls_list_size", strconv.Itoa(s.Segment.LocalListSize),
 		// temp_file: ffmpeg writes <name>.tmp then renames, so the presence
 		//   of seg-N.ts means the segment is complete. The uploader relies

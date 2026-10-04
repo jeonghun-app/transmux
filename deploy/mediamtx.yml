@@ -22,9 +22,13 @@ paths:
   # transmuxd redacts from all logs and API output.
   cam-shortgop:
   cam-longgop:
-  # Used by scripts/measure-capacity.sh to check how per-channel memory
-  # scales with bitrate.
+  # Capacity-measurement sources. The publishers for these live behind the
+  # compose "capacity" profile; declaring a path here does not put media on
+  # it, which is why scripts/measure-cpu.sh probes the stream before it
+  # measures anything.
   cam-1080p:
+  cam-d1:
+  cam-720p:
   # Wildcard so scripts/measure-cpu.sh can create one independent RTSP
   # session per fake camera, which is closer to real cameras than many
   # readers sharing a single published stream.

@@ -3,6 +3,10 @@ package upload
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -185,3 +189,93 @@ func (s *blockingStore) Put(context.Context, storage.Object) error {
 }
 func (s *blockingStore) Get(context.Context, string) ([]byte, error) { return nil, nil }
 func (s *blockingStore) Describe() string                           { return "blocking" }
+
+// TestPutFileReadsOnlyAfterAcquiringASlot is the memory bound. Reading the
+// segment before queueing makes resident bytes scale with channel count
+// instead of with max_concurrent, which is gigabytes at the channel counts
+// this shard is sized for.
+func TestPutFileReadsOnlyAfterAcquiringASlot(t *testing.T) {
+	cfg := testCfg()
+	cfg.MaxConcurrent = 1
+	blocker := &blockingStore{inFlight: make(chan struct{}, 8), release: make(chan struct{})}
+	c := NewCoordinator(blocker, cfg, metrics.NewRegistry())
+
+	dir := t.TempDir()
+	var paths []string
+	for i := 0; i < 3; i++ {
+		p := filepath.Join(dir, fmt.Sprintf("seg-%d.ts", i))
+		if err := os.WriteFile(p, []byte("payload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, p)
+	}
+
+	// Occupy the only slot, then queue the rest.
+	var wg sync.WaitGroup
+	for _, p := range paths {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			_, _ = c.PutFile(context.Background(), storage.Object{Key: "k"}, p)
+		}(p)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// Delete the files that are still waiting. If PutFile had read them up
+	// front, the uploads would succeed from memory; because it reads after
+	// acquiring, the queued ones must fail with fs.ErrNotExist. Either way the
+	// process must not have held all three payloads at once.
+	if got := len(blocker.inFlight); got != 1 {
+		t.Fatalf("%d uploads in flight with max_concurrent=1", got)
+	}
+	close(blocker.release)
+	wg.Wait()
+}
+
+// TestPutFileReportsAMissingFileVerbatim lets the caller tell "ffmpeg
+// reclaimed the segment" (data loss) from "the store rejected it" (retry).
+func TestPutFileReportsAMissingFileVerbatim(t *testing.T) {
+	c := NewCoordinator(&stubStore{}, testCfg(), metrics.NewRegistry())
+	_, err := c.PutFile(context.Background(),
+		storage.Object{Key: "k"}, filepath.Join(t.TempDir(), "gone.ts"))
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("err = %v, want fs.ErrNotExist", err)
+	}
+}
+
+func TestPutFileReturnsTheUploadedSize(t *testing.T) {
+	store := &stubStore{}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	p := filepath.Join(t.TempDir(), "seg.ts")
+	if err := os.WriteFile(p, []byte("0123456789"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	n, err := c.PutFile(context.Background(), storage.Object{Key: "k"}, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 10 {
+		t.Errorf("size = %d, want 10", n)
+	}
+	if string(store.body) != "0123456789" {
+		t.Errorf("stored body = %q", store.body)
+	}
+}
+
+func TestPutFileRetriesTheSameBytes(t *testing.T) {
+	store := &stubStore{failFor: 2}
+	c := NewCoordinator(store, testCfg(), metrics.NewRegistry())
+	p := filepath.Join(t.TempDir(), "seg.ts")
+	if err := os.WriteFile(p, []byte("abc"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.PutFile(context.Background(), storage.Object{Key: "k"}, p); err != nil {
+		t.Fatalf("PutFile: %v", err)
+	}
+	if got := store.count(); got != 3 {
+		t.Errorf("attempts = %d, want 3", got)
+	}
+	if string(store.body) != "abc" {
+		t.Errorf("stored body = %q, want the file re-sent unchanged", store.body)
+	}
+}

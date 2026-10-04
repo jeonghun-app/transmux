@@ -19,9 +19,18 @@ import (
 	"github.com/jeonghun-app/transmux/internal/metrics"
 )
 
+// StatusSource is the view of the channel manager the monitoring endpoints
+// need. It is an interface so the handler can be tested against specific
+// shard states without running real workers.
+type StatusSource interface {
+	Status() channel.Status
+	Snapshots() []channel.Snapshot
+	Snapshot(centerID, cameraID string) (channel.Snapshot, bool)
+}
+
 // Handler serves the monitoring endpoints.
 type Handler struct {
-	mgr   *channel.Manager
+	mgr   StatusSource
 	reg   *metrics.Registry
 	log   *slog.Logger
 	store string
@@ -31,7 +40,7 @@ type Handler struct {
 	degradedRatio float64
 }
 
-func NewHandler(mgr *channel.Manager, reg *metrics.Registry, storeDesc string, log *slog.Logger) *Handler {
+func NewHandler(mgr StatusSource, reg *metrics.Registry, storeDesc string, log *slog.Logger) *Handler {
 	return &Handler{mgr: mgr, reg: reg, log: log, store: storeDesc, degradedRatio: 0.5}
 }
 

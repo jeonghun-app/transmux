@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"time"
 
 	"github.com/jeonghun-app/transmux/internal/config"
@@ -77,6 +78,45 @@ func (c *Coordinator) Put(ctx context.Context, obj storage.Object) error {
 	}
 	defer func() { <-c.sem }()
 
+	return c.attempts(ctx, obj)
+}
+
+// PutFile uploads the contents of srcPath, reading the file only after a
+// concurrency slot has been acquired.
+//
+// That ordering is the whole point. Reading first and then queueing bounds
+// resident segment bodies by channel count instead of by max_concurrent: a
+// shard with several hundred channels and a slow store would hold one entire
+// segment per channel in the Go heap while waiting for a slot, which is
+// gigabytes at the channel counts this is sized for.
+//
+// A missing file is returned as-is so the caller can tell "ffmpeg reclaimed
+// it" (data loss, count it) from "the store rejected it" (retry it). The
+// bytes are returned because the caller needs the size it actually uploaded.
+func (c *Coordinator) PutFile(ctx context.Context, obj storage.Object, srcPath string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	select {
+	case c.sem <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	defer func() { <-c.sem }()
+
+	body, err := os.ReadFile(srcPath)
+	if err != nil {
+		return 0, err
+	}
+	obj.Body = body
+	if err := c.attempts(ctx, obj); err != nil {
+		return 0, err
+	}
+	return int64(len(body)), nil
+}
+
+// attempts runs the retry loop. The caller must already hold a semaphore slot.
+func (c *Coordinator) attempts(ctx context.Context, obj storage.Object) error {
 	c.inFlight.Add(1)
 	defer c.inFlight.Add(-1)
 

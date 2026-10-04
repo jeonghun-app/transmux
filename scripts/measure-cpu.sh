@@ -19,7 +19,8 @@
 # hundreds of ffmpeg processes caused the scheduler thrashing that is often
 # claimed, the slope would rise with N. Look at the MARGINAL column.
 #
-# Prerequisite: the PoC stack is up (make poc-up).
+# Prerequisite: the PoC stack is up. The hd, d1 and hd720 profiles need the
+# capacity sources too, so use `make poc-up-capacity` for those.
 #
 # Usage: scripts/measure-cpu.sh [--profile shortgop|longgop|hd] [counts...]
 #        scripts/measure-cpu.sh 1 10 25 50 75
@@ -48,6 +49,39 @@ case "$PROFILE" in
   hd720)    RTSP_PATH=cam-720p     ;;   # 1280x720 1Mbps   GOP 2s
   *) echo "unknown profile: $PROFILE" >&2; exit 2 ;;
 esac
+
+# A declared MediaMTX path with no publisher is not an error at the RTSP layer:
+# transmuxd connects, receives nothing, and the run reports the CPU cost of
+# idle channels. Refuse to produce that number.
+#
+# The check probes the stream rather than asking the MediaMTX API, which needs
+# credentials in 1.9.x, and rather than trusting that a publisher container is
+# running, which does not prove media is flowing.
+require_publisher() {
+  path="$1"
+  if ! docker ps --format '{{.Names}}' | grep -qx transmux-verifier; then
+    echo "the PoC stack is not running; start it with: make poc-up-capacity" >&2
+    exit 2
+  fi
+  if docker exec transmux-verifier timeout 15 ffprobe -v error \
+       -rtsp_transport tcp -i "rtsp://mediamtx:8554/$path" \
+       -show_entries stream=codec_name -of csv=p=0 >/dev/null 2>&1; then
+    return 0
+  fi
+  cat >&2 <<MSG
+no publisher on RTSP path "$path" (profile $PROFILE).
+
+The 1080p, D1 and 720p sources live behind the compose "capacity" profile so a
+normal PoC run does not pay for three extra encoders. Start them with:
+
+    make poc-up-capacity
+
+Measuring without a publisher would report the cost of idle channels, not of
+the profile.
+MSG
+  exit 2
+}
+require_publisher "$RTSP_PATH"
 
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
 trap cleanup EXIT

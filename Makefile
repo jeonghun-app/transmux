@@ -58,6 +58,10 @@ image: ## Build the runtime container image
 poc-up: image ## Bring up the full PoC stack: MediaMTX + fake camera + transmuxd + MinIO
 	$(DOCKER) compose -f deploy/docker-compose.poc.yml up -d --build
 
+.PHONY: poc-up-capacity
+poc-up-capacity: image ## PoC stack plus the 1080p/D1/720p sources the capacity scripts need
+	$(DOCKER) compose -f deploy/docker-compose.poc.yml --profile capacity up -d --build
+
 .PHONY: poc-logs
 poc-logs: ## Follow transmuxd logs in the PoC stack
 	$(DOCKER) compose -f deploy/docker-compose.poc.yml logs -f transmuxd
@@ -67,12 +71,12 @@ poc-verify: ## Assert the PoC produced a playable, self-consistent stream in Min
 	$(DOCKER) compose -f deploy/docker-compose.poc.yml exec -T verifier /verify.sh
 
 .PHONY: measure-cpu
-measure-cpu: ## Measure precise per-channel CPU cost (needs poc-up)
+measure-cpu: ## Measure precise per-channel CPU cost (needs poc-up-capacity)
 	./scripts/measure-cpu.sh --profile hd 1 10 25 50
 
 .PHONY: poc-down
 poc-down: ## Tear down the PoC stack and its volumes
-	$(DOCKER) compose -f deploy/docker-compose.poc.yml down -v
+	$(DOCKER) compose -f deploy/docker-compose.poc.yml --profile capacity down -v
 
 .PHONY: clean
 clean:

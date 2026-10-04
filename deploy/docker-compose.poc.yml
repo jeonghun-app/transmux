@@ -98,6 +98,131 @@ services:
       - rtsp://mediamtx:8554/cam-longgop
     restart: unless-stopped
 
+  # ---- capacity-measurement sources ------------------------------------
+  # Behind the "capacity" profile so a normal `make poc-up` does not pay for
+  # three extra encoders. scripts/measure-cpu.sh needs them: its --profile
+  # flag selects an RTSP path, and mediamtx.yml declaring a path is not the
+  # same as something publishing to it. Without a publisher the path exists
+  # but carries no media, so the run silently measures idle channels.
+  #
+  #   make poc-up-capacity
+  #
+  # The encoder parameters match the profiles in docs/capacity-model.md.
+  cam-1080p:
+    image: transmux:test
+    container_name: transmux-cam-1080p
+    profiles: ["capacity"]
+    depends_on:
+      - mediamtx
+    entrypoint: ["ffmpeg"]
+    command:
+      - -hide_banner
+      - -loglevel
+      - warning
+      - -re
+      - -f
+      - lavfi
+      - -i
+      - testsrc2=size=1920x1080:rate=25
+      - -c:v
+      - libx264
+      - -preset
+      - ultrafast
+      - -tune
+      - zerolatency
+      - -b:v
+      - "4000k"
+      - -g
+      - "100"
+      - -keyint_min
+      - "100"
+      - -sc_threshold
+      - "0"
+      - -an
+      - -f
+      - rtsp
+      - -rtsp_transport
+      - tcp
+      - rtsp://mediamtx:8554/cam-1080p
+    restart: unless-stopped
+
+  # Typical surveillance D1.
+  cam-d1:
+    image: transmux:test
+    container_name: transmux-cam-d1
+    profiles: ["capacity"]
+    depends_on:
+      - mediamtx
+    entrypoint: ["ffmpeg"]
+    command:
+      - -hide_banner
+      - -loglevel
+      - warning
+      - -re
+      - -f
+      - lavfi
+      - -i
+      - testsrc2=size=704x480:rate=25
+      - -c:v
+      - libx264
+      - -preset
+      - ultrafast
+      - -tune
+      - zerolatency
+      - -b:v
+      - "500k"
+      - -g
+      - "50"
+      - -keyint_min
+      - "50"
+      - -sc_threshold
+      - "0"
+      - -an
+      - -f
+      - rtsp
+      - -rtsp_transport
+      - tcp
+      - rtsp://mediamtx:8554/cam-d1
+    restart: unless-stopped
+
+  cam-720p:
+    image: transmux:test
+    container_name: transmux-cam-720p
+    profiles: ["capacity"]
+    depends_on:
+      - mediamtx
+    entrypoint: ["ffmpeg"]
+    command:
+      - -hide_banner
+      - -loglevel
+      - warning
+      - -re
+      - -f
+      - lavfi
+      - -i
+      - testsrc2=size=1280x720:rate=25
+      - -c:v
+      - libx264
+      - -preset
+      - ultrafast
+      - -tune
+      - zerolatency
+      - -b:v
+      - "1000k"
+      - -g
+      - "50"
+      - -keyint_min
+      - "50"
+      - -sc_threshold
+      - "0"
+      - -an
+      - -f
+      - rtsp
+      - -rtsp_transport
+      - tcp
+      - rtsp://mediamtx:8554/cam-720p
+    restart: unless-stopped
+
   minio:
     image: minio/minio:RELEASE.2024-10-13T13-34-11Z
     container_name: transmux-minio
