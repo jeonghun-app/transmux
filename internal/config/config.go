@@ -123,6 +123,7 @@ type StorageConfig struct {
 	TagMedia bool `json:"tag_media"`
 
 	// KeyPrefix scopes channel media and leases; the shared roster has its own full key.
+	// Load removes surrounding slashes so every consumer uses the same namespace.
 	KeyPrefix string `json:"key_prefix"`
 
 	// ManifestName is the object name of the live playlist, stored at
@@ -240,7 +241,7 @@ func Default() Config {
 		MaxChannels: 75,
 		SpoolDir:    "/run/transmux/spool",
 		StateDir:    "/var/lib/transmux/state",
-		HTTPListen:  ":8080",
+		HTTPListen:  "127.0.0.1:8080",
 		Segment: SegmentConfig{
 			TargetDuration: Duration{5 * time.Second},
 			LiveWindow:     6,
@@ -308,6 +309,7 @@ func Load(path string) (Config, error) {
 	if err := cfg.Validate(); err != nil {
 		return cfg, err
 	}
+	cfg.Storage.KeyPrefix = strings.Trim(cfg.Storage.KeyPrefix, "/")
 	return cfg, nil
 }
 

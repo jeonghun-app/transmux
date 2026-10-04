@@ -156,6 +156,17 @@ type HTTPProvider struct {
 func (p *HTTPProvider) Name() string { return "http" }
 
 func (p *HTTPProvider) Cameras(ctx context.Context) ([]Camera, error) {
+	roster, err := p.Load(ctx)
+	if err != nil {
+		return nil, err
+	}
+	cameras, err := convert(roster)
+	return assigned(cameras, p.shard), err
+}
+
+// Load returns the complete catalog, including disabled cameras and other
+// shards, so retained recordings remain accessible after ingestion stops.
+func (p *HTTPProvider) Load(ctx context.Context) ([]config.StaticCamera, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create camera provider request: invalid URL or context")
@@ -201,8 +212,10 @@ func (p *HTTPProvider) Cameras(ctx context.Context) ([]Camera, error) {
 	if raw == nil {
 		return nil, fmt.Errorf("camera provider payload must be an array; use [] for an empty roster")
 	}
-	cameras, err := convert(raw)
-	return assigned(cameras, p.shard), err
+	if err := ValidateRoster(raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
 }
 
 // NewProvider builds the provider selected by configuration.

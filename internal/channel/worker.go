@@ -1658,7 +1658,7 @@ func (w *Worker) putManifest(ctx context.Context, pending *manifestWrite) (strin
 // {center_id}/{camera_id}/... layout.
 func (w *Worker) objectKey(rel string) string {
 	parts := make([]string, 0, 4)
-	if p := strings.Trim(w.cfg.Storage.KeyPrefix, "/"); p != "" {
+	if p := w.cfg.Storage.KeyPrefix; p != "" {
 		parts = append(parts, p)
 	}
 	parts = append(parts, w.cam.CenterID, w.cam.CameraID, rel)
