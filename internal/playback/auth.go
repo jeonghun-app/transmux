@@ -193,7 +193,8 @@ const (
 	// while failed guesses against one configured account are bounded
 	// independently of how many addresses an attacker controls. Reaching the
 	// account limit locks that account for the rest of its window; this is
-	// intended, and a successful sign-in is never counted.
+	// intended. Each attempt is counted before the password is checked, so
+	// concurrent guesses cannot exceed the limit, and refunded on success.
 	loginClientLimit   = 30
 	loginAccountLimit  = 10
 	loginOverflowLimit = 300
@@ -214,12 +215,19 @@ type loginRate struct {
 // loginLimiter is a fixed-window attempt counter. When the table is full of
 // live entries, new keys share one overflow bucket with its own limit, so
 // filling the table neither evicts a key that is being limited nor refuses
-// every newcomer outright.
+// every newcomer outright. Once that bucket is spent, new clients are
+// refused together until entries expire; the counters make this visible.
 type loginLimiter struct {
 	mu       sync.Mutex
 	limit    int
 	overflow int
 	entries  map[string]loginRate
+	// Overflow bucket attempts and refusals since start, and the last time
+	// a saturation warning was issued.
+	overflowUsed    uint64
+	overflowRefused uint64
+	warnedAt        time.Time
+	warnedUsed      uint64
 }
 
 func newLoginLimiter(limit, overflow int) *loginLimiter {
@@ -268,31 +276,61 @@ func (l *loginLimiter) allow(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	key, limit := l.slot(key, now)
-	return l.add(key, now) <= limit
+	ok := l.add(key, now) <= limit
+	if key == loginOverflowKey {
+		l.overflowUsed++
+		if !ok {
+			l.overflowRefused++
+		}
+	}
+	return ok
 }
 
-// exhausted reports, without counting, whether key has no attempts left.
-func (l *loginLimiter) exhausted(key string, now time.Time) bool {
+// refund returns an attempt counted by allow that turned out not to be a
+// failure, as long as its window is still open.
+func (l *loginLimiter) refund(key string, now time.Time) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	key, limit := l.slot(key, now)
-	return l.current(key, now).Count >= limit
+	entry := l.current(key, now)
+	switch {
+	case entry.Count > 1:
+		entry.Count--
+		l.entries[key] = entry
+	case entry.Count == 1:
+		delete(l.entries, key)
+	}
 }
 
-// fail counts one failed attempt against key.
-func (l *loginLimiter) fail(key string, now time.Time) {
+type overflowStatus struct {
+	Used    uint64 `json:"overflow_attempts"`
+	Refused uint64 `json:"overflow_refused"`
+}
+
+func (l *loginLimiter) status() overflowStatus {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	key, _ = l.slot(key, now)
-	l.add(key, now)
+	return overflowStatus{l.overflowUsed, l.overflowRefused}
+}
+
+// overflowWarning reports, at most once per window, that the overflow bucket
+// has been used since the previous warning.
+func (l *loginLimiter) overflowWarning(now time.Time) (overflowStatus, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.overflowUsed == l.warnedUsed || now.Sub(l.warnedAt) < loginWindow {
+		return overflowStatus{}, false
+	}
+	l.warnedAt, l.warnedUsed = now, l.overflowUsed
+	return overflowStatus{l.overflowUsed, l.overflowRefused}, true
 }
 
 // AccountKey returns the account budget key for username and whether it is
 // a configured account. Unknown names are mapped by a per-process secret
 // HMAC onto a fixed set of buckets that follow the same rules, so they cannot
-// exhaust memory or lock out a real account, and the 429 after repeated
-// failures does not reveal whether an account exists. An attacker cannot
-// aim names at one bucket without the secret.
+// exhaust memory or lock out a real account, and an attacker cannot aim names
+// at one bucket without the secret. This makes existence hard to tell from
+// the 429 behaviour, not impossible: an attacker who saturates many buckets
+// can see some unknown names refused where an untouched real account is not.
 func (a *Auth) AccountKey(username string) (string, bool) {
 	if _, exists := a.users[username]; exists {
 		return username, true

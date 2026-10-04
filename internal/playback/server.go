@@ -242,7 +242,12 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Retry-After", "60")
 		fail(w, http.StatusTooManyRequests, "login_rate_limit", "Wait a minute before signing in again.")
 	}
-	if !s.loginClients.allow(s.auth.ClientKey(r), time.Now()) {
+	allowed := s.loginClients.allow(s.auth.ClientKey(r), time.Now())
+	if status, warn := s.loginClients.overflowWarning(time.Now()); warn {
+		s.log.Warn("login client table is full; new clients share the overflow limit",
+			"overflow_attempts", status.Used, "overflow_refused", status.Refused)
+	}
+	if !allowed {
 		limited()
 		return
 	}
@@ -260,25 +265,32 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	if !known {
 		accounts = s.loginUnknown
 	}
-	if accounts.exhausted(key, time.Now()) {
+	// Count the attempt before verifying it, so concurrent guesses cannot
+	// pass the check together; only a verified failure keeps the count.
+	if !accounts.allow(key, time.Now()) {
 		limited()
 		return
 	}
 	if !take(s.loginSlots) {
+		accounts.refund(key, time.Now())
 		limited()
 		return
 	}
 	defer release(s.loginSlots)
 	token, claims, err := s.auth.Login(body.Username, body.Password)
 	if err != nil {
-		accounts.fail(key, time.Now())
 		fail(w, http.StatusUnauthorized, "invalid_credentials", "Username or password is incorrect.")
 		return
 	}
+	accounts.refund(key, time.Now())
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": token, "token_type": "Bearer", "expires_at": claims.ExpiresAt.Time,
 	})
 }
+
+// LoginStatus reports use of the shared overflow login bucket, so operators
+// can see when the client table is saturated.
+func (s *Server) LoginStatus() overflowStatus { return s.loginClients.status() }
 
 func (s *Server) loadRosterOnly(ctx context.Context) ([]config.StaticCamera, error) {
 	roster, _, err := s.loadRoster(ctx)

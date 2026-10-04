@@ -416,7 +416,7 @@ func TestLoginUnknownNamesAreLimitedLikeAccounts(t *testing.T) {
 	for _, name := range others {
 		key, _ := f.app.auth.AccountKey(name)
 		for n := 0; n < loginAccountLimit; n++ {
-			f.app.loginUnknown.fail(key, time.Now())
+			f.app.loginUnknown.allow(key, time.Now())
 		}
 	}
 	for n := 0; n < loginAccountLimit; n++ {
@@ -441,5 +441,80 @@ func TestLoginUnknownNamesAreLimitedLikeAccounts(t *testing.T) {
 	}
 	if status, _ := login(others[0], "wrong-password"); status != 429 {
 		t.Fatalf("exhausted unknown bucket was not limited: %d", status)
+	}
+}
+
+func TestExportReservationReadsOutstandingBeforeStatfs(t *testing.T) {
+	f := newFixture(t)
+	f.app.cfg.Export.MinFreeBytes = 128 << 20
+	const reserve = 300 << 20
+	f.app.jobsMu.Lock()
+	defer f.app.jobsMu.Unlock()
+	running := &exportSpace{reserve: reserve}
+	f.app.exportSpace[running] = struct{}{}
+	original := diskAvailable
+	t.Cleanup(func() { diskAvailable = original })
+	// Statfs reports one byte too little for both jobs; the running job then
+	// writes 64KiB before its counter could be read.
+	diskAvailable = func(string) (uint64, error) {
+		available := uint64(f.app.cfg.Export.MinFreeBytes) + 2*reserve - 1
+		running.written.Add(64 << 10)
+		return available, nil
+	}
+	if _, err := f.app.reserveExportSpace(reserve); !errors.Is(err, errExportSpace) {
+		t.Fatalf("stale free space paired with a newer write count: %v", err)
+	}
+}
+
+func TestLoginAccountLimitCountsAttemptsInFlight(t *testing.T) {
+	f := newFixture(t)
+	login := func(password string) int {
+		t.Helper()
+		resp, _ := f.request(t, "POST", "/v1/login", "", map[string]string{"username": "admin", "password": password}, nil)
+		return resp.StatusCode
+	}
+	for n := 1; n < loginAccountLimit; n++ {
+		if status := login("wrong-password"); status != 401 {
+			t.Fatalf("failure %d: %d", n, status)
+		}
+	}
+	// A concurrent attempt is still verifying its password: it holds the
+	// last failure slot, so this one may not also be checked.
+	f.app.loginAccounts.allow("admin", time.Now())
+	if status := login("wrong-password"); status != 429 {
+		t.Fatalf("concurrent guesses exceeded the failure limit: %d", status)
+	}
+	// The in-flight attempt succeeds and is refunded, freeing the slot.
+	f.app.loginAccounts.refund("admin", time.Now())
+	f.app.loginAccounts.refund("admin", time.Now()) // the refused attempt above
+	if status := login("test-only-password"); status != 200 {
+		t.Fatalf("refunded attempt still counted: %d", status)
+	}
+}
+
+func TestLoginOverflowSaturationIsObservable(t *testing.T) {
+	l := newLoginLimiter(1, 1)
+	now := time.Now()
+	for n := range loginTrackedKeys {
+		l.allow(fmt.Sprintf("k%d", n), now)
+	}
+	if _, warn := l.overflowWarning(now); warn {
+		t.Fatal("warned before the overflow bucket was used")
+	}
+	l.allow("new-1", now)
+	l.allow("new-2", now)
+	status, warn := l.overflowWarning(now)
+	if !warn || status.Used != 2 || status.Refused != 1 {
+		t.Fatalf("overflow warning: %v %+v", warn, status)
+	}
+	l.allow("new-3", now)
+	if _, warn := l.overflowWarning(now.Add(time.Second)); warn {
+		t.Fatal("warning repeated within the window")
+	}
+	if _, warn := l.overflowWarning(now.Add(loginWindow)); !warn {
+		t.Fatal("continued saturation was not reported after the window")
+	}
+	if got := l.status(); got.Used != 3 || got.Refused != 2 {
+		t.Fatalf("status: %+v", got)
 	}
 }

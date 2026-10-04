@@ -363,13 +363,17 @@ func (s *Server) reserveExportSpace(reserve int64) (*exportSpace, error) {
 	if err := os.MkdirAll(s.cfg.Export.TempDir, 0o750); err != nil {
 		return nil, err
 	}
-	available, err := diskAvailable(s.cfg.Export.TempDir)
-	if err != nil {
-		return nil, err
-	}
+	// Sum what running jobs still have to write before reading Statfs. Writes
+	// do not take jobsMu, so a write landing in between then lowers only the
+	// free space, never the outstanding total, and the check errs towards
+	// refusing instead of pairing a stale Statfs with a newer write count.
 	need := uint64(reserve) + uint64(s.cfg.Export.MinFreeBytes)
 	for space := range s.exportSpace {
 		need += uint64(space.outstanding())
+	}
+	available, err := diskAvailable(s.cfg.Export.TempDir)
+	if err != nil {
+		return nil, err
 	}
 	if available < need {
 		return nil, errExportSpace
