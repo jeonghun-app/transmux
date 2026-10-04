@@ -192,6 +192,11 @@ func (c Config) Validate() error {
 		c.Retention.Batch < 1 || c.Retention.Batch > 10000 {
 		return fmt.Errorf("invalid retention days, interval or batch")
 	}
+	// The index forgets days older than index.days, so a shorter index window
+	// would hide recordings that retention still keeps.
+	if c.Retention.Enabled && c.Index.Days < c.Retention.Days {
+		return fmt.Errorf("index.days (%d) must be at least retention.days (%d)", c.Index.Days, c.Retention.Days)
+	}
 	if c.MaxStreams < 1 || c.MaxStreams > 10000 || c.MaxSessions < 1 || c.MaxSessions > 10000 {
 		return fmt.Errorf("max_streams and max_recording_sessions must be 1..10000")
 	}

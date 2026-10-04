@@ -116,7 +116,7 @@ type StorageConfig struct {
 	Bucket   string `json:"bucket"`
 	Region   string `json:"region"`
 	Endpoint string `json:"endpoint"`
-	// ForcePathStyle is required for MinIO.
+	// ForcePathStyle is required for path-style S3-compatible servers such as RustFS.
 	ForcePathStyle bool `json:"force_path_style"`
 	// TagMedia attaches lifecycle tags to immutable media only. Enabling it
 	// requires s3:PutObjectTagging in addition to the existing write role.
