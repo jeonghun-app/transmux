@@ -26,9 +26,12 @@ type Scanner struct {
 	Days         int
 	Workers      int
 	Interval     time.Duration
-	Log          *slog.Logger
+	// ScanTimeout bounds one camera-day page. Zero means 30 seconds.
+	ScanTimeout time.Duration
+	Log         *slog.Logger
 
 	indexed  atomic.Uint64
+	removed  atomic.Uint64
 	rejected atomic.Uint64
 	failures atomic.Uint64
 	lastPass atomic.Int64
@@ -38,6 +41,7 @@ type Scanner struct {
 
 type Status struct {
 	Indexed  uint64    `json:"indexed_since_start"`
+	Removed  uint64    `json:"removed_since_start"`
 	Rejected uint64    `json:"rejected_since_start"`
 	Failures uint64    `json:"failures_since_start"`
 	LastPass time.Time `json:"last_pass"`
@@ -54,7 +58,7 @@ func (s *Scanner) Status() Status {
 	if ms := s.lastLive.Load(); ms != 0 {
 		live = time.UnixMilli(ms).UTC()
 	}
-	return Status{s.indexed.Load(), s.rejected.Load(), s.failures.Load(), last, s.active.Load(), live}
+	return Status{s.indexed.Load(), s.removed.Load(), s.rejected.Load(), s.failures.Load(), last, s.active.Load(), live}
 }
 
 func (s *Scanner) Run(ctx context.Context) {
@@ -97,6 +101,15 @@ func (s *Scanner) Pass(ctx context.Context) {
 		s.Log.Warn("recording index roster unavailable", "error", err)
 		return
 	}
+	// Days outside the scan window are never reconciled again. Dropping
+	// them bounds the file; S3 stays the source of truth for older media.
+	now := time.Now().UTC()
+	if s.Days > 0 {
+		if _, err := s.Index.Prune(midnight(now).AddDate(0, 0, 1-s.Days), 64); err != nil {
+			s.failures.Add(1)
+			s.Log.Warn("recording index prune failed", "error", err)
+		}
+	}
 	type job struct {
 		camera config.StaticCamera
 		day    time.Time
@@ -119,7 +132,6 @@ func (s *Scanner) Pass(ctx context.Context) {
 	}
 	// Recent recordings are indexed first, including yesterday's boundary
 	// segment. Backfill gets a bounded page per camera/day on every pass.
-	now := time.Now().UTC()
 send:
 	for offset := 0; offset < s.Days; offset++ {
 		day := midnight(now).AddDate(0, 0, -offset)
@@ -215,8 +227,16 @@ func (s *Scanner) scanLive(ctx context.Context, cam config.StaticCamera) error {
 	return nil
 }
 
+// ScanDay indexes one listed page of a camera-day and removes index entries
+// whose objects the page shows are gone. Progress is saved even when the time
+// budget or a store error ends the page early, so a slow store still advances.
 func (s *Scanner) ScanDay(ctx context.Context, cam config.StaticCamera, day time.Time) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	parent := ctx
+	timeout := s.ScanTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	state, err := s.Index.ScanState(cam.CenterID, cam.CameraID, day)
 	if err != nil {
@@ -228,45 +248,67 @@ func (s *Scanner) ScanDay(ctx context.Context, cam config.StaticCamera, day time
 		return nil
 	}
 	// A daily full reconciliation catches delayed writes inserted before
-	// the lexical cursor. Frequent passes use an overlap at the live tail.
+	// the lexical cursor and deletions anywhere in the day. Frequent passes
+	// use an overlap at the live tail.
 	if state.CycleStarted.IsZero() || now.Sub(state.CycleStarted) >= 24*time.Hour && state.Complete {
 		state.Cursor, state.CycleStarted, state.Complete = "", now, false
 	}
-	prefix := path.Join(s.Prefix, cam.CenterID, cam.CameraID, day.Format("2006/01/02")) + "/"
+	base := path.Join(s.Prefix, cam.CenterID, cam.CameraID) + "/"
+	prefix := base + day.Format("2006/01/02") + "/"
+	listedAt := time.Now()
 	page, err := s.Store.List(ctx, prefix, state.Cursor, 256)
 	if err != nil {
 		return err
 	}
+	// Deletions are reconciled before any HEAD so that a page cut short by
+	// the time budget still drops objects a Lifecycle rule has removed.
+	listed := make([]string, len(page.Entries))
+	for n, entry := range page.Entries {
+		listed[n] = strings.TrimPrefix(entry.Key, base)
+	}
+	upto := ""
+	if page.More && len(listed) > 0 {
+		upto = listed[len(listed)-1]
+	}
+	removed, err := s.Index.Reconcile(cam.CenterID, cam.CameraID, day,
+		strings.TrimPrefix(state.Cursor, base), upto, listed, listedAt)
+	if err != nil {
+		return err
+	}
+	s.removed.Add(uint64(removed))
 	var pending []Segment
-	for _, entry := range page.Entries {
-		uri := strings.TrimPrefix(entry.Key, path.Join(s.Prefix, cam.CenterID, cam.CameraID)+"/")
-		if _, _, err := hls.SegmentIdentity(uri); err != nil {
-			continue
-		}
-		if _, err := s.Index.Get(cam.CenterID, cam.CameraID, uri); err == nil {
-			continue
-		} else if !errors.Is(err, storage.ErrNotFound) {
-			return err
-		}
-		info, err := s.Store.Head(ctx, entry.Key)
-		if errors.Is(err, storage.ErrNotFound) {
-			continue // retention may remove an object after LIST
-		}
+	done := state.Cursor
+	var scanErr error
+	for n, entry := range page.Entries {
+		record, ok, err := s.indexEntry(ctx, cam, entry, listed[n])
 		if err != nil {
-			return err
+			scanErr = err
+			break
 		}
-		record, err := FromObject(s.Prefix, cam.CenterID, cam.CameraID, entry, info)
-		if err != nil {
-			s.rejected.Add(1)
-			s.Log.Warn("recording metadata rejected", "object", entry.Key, "error", err)
-			continue
+		if ok {
+			pending = append(pending, record)
 		}
-		pending = append(pending, record)
+		done = entry.Key
 	}
 	if err := s.Index.Put(pending); err != nil {
 		return err
 	}
 	s.indexed.Add(uint64(len(pending)))
+	if scanErr != nil {
+		if done == state.Cursor {
+			return scanErr
+		}
+		// Resume after the last object handled instead of repeating the
+		// page. Running out of the page budget is progress, not a failure.
+		state.Cursor, state.Complete = done, false
+		if err := s.Index.SaveScan(cam.CenterID, cam.CameraID, day, state); err != nil {
+			return err
+		}
+		if errors.Is(scanErr, context.DeadlineExceeded) && parent.Err() == nil {
+			return nil
+		}
+		return scanErr
+	}
 	if len(page.Entries) > 0 {
 		if page.More || old {
 			state.Cursor = page.Entries[len(page.Entries)-1].Key
@@ -276,4 +318,33 @@ func (s *Scanner) ScanDay(ctx context.Context, cam config.StaticCamera, day time
 	}
 	state.Complete, state.ScannedAt = !page.More, now
 	return s.Index.SaveScan(cam.CenterID, cam.CameraID, day, state)
+}
+
+// indexEntry returns the record of one listed object that is not yet indexed.
+// ok is false for skipped objects: other names, already indexed, deleted after
+// the listing or carrying invalid metadata.
+func (s *Scanner) indexEntry(ctx context.Context, cam config.StaticCamera, entry storage.Entry,
+	uri string) (Segment, bool, error) {
+	if _, _, err := hls.SegmentIdentity(uri); err != nil {
+		return Segment{}, false, nil
+	}
+	if _, err := s.Index.Get(cam.CenterID, cam.CameraID, uri); err == nil {
+		return Segment{}, false, nil
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return Segment{}, false, err
+	}
+	info, err := s.Store.Head(ctx, entry.Key)
+	if errors.Is(err, storage.ErrNotFound) {
+		return Segment{}, false, nil // retention may remove an object after LIST
+	}
+	if err != nil {
+		return Segment{}, false, err
+	}
+	record, err := FromObject(s.Prefix, cam.CenterID, cam.CameraID, entry, info)
+	if err != nil {
+		s.rejected.Add(1)
+		s.Log.Warn("recording metadata rejected", "object", entry.Key, "error", err)
+		return Segment{}, false, nil
+	}
+	return record, true, nil
 }

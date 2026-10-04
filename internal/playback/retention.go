@@ -64,23 +64,37 @@ func (s *Server) retentionPass(ctx context.Context, first int) int {
 	cutoff := time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -s.cfg.Retention.Days)
 	budget := s.cfg.Retention.Batch
 	next := first % len(roster)
-	for n := 0; n < len(roster) && budget > 0 && ctx.Err() == nil; n++ {
+	// Each turn gives one camera at most 64 listed objects, so a camera with
+	// a large backlog never starves the others. Turns repeat round robin until
+	// the batch is spent or every camera has reached its unexpired media.
+	finished := make([]bool, len(roster))
+	for active := len(roster); active > 0 && budget > 0 && ctx.Err() == nil; next = (next + 1) % len(roster) {
+		if finished[next] {
+			continue
+		}
 		cam := roster[next]
-		next = (next + 1) % len(roster)
 		cursorName := "retention/" + cam.CenterID + "/" + cam.CameraID
 		cursor, err := s.index.Cursor(cursorName)
 		if err != nil {
 			s.retentionError(err)
+			finished[next], active = true, active-1
 			continue
 		}
 		count, after, err := s.retainCamera(ctx, cam, cutoff, cursor, min(64, budget))
 		budget -= count
 		if err != nil {
 			s.retentionError(err)
+			finished[next], active = true, active-1
 			continue
 		}
 		if err := s.index.SaveCursor(cursorName, after); err != nil {
 			s.retentionError(err)
+			finished[next], active = true, active-1
+			continue
+		}
+		// An empty cursor restarts the sweep; that waits for the next pass.
+		if after == "" || count == 0 {
+			finished[next], active = true, active-1
 		}
 	}
 	return next

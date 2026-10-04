@@ -4,6 +4,7 @@
 package recording
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -31,6 +32,10 @@ var (
 	ErrTooMany     = errors.New("recording range contains too many segments")
 	segmentsBucket = []byte("segments-v1")
 	scansBucket    = []byte("scans-v1")
+	// objectsBucket maps each indexed object name to its segment record, per
+	// capture day, in the lexical order an S3 listing uses. It lets a listed
+	// page be reconciled against the index without scanning a whole day.
+	objectsBucket = []byte("objects-v1")
 )
 
 type Segment struct {
@@ -99,7 +104,7 @@ func Open(filename string) (*Index, error) {
 	}
 	var id string
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{segmentsBucket, scansBucket} {
+		for _, name := range [][]byte{segmentsBucket, scansBucket, objectsBucket} {
 			if _, err := tx.CreateBucketIfNotExists(name); err != nil {
 				return err
 			}
@@ -142,17 +147,56 @@ func partition(center, camera string, day time.Time) []byte {
 	return []byte(center + "/" + camera + "/" + day.UTC().Format("20060102"))
 }
 
+// objectValue is the record key followed by the time the entry was indexed.
+func objectValue(record []byte, indexed time.Time) []byte {
+	value := make([]byte, 24)
+	copy(value, record)
+	binary.BigEndian.PutUint64(value[16:], uint64(max(0, indexed.UnixMilli())))
+	return value
+}
+
+// objectNames returns the object-name bucket of one partition. A partition
+// written before that bucket existed is backfilled from its segment records
+// with a zero index time, so every existing entry is eligible to reconcile.
+func objectNames(tx *bolt.Tx, name []byte) (*bolt.Bucket, error) {
+	root := tx.Bucket(objectsBucket)
+	if bucket := root.Bucket(name); bucket != nil {
+		return bucket, nil
+	}
+	bucket, err := root.CreateBucket(name)
+	if err != nil {
+		return nil, err
+	}
+	segments := tx.Bucket(segmentsBucket).Bucket(name)
+	if segments == nil {
+		return bucket, nil
+	}
+	return bucket, segments.ForEach(func(key, raw []byte) error {
+		var s Segment
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return err
+		}
+		return bucket.Put([]byte(s.URI), objectValue(key, time.Time{}))
+	})
+}
+
 func (i *Index) Put(segments []Segment) error {
 	if len(segments) == 0 {
 		return nil
 	}
+	now := time.Now()
 	return i.db.Update(func(tx *bolt.Tx) error {
 		for _, s := range segments {
 			if !config.ValidID(s.CenterID) || !config.ValidID(s.CameraID) || s.Start.UnixMilli() < 0 ||
 				s.DurationMS < 1 || s.DurationMS > MaxSegmentDuration.Milliseconds() {
 				return fmt.Errorf("invalid recording index entry")
 			}
-			bucket, err := tx.Bucket(segmentsBucket).CreateBucketIfNotExists(partition(s.CenterID, s.CameraID, s.Start))
+			name := partition(s.CenterID, s.CameraID, s.Start)
+			names, err := objectNames(tx, name)
+			if err != nil {
+				return err
+			}
+			bucket, err := tx.Bucket(segmentsBucket).CreateBucketIfNotExists(name)
 			if err != nil {
 				return err
 			}
@@ -160,7 +204,11 @@ func (i *Index) Put(segments []Segment) error {
 			if err != nil {
 				return err
 			}
-			if err := bucket.Put(recordKey(s.Start, s.Sequence), raw); err != nil {
+			key := recordKey(s.Start, s.Sequence)
+			if err := bucket.Put(key, raw); err != nil {
+				return err
+			}
+			if err := names.Put([]byte(s.URI), objectValue(key, now)); err != nil {
 				return err
 			}
 		}
@@ -246,12 +294,138 @@ func (i *Index) Query(ctx context.Context, center, camera string, start, end tim
 
 func (i *Index) Remove(s Segment) error {
 	return i.db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(segmentsBucket).Bucket(partition(s.CenterID, s.CameraID, s.Start))
+		name := partition(s.CenterID, s.CameraID, s.Start)
+		if names := tx.Bucket(objectsBucket).Bucket(name); names != nil {
+			if err := names.Delete([]byte(s.URI)); err != nil {
+				return err
+			}
+		}
+		bucket := tx.Bucket(segmentsBucket).Bucket(name)
 		if bucket == nil {
 			return nil
 		}
 		return bucket.Delete(recordKey(s.Start, s.Sequence))
 	})
+}
+
+// reconcileGrace keeps entries indexed shortly before a listing began. It
+// absorbs wall-clock adjustments between the index write and the listing.
+var reconcileGrace = time.Minute
+
+// Reconcile removes the indexed segments of one capture day whose objects are
+// absent from a listing of the object-name range (after, upto]. An empty upto
+// means the listing reached the end of the day. S3 listings are strongly
+// consistent, so an object indexed before the listing began and missing from
+// it has been deleted, typically by a Lifecycle rule. An entry indexed after
+// the listing began may name an object written later and is kept.
+func (i *Index) Reconcile(center, camera string, day time.Time, after, upto string,
+	listed []string, listedAt time.Time) (int, error) {
+	present := make(map[string]bool, len(listed))
+	for _, name := range listed {
+		present[name] = true
+	}
+	before := uint64(max(0, listedAt.Add(-reconcileGrace).UnixMilli()))
+	removed := 0
+	err := i.db.Update(func(tx *bolt.Tx) error {
+		name := partition(center, camera, day)
+		segments := tx.Bucket(segmentsBucket).Bucket(name)
+		if segments == nil {
+			return nil
+		}
+		names, err := objectNames(tx, name)
+		if err != nil {
+			return err
+		}
+		type entry struct{ name, record []byte }
+		var stale []entry
+		c := names.Cursor()
+		k, v := c.Seek([]byte(after))
+		if k != nil && string(k) == after {
+			k, v = c.Next()
+		}
+		for ; k != nil; k, v = c.Next() {
+			if upto != "" && string(k) > upto {
+				break
+			}
+			if present[string(k)] || len(v) != 24 || binary.BigEndian.Uint64(v[16:]) >= before {
+				continue
+			}
+			stale = append(stale, entry{bytes.Clone(k), bytes.Clone(v[:16])})
+		}
+		for _, e := range stale {
+			// A later object with the same capture identity may own the
+			// record; then only the stale name is dropped.
+			if raw := segments.Get(e.record); raw != nil {
+				var s Segment
+				if err := json.Unmarshal(raw, &s); err != nil {
+					return err
+				}
+				if s.URI == string(e.name) {
+					if err := segments.Delete(e.record); err != nil {
+						return err
+					}
+					removed++
+				}
+			}
+			if err := names.Delete(e.name); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return removed, err
+}
+
+// Prune drops whole capture days before cutoff with their scan state. The
+// scanner no longer reconciles those days against S3, so keeping them would
+// list recordings that may be gone and grow the file without bound. At most
+// limit days are dropped per call to keep each write transaction small.
+func (i *Index) Prune(cutoff time.Time, limit int) (int, error) {
+	cutoff = midnight(cutoff)
+	expired := func(name []byte) bool {
+		parts := strings.Split(string(name), "/")
+		if len(parts) != 3 || !config.ValidID(parts[0]) || !config.ValidID(parts[1]) {
+			return false
+		}
+		day, err := time.Parse("20060102", parts[2])
+		return err == nil && day.Before(cutoff)
+	}
+	var names [][]byte
+	err := i.db.View(func(tx *bolt.Tx) error {
+		seen := map[string]bool{}
+		for _, root := range [][]byte{segmentsBucket, objectsBucket, scansBucket} {
+			c := tx.Bucket(root).Cursor()
+			for k, _ := c.First(); k != nil && len(names) < limit; k, _ = c.Next() {
+				if expired(k) && !seen[string(k)] {
+					seen[string(k)] = true
+					names = append(names, bytes.Clone(k))
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil || len(names) == 0 {
+		return 0, err
+	}
+	err = i.db.Update(func(tx *bolt.Tx) error {
+		for _, name := range names {
+			for _, root := range [][]byte{segmentsBucket, objectsBucket} {
+				if tx.Bucket(root).Bucket(name) != nil {
+					if err := tx.Bucket(root).DeleteBucket(name); err != nil {
+						return err
+					}
+				}
+			}
+			if err := tx.Bucket(scansBucket).Delete(name); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return len(names), nil
 }
 
 func (i *Index) Latest(center, camera string, now time.Time) (Segment, error) {
