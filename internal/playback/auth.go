@@ -271,33 +271,55 @@ func (l *loginLimiter) add(key string, now time.Time) int {
 	return entry.Count
 }
 
+// loginTicket identifies one counted attempt: the entry it was counted in
+// and the start of that entry's window.
+type loginTicket struct {
+	key string
+	at  time.Time
+}
+
 // allow counts the attempt and reports whether it is within the limit.
 func (l *loginLimiter) allow(key string, now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	key, limit := l.slot(key, now)
-	ok := l.add(key, now) <= limit
-	if key == loginOverflowKey {
-		l.overflowUsed++
-		if !ok {
-			l.overflowRefused++
-		}
-	}
+	_, ok := l.reserve(key, now)
 	return ok
 }
 
-// refund returns an attempt counted by allow that turned out not to be a
-// failure, as long as its window is still open.
-func (l *loginLimiter) refund(key string, now time.Time) {
+// reserve counts an attempt if it is within the limit and returns a ticket
+// for refunding it. A refused attempt is not counted, so it never needs a
+// refund and cannot keep a key locked after a counted attempt is returned.
+func (l *loginLimiter) reserve(key string, now time.Time) (loginTicket, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	entry := l.current(key, now)
+	key, limit := l.slot(key, now)
+	if key == loginOverflowKey {
+		l.overflowUsed++
+	}
+	if l.current(key, now).Count >= limit {
+		if key == loginOverflowKey {
+			l.overflowRefused++
+		}
+		return loginTicket{}, false
+	}
+	l.add(key, now)
+	return loginTicket{key, l.entries[key].At}, true
+}
+
+// refund returns an attempt counted by reserve that turned out not to be a
+// failure. It only applies to the window the attempt was counted in, so a
+// late refund cannot erase failures recorded in a newer window.
+func (l *loginLimiter) refund(ticket loginTicket) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	entry, exists := l.entries[ticket.key]
+	if !exists || !entry.At.Equal(ticket.at) {
+		return
+	}
 	switch {
 	case entry.Count > 1:
 		entry.Count--
-		l.entries[key] = entry
+		l.entries[ticket.key] = entry
 	case entry.Count == 1:
-		delete(l.entries, key)
+		delete(l.entries, ticket.key)
 	}
 }
 

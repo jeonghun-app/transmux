@@ -267,12 +267,13 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	// Count the attempt before verifying it, so concurrent guesses cannot
 	// pass the check together; only a verified failure keeps the count.
-	if !accounts.allow(key, time.Now()) {
+	ticket, ok := accounts.reserve(key, time.Now())
+	if !ok {
 		limited()
 		return
 	}
 	if !take(s.loginSlots) {
-		accounts.refund(key, time.Now())
+		accounts.refund(ticket)
 		limited()
 		return
 	}
@@ -282,7 +283,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusUnauthorized, "invalid_credentials", "Username or password is incorrect.")
 		return
 	}
-	accounts.refund(key, time.Now())
+	accounts.refund(ticket)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token": token, "token_type": "Bearer", "expires_at": claims.ExpiresAt.Time,
 	})

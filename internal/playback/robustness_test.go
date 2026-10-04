@@ -480,15 +480,39 @@ func TestLoginAccountLimitCountsAttemptsInFlight(t *testing.T) {
 	}
 	// A concurrent attempt is still verifying its password: it holds the
 	// last failure slot, so this one may not also be checked.
-	f.app.loginAccounts.allow("admin", time.Now())
+	inFlight, ok := f.app.loginAccounts.reserve("admin", time.Now())
+	if !ok {
+		t.Fatal("last attempt refused")
+	}
 	if status := login("wrong-password"); status != 429 {
 		t.Fatalf("concurrent guesses exceeded the failure limit: %d", status)
 	}
-	// The in-flight attempt succeeds and is refunded, freeing the slot.
-	f.app.loginAccounts.refund("admin", time.Now())
-	f.app.loginAccounts.refund("admin", time.Now()) // the refused attempt above
+	// The in-flight attempt succeeds and is refunded. The refused attempt
+	// was never counted, so the account is usable again without more.
+	f.app.loginAccounts.refund(inFlight)
 	if status := login("test-only-password"); status != 200 {
-		t.Fatalf("refunded attempt still counted: %d", status)
+		t.Fatalf("refused attempt kept the account locked: %d", status)
+	}
+}
+
+func TestLoginRefundOnlyAppliesToItsWindow(t *testing.T) {
+	l := newLoginLimiter(2, 2)
+	now := time.Now()
+	old, ok := l.reserve("admin", now)
+	if !ok {
+		t.Fatal("first attempt refused")
+	}
+	// The window rolls over while the old attempt is still verifying, and
+	// two failures land in the new window.
+	later := now.Add(loginWindow)
+	l.allow("admin", later)
+	l.allow("admin", later)
+	l.refund(old)
+	if l.allow("admin", later) {
+		t.Fatal("a refund from an old window erased a new failure")
+	}
+	if l.entries["admin"].Count != 2 {
+		t.Fatalf("refused attempt was counted: %d", l.entries["admin"].Count)
 	}
 }
 
