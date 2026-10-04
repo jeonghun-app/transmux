@@ -168,22 +168,28 @@ jobs:
         run: |
           ref="${IMAGE,,}:${GITHUB_REF_NAME}"
           if ! cfg=$(docker buildx imagetools inspect "$ref" --format '{{json .Image}}' 2>/tmp/inspect.err); then
-            if grep -qiE 'not found|manifest unknown' /tmp/inspect.err; then
+            # Proceed only when the registry says this tag has no manifest:
+            # buildx reports that as exactly "ERROR: <ref>: not found", and a
+            # registry may answer MANIFEST_UNKNOWN. Anything else (auth,
+            # network, a missing tool) fails closed.
+            if grep -qxF "ERROR: $ref: not found" /tmp/inspect.err ||
+               grep -qiE '(^|[^a-z_])manifest[ _]unknown' /tmp/inspect.err; then
               echo "$ref not published yet"
               exit 0
             fi
             cat /tmp/inspect.err
             exit 1
           fi
-          # A single-platform image is one config object; an index is a map
-          # of platform to config. Every platform comes from one build.
-          rev=$(jq -r 'if has("config") then .config else (to_entries[0].value.config) end
-                       | .Labels["org.opencontainers.image.revision"] // ""' <<<"$cfg")
-          if [ "$rev" != "$GITHUB_SHA" ]; then
-            echo "::error::$ref was built from '${rev}', not $GITHUB_SHA; publish a new version instead"
+          # A single-platform image is one config object; an index is a map of
+          # platform to config (attestation manifests are not included). Every
+          # platform must carry this commit's revision.
+          revs=$(jq -c '[if has("config") then .config else .[].config end
+                         | .Labels["org.opencontainers.image.revision"] // ""]' <<<"$cfg")
+          if ! jq -e --arg sha "$GITHUB_SHA" 'length > 0 and all(.[]; . == $sha)' <<<"$revs" >/dev/null; then
+            echo "::error::$ref has revisions $revs, not $GITHUB_SHA; publish a new version instead"
             exit 1
           fi
-          echo "$ref already built from $GITHUB_SHA; re-run will overwrite it with the same commit"
+          echo "$ref already built from $GITHUB_SHA on every platform; re-run will overwrite it"
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
