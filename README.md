@@ -168,7 +168,7 @@ playbackd -config /etc/transmux/playback.json -validate
 클라이언트 한도는 모든 로그인 시도에 30회/분이며 IPv6는 `/64` 단위로 묶는다.
 클라이언트 추적 키는 최대 10,000개이며, 가득 차면 신규 클라이언트는 공용 overflow
 버킷(300회/분)을 공유한다. 포화 시 신규 클라이언트가 함께 제한될 수 있으며,
-이 상태는 메트릭으로 관측할 수 있다. 이 한도들은 설정 키가 없는 상수다.
+이 상태는 관리자 상태 API(`GET /v1/admin/status`)의 `login.overflow_attempts`·`login.overflow_refused`와 경고 로그로 확인할 수 있다. 이 한도들은 설정 키가 없는 상수다.
 내보내기의 즉시 오류 응답은 [솔루션 API 가이드](docs/solution.md#api)를 참고한다.
 
 자격증명은 AWS SDK의 기본 체인으로 읽는다. 프로덕션은 ECS task role 또는 EKS

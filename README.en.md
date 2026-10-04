@@ -181,7 +181,7 @@ without an attack saturating many buckets, but do not guarantee complete conceal
 The client limit covers all login attempts at 30 per minute, grouping IPv6
 addresses by `/64`. At most 10,000 client keys are tracked. Once full, new clients
 share an overflow bucket limited to 300 per minute. Saturation can therefore
-limit new clients together; this state is observable through metrics.
+limit new clients together; this state is visible in `login.overflow_attempts` and `login.overflow_refused` of the admin status API (`GET /v1/admin/status`) and in a warning log.
 These limits are constants with no configuration keys. See the
 [solution API guide](docs/solution.md#api) for immediate export error responses.
 
