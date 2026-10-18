@@ -155,6 +155,7 @@ playbackd -config /etc/transmux/playback.json -validate
 
 | 키 | 의미 | 주의 |
 |---|---|---|
+| `metrics_listen` | 재생 서버의 내부 메트릭 주소(`GET /metrics`) | 기본 `127.0.0.1:8091`. 인증이 없으므로 `http_listen`과 같은 주소를 쓸 수 없다. 컨테이너 예제는 `:8091`을 명시하고 호스트에 공개하지 않는다 |
 | `auth.trusted_proxies` | `X-Forwarded-For`를 신뢰할 프록시 CIDR 문자열 배열 | 기본 `[]`, 최대 64개. 비어 있으면 `RemoteAddr`만 사용. TLS 리버스 프록시 뒤 배포 시 실제 프록시 CIDR 지정 필수 |
 | `export.min_free_bytes` | 내보내기 볼륨에 남길 최소 여유 바이트 | 기본 `1073741824` (1GiB), 허용 범위 128MiB∼1TiB. 작업별 예약은 `3 × (세그먼트 바이트 합 + 서로 다른 초기화 파일 수 × 1MiB) + (파일 수 + 2) × 64KiB`다. 파일 수는 세그먼트와 서로 다른 초기화 파일 수의 합이며, 진행 중 작업은 아직 기록하지 않은 예약분만 합산한다. 부족하면 시작 전에 `507 export_storage_full` (`Retry-After: 60`) 반환 |
 
@@ -332,6 +333,48 @@ S3 일시 장애로 liveness를 실패시키면 오케스트레이터가 컨테�
 HTTP 카메라 목록은 `StaticCamera` JSON 배열 계약을 따른다. 알 수 없는 필드,
 8MiB를 넘는 응답, 뒤에 다른 문서가 붙은 응답, `null`은 오류로 처리하고 기존
 채널을 유지한다. 전체 카메라를 해제하려면 명시적으로 `[]`를 반환해야 한다.
+
+## 재생 서버 모니터링
+
+`playbackd`는 공개 API와 분리된 내부 리스너(`metrics_listen`, 기본
+`127.0.0.1:8091`)에서 `GET /metrics`를 Prometheus 텍스트 형식으로 제공한다.
+공개 리스너(`http_listen`)에는 `/metrics`가 없으며 로그인 여부와 관계없이 `404`를
+반환한다. 메트릭 리스너에는 인증이 없으므로 내부 인터페이스에 바인딩하거나
+security group / service mesh 뒤에 둔다. 이 주소에 바인딩하지 못하면 `playbackd`는
+기동하지 않는다.
+
+| 메트릭 | 종류 | 라벨 | 의미 |
+|---|---|---|---|
+| `transmux_playback_http_requests_total` | counter | `route`, `status_class` | 공개 리스너 요청 수. `status_class`는 `2xx`∼`5xx` |
+| `transmux_playback_http_errors_total` | counter | `route`, `status`, `error` | API 오류 응답 수. `error`는 응답의 오류 코드(`playback_capacity`, `camera_offline`, `temporarily_unavailable`, `login_rate_limit` 등) |
+| `transmux_playback_http_request_duration_seconds` | histogram | `route` | 처리 시간. 응답 본문 전송까지 포함한다 |
+| `transmux_playback_media_requests_active` | gauge | | `max_streams` 슬롯을 점유한 미디어 요청 수 |
+| `transmux_playback_max_streams` | gauge | | 설정된 `max_streams` |
+| `transmux_playback_exports_active` | gauge | | 실행 중인 내보내기 작업 수 |
+| `transmux_playback_export_workers` | gauge | | 설정된 `export.workers` |
+| `transmux_playback_index_failures_total` | counter | | 녹화 인덱서 실패 수(기동 이후) |
+| `transmux_playback_retention_errors_total` | counter | | 보존 작업 오류 수(기동 이후) |
+| `transmux_playback_build_info` | gauge | `version` | 항상 1 |
+
+`route`는 등록된 경로 패턴이다(예:
+`GET /media/{token}/{center}/{camera}/{resource...}`). 어떤 패턴에도 맞지 않는
+요청(없는 경로, 허용되지 않은 메서드, CORS preflight)은 `unmatched`로 묶는다.
+capability 토큰, 센터·카메라 식별자, 사용자 이름은 라벨에 넣지 않는다. 원시 경로를
+라벨로 쓰면 시계열 수가 시청 세션 수만큼 늘고 스크랩 결과에 유효한 재생 URL이 남기
+때문이다. 활성 요청·내보내기 게이지와 인덱서·보존 카운터는
+`GET /v1/admin/status`와 같은 값을 스크랩 시점에 읽는다. 라이브 재생 세션은 서버에
+상태를 두지 않는 서명 토큰이므로 세션 수 대신 미디어 요청 동시성을 노출한다.
+미디어 세그먼트와 내보내기 다운로드의 처리 시간은 클라이언트 수신 속도의 영향을
+받는다.
+
+| 상황 | 신호 |
+|---|---|
+| 재생 서버 오류율 | `transmux_playback_http_requests_total{status_class="5xx"}` 증가율 ÷ 전체 증가율 |
+| 재생 용량 소진 | `transmux_playback_http_errors_total{error="playback_capacity"}` 증가, `media_requests_active`가 `max_streams`에 근접 |
+| 라이브 영상 없음 | `error="camera_offline"` 증가. 수집 서버의 `transmux_channel_state`와 함께 본다 |
+| 저장소·카탈로그 장애 | `error="temporarily_unavailable"` 또는 `error="catalog_unavailable"` 증가 |
+| 로그인 한도 소진 | `error="login_rate_limit"` 증가 |
+| 인덱스·보존 작업 실패 | `transmux_playback_index_failures_total`, `transmux_playback_retention_errors_total` 증가 |
 
 ## 알려진 제약과 미구현
 

@@ -14,7 +14,11 @@ import (
 )
 
 type Config struct {
-	HTTPListen     string          `json:"http_listen"`
+	HTTPListen string `json:"http_listen"`
+	// MetricsListen is a separate, unauthenticated listener for GET /metrics.
+	// It is not a path on http_listen because that listener is the public,
+	// authenticated origin; the default keeps it on the loopback interface.
+	MetricsListen  string          `json:"metrics_listen"`
 	PublicURL      string          `json:"public_url"`
 	IngestConfig   string          `json:"ingest_config"`
 	IndexPath      string          `json:"index_path"`
@@ -83,7 +87,7 @@ type RetentionConfig struct {
 
 func DefaultConfig() Config {
 	return Config{
-		HTTPListen: ":8090", PublicURL: "http://localhost:8090",
+		HTTPListen: ":8090", MetricsListen: "127.0.0.1:8091", PublicURL: "http://localhost:8090",
 		IngestConfig: "/etc/transmux/config.json",
 		IndexPath:    "/var/lib/transmux/playback/recordings.db",
 		Auth: AuthConfig{
@@ -127,6 +131,9 @@ func (c Config) Validate() error {
 	_, port, err := net.SplitHostPort(c.HTTPListen)
 	if err != nil || port == "" {
 		return fmt.Errorf("http_listen must be host:port")
+	}
+	if err := validateMetricsListen(c.MetricsListen, c.HTTPListen); err != nil {
+		return err
 	}
 	if err := config.ValidateHTTPURL(c.PublicURL, "public_url"); err != nil {
 		return err
@@ -208,6 +215,31 @@ func (c Config) Validate() error {
 		shards[shard.ID] = true
 	}
 	return nil
+}
+
+// validateMetricsListen also refuses an address that would share a socket
+// with http_listen, since serving both from one listener is exactly the
+// exposure the separate listener exists to prevent.
+func validateMetricsListen(addr, public string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || port == "" {
+		return fmt.Errorf("metrics_listen must be host:port, for example \"127.0.0.1:8091\"")
+	}
+	number, err := net.LookupPort("tcp", port)
+	if err != nil {
+		return fmt.Errorf("metrics_listen %q has an invalid port", addr)
+	}
+	publicHost, publicPort, _ := net.SplitHostPort(public)
+	if p, err := net.LookupPort("tcp", publicPort); err == nil && p == number &&
+		(host == publicHost || wildcardHost(host) || wildcardHost(publicHost)) {
+		return fmt.Errorf("metrics_listen must not share an address with http_listen")
+	}
+	return nil
+}
+
+func wildcardHost(host string) bool {
+	ip := net.ParseIP(host)
+	return host == "" || ip != nil && ip.IsUnspecified()
 }
 
 func validateGrants(grants []Grant) error {

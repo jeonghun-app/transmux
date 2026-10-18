@@ -18,6 +18,7 @@ import (
 
 	"github.com/jeonghun-app/transmux/internal/config"
 	"github.com/jeonghun-app/transmux/internal/ffmpeg"
+	"github.com/jeonghun-app/transmux/internal/metrics"
 	"github.com/jeonghun-app/transmux/internal/playback"
 	"github.com/jeonghun-app/transmux/internal/recording"
 	"github.com/jeonghun-app/transmux/internal/storage"
@@ -72,29 +73,47 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	app.Metrics().Gauge("transmux_playback_build_info", "Always 1; labels carry build metadata.",
+		metrics.Label{Name: "version", Value: version}).Set(1)
 	listener, err := net.Listen("tcp", cfg.HTTPListen)
 	if err != nil {
 		return err
 	}
+	// Bind the metrics listener before serving anything, as transmuxd does for
+	// its monitoring API: a playbackd that cannot be scraped would look idle
+	// to its alarms instead of failing.
+	metricsListener, err := net.Listen("tcp", cfg.MetricsListen)
+	if err != nil {
+		_ = listener.Close()
+		return fmt.Errorf("bind metrics listener on %s: %w", cfg.MetricsListen, err)
+	}
 	srv := &http.Server{Handler: app.Routes(), ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout: 20 * time.Second, WriteTimeout: time.Hour,
 		IdleTimeout: time.Minute, MaxHeaderBytes: 32 << 10}
+	metricsSrv := &http.Server{Handler: app.MetricsRoutes(), ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: time.Minute}
 	var wg sync.WaitGroup
 	wg.Go(func() { app.RunBackground(ctx) })
-	serveErr := make(chan error, 1)
-	wg.Go(func() {
-		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	serveErr := make(chan error, 2)
+	serve := func(srv *http.Server, l net.Listener) {
+		if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serveErr <- err
 			stop()
 		}
-	})
+	}
+	wg.Go(func() { serve(srv, listener) })
+	wg.Go(func() { serve(metricsSrv, metricsListener) })
 	log.Info("playbackd ready", "version", version, "listen", listener.Addr().String(),
+		"metrics_listen", metricsListener.Addr().String(),
 		"public_url", cfg.PublicURL, "retention_enabled", cfg.Retention.Enabled)
 	<-ctx.Done()
 	shutdown, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(shutdown); err != nil {
 		_ = srv.Close()
+	}
+	if err := metricsSrv.Shutdown(shutdown); err != nil {
+		_ = metricsSrv.Close()
 	}
 	wg.Wait()
 	select {

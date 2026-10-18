@@ -117,3 +117,59 @@ func TestRenderUsesPrometheusEscapes(t *testing.T) {
 		t.Error("Go-only escape would reject the entire Prometheus scrape")
 	}
 }
+
+// TestHistogramRendersCumulativeBuckets pins the exposition shape Prometheus
+// needs for histogram_quantile: cumulative le buckets ending in +Inf, which
+// must equal _count, plus _sum.
+func TestHistogramRendersCumulativeBuckets(t *testing.T) {
+	r := NewRegistry()
+	h := r.Histogram("req_seconds", "Latency.", []float64{0.1, 1},
+		Label{Name: "route", Value: "GET /x"})
+	for _, v := range []float64{0.05, 0.1, 0.5, 3} {
+		h.Observe(v)
+	}
+	out := string(r.Render())
+	for _, want := range []string{
+		"# TYPE req_seconds histogram\n",
+		`req_seconds_bucket{route="GET /x",le="0.1"} 2` + "\n",
+		`req_seconds_bucket{route="GET /x",le="1"} 3` + "\n",
+		`req_seconds_bucket{route="GET /x",le="+Inf"} 4` + "\n",
+		`req_seconds_sum{route="GET /x"} 3.65` + "\n",
+		`req_seconds_count{route="GET /x"} 4` + "\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+}
+
+func TestHistogramWithoutLabelsAndUnsortedBuckets(t *testing.T) {
+	r := NewRegistry()
+	h := r.Histogram("d_seconds", "help", []float64{5, 1})
+	h.Observe(2)
+	out := string(r.Render())
+	for _, want := range []string{
+		`d_seconds_bucket{le="1"} 0`,
+		`d_seconds_bucket{le="5"} 1`,
+		`d_seconds_bucket{le="+Inf"} 1`,
+		"d_seconds_count 1\n",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+}
+
+// TestCounterFuncReadsAtScrapeTime covers counters owned by another
+// component, such as the recording scanner's failure count: the exported
+// value must be the owner's, not a copy that can drift from it.
+func TestCounterFuncReadsAtScrapeTime(t *testing.T) {
+	r := NewRegistry()
+	var n float64
+	r.CounterFunc("owned_total", "help", func() float64 { return n })
+	n = 7
+	out := string(r.Render())
+	if !strings.Contains(out, "# TYPE owned_total counter\n") || !strings.Contains(out, "owned_total 7\n") {
+		t.Errorf("counter func not rendered at scrape time\n%s", out)
+	}
+}

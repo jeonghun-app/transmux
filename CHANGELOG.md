@@ -8,6 +8,20 @@
 
 ## [Unreleased]
 
+### Added
+
+- `playbackd`가 Prometheus 메트릭을 제공한다. 경로 패턴·상태 등급별 요청 수,
+  경로 패턴·상태·오류 코드별 오류 응답 수(`playback_capacity`, `camera_offline`,
+  `temporarily_unavailable`, `login_rate_limit` 등), 처리 시간 히스토그램, 동시
+  미디어 요청·내보내기 수와 한도, 인덱서·보존 작업 실패 수다. 라벨에 capability
+  토큰, 센터·카메라 식별자, 사용자 이름을 넣지 않는다.
+- **호환성:** 재생 설정 `metrics_listen`(기본 `127.0.0.1:8091`). 메트릭은 인증이
+  없으므로 공개 리스너가 아닌 이 내부 리스너에서만 제공하고, 공개 리스너의
+  `/metrics`는 `404`다. 업그레이드하면 `playbackd`가 이 주소에 새로 바인딩하며,
+  바인딩하지 못하면 기동하지 않는다. `http_listen`이 이미 8091 포트를 쓰거나 같은
+  호스트에서 다른 프로세스가 8091을 쓰면 `metrics_listen`에 다른 주소를 지정한다.
+  `configs/solution-playback.json`은 Compose 네트워크용으로 `:8091`을 명시한다.
+
 ## [0.2.0] - 2026-10-04
 
 ### Added
