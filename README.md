@@ -72,6 +72,7 @@ make help          # 사용 가능한 타겟
 make fmt-check     # Go 포맷 검사
 make vet           # 정적 검사
 make test          # 단위 테스트
+make cover         # 단위 테스트 커버리지, 하한(COVER_MIN) 미만이면 실패
 make race          # 동시성 검사
 make build         # 수집·재생 바이너리 빌드
 make dist          # 릴리스 묶음 생성

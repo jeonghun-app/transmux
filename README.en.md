@@ -82,6 +82,7 @@ make help          # Available targets
 make fmt-check     # Check Go formatting
 make vet           # Static analysis
 make test          # Unit tests
+make cover         # Unit-test coverage; fails below the floor (COVER_MIN)
 make race          # Concurrency checks
 make build         # Build ingest and playback binaries
 make dist          # Create release bundles

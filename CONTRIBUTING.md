@@ -34,13 +34,20 @@ Go 변경에는 [CI](.github/workflows/ci.yml)와
 [야간 검사](.github/workflows/nightly.yml)의 다음 명령을 사용한다.
 
 ```sh
-make fmt-check vet test race build vuln
+make fmt-check vet test cover race build vuln
 make test-ffmpeg image
 ```
 
 ffmpeg를 실제로 사용하는 테스트는 `make test-ffmpeg`로 실행한다. 이 대상은
 `deploy/Dockerfile`의 `test` 이미지를 빌드하고 `ffmpeg` 빌드 태그 테스트를 실행한다.
 의존성 검사는 `make vuln`로 수행하며 야간 워크플로에도 포함된다.
+
+`make cover`는 단위 테스트를 커버리지와 함께 실행하고 전체 구문 커버리지가
+[Makefile](Makefile)의 `COVER_MIN`보다 낮으면 실패한다. 하한 값과 정한 근거는
+Makefile 주석에 있다. 패키지별 결과는 `tmp/coverage/summary.md`에,
+프로파일은 `tmp/coverage/cover.out`에 남고 CI는 같은 표를 작업 요약에 붙인다.
+`ffmpeg` 빌드 태그 테스트는 측정에 들어가지 않는다. 커버리지가 하한보다 낮아지면
+하한을 내리지 말고 테스트를 보탠다. 커버리지가 오르면 같은 방식으로 하한을 올린다.
 
 릴리스 묶음을 검증할 때는 `make dist`를 실행하고, 워크플로를 수정하면
 `make lint-actions`로 검사한다.
