@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -294,5 +295,49 @@ func TestHeadReportsMetadata(t *testing.T) {
 	}
 	if _, err := s.Head(context.Background(), "c1/cam1/absent.ts"); !errors.Is(err, ErrNotFound) {
 		t.Errorf("Head of an absent key: err = %v, want ErrNotFound", err)
+	}
+}
+
+// TestCompareAndSwapOnAMissingObjectIsRefusedByEveryStore fixes one meaning
+// for every backend. The lease, the manifest fence and the shared roster all
+// read ErrPreconditionFailed as "the version I hold is no longer current" and
+// give up ownership or ask for a reload. If a backend answered a deleted
+// object with a generic error instead, those callers would take it for an
+// ambiguous fault and only conclude the same on a later attempt, so the same
+// deletion would behave differently in tests and against S3.
+func TestCompareAndSwapOnAMissingObjectIsRefusedByEveryStore(t *testing.T) {
+	stores := map[string]func(t *testing.T) ObjectStore{
+		"filesystem": func(t *testing.T) ObjectStore {
+			s, err := NewFilesystemStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			return s
+		},
+		// The handler answers as S3 does for a key that was never written:
+		// GET and an If-Match PUT are both 404 NoSuchKey.
+		"s3": func(t *testing.T) ObjectStore {
+			return testS3Store(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPut && r.Header.Get("If-Match") == "" {
+					t.Errorf("unexpected unconditional %s", r.URL.Path)
+				}
+				s3Error(w, http.StatusNotFound, "NoSuchKey")
+			})
+		},
+	}
+	for name, open := range stores {
+		t.Run(name, func(t *testing.T) {
+			s := open(t)
+			key := "c1/cam1/_transmux/lease.json"
+			_, err := s.Put(context.Background(), Object{Key: key, Body: []byte("renewal"),
+				Preconditions: Preconditions{IfMatch: `"deleted-version"`}})
+			if !errors.Is(err, ErrPreconditionFailed) {
+				t.Fatalf("err = %v, want ErrPreconditionFailed", err)
+			}
+			// A refused swap must not have created the key either.
+			if _, _, err := s.Get(context.Background(), key); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("Get after a refused swap: err = %v, want ErrNotFound", err)
+			}
+		})
 	}
 }

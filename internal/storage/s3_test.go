@@ -120,3 +120,74 @@ func TestS3LifecycleTagsStayOffControlObjects(t *testing.T) {
 		}
 	}
 }
+
+// s3Error answers the way S3 does when it refuses a request: an XML body whose
+// Code is what the SDK surfaces as the API error code.
+func s3Error(w http.ResponseWriter, status int, code string) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintf(w, "<Error><Code>%s</Code><Message>refused</Message></Error>", code)
+}
+
+// TestS3CompareAndSwapOnAMissingKeyIsAPreconditionFailure pins the answer S3
+// and RustFS give an If-Match write against a key that does not exist: 404
+// NoSuchKey rather than 412. The version the caller swapped against is gone,
+// which is the same answer as a stale ETag. The bare 404 case covers gateways
+// that send no error body.
+func TestS3CompareAndSwapOnAMissingKeyIsAPreconditionFailure(t *testing.T) {
+	for name, code := range map[string]string{"NoSuchKey": "NoSuchKey", "bare": ""} {
+		t.Run(name, func(t *testing.T) {
+			store := testS3Store(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("If-Match") != `"gone"` {
+					t.Error("compare-and-swap precondition was not sent")
+				}
+				if code == "" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				s3Error(w, http.StatusNotFound, code)
+			})
+			_, err := store.Put(context.Background(), Object{
+				Key: "c/cam/_transmux/lease.json", Body: []byte("renewal"),
+				Preconditions: Preconditions{IfMatch: `"gone"`},
+			})
+			if !errors.Is(err, ErrPreconditionFailed) {
+				t.Fatalf("If-Match on a missing key: err = %v, want ErrPreconditionFailed", err)
+			}
+		})
+	}
+}
+
+// TestS3NotFoundIsNotAConflictWithoutAMissingKey keeps the mapping narrow. A
+// 404 to a write that did not swap against a version says nothing about
+// another writer, and a missing bucket is a configuration fault that
+// reloading cannot fix, so this write must not report either as a lost race.
+// It pins the single Put only: the read path still maps a missing bucket to
+// ErrNotFound, so a lease renewal reaches ErrLeaseLost on its next attempt
+// regardless (#36).
+func TestS3NotFoundIsNotAConflictWithoutAMissingKey(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pre  Preconditions
+		code string
+	}{
+		{"unconditional", Preconditions{}, "NoSuchKey"},
+		{"create-only", Preconditions{IfNoneMatch: true}, "NoSuchKey"},
+		{"missing-bucket", Preconditions{IfMatch: `"version"`}, "NoSuchBucket"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := testS3Store(t, func(w http.ResponseWriter, r *http.Request) {
+				s3Error(w, http.StatusNotFound, tc.code)
+			})
+			_, err := store.Put(context.Background(), Object{
+				Key: "c/cam/index.m3u8", Body: []byte("playlist"), Preconditions: tc.pre,
+			})
+			if err == nil {
+				t.Fatal("a refused write reported success")
+			}
+			if errors.Is(err, ErrPreconditionFailed) {
+				t.Fatalf("404 %s was reported as a conditional conflict: %v", tc.code, err)
+			}
+		})
+	}
+}

@@ -39,7 +39,9 @@ var ErrPreconditionFailed = errors.New("object precondition failed")
 // for immutable segments and for claiming a control object. IfMatch is
 // compare-and-swap, used for the manifest and for lease renewal.
 type Preconditions struct {
-	// IfMatch requires the stored object to have exactly this ETag.
+	// IfMatch requires the stored object to have exactly this ETag. An absent
+	// key matches no ETag: the write is refused with ErrPreconditionFailed
+	// and the key is not created, whatever status the backend answers with.
 	IfMatch string
 	// IfNoneMatch requires the key to be absent.
 	IfNoneMatch bool

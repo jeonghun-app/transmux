@@ -3,6 +3,8 @@ package camera
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -113,5 +115,44 @@ func TestSharedRosterAssignmentsMoveBetweenShards(t *testing.T) {
 	after, err = two.Cameras(ctx)
 	if err != nil || len(after) != 1 {
 		t.Fatalf("new shard did not receive assignment: %v %v", after, err)
+	}
+}
+
+// TestSavingADeletedRosterAsksForAReload: an editor holding the version of a
+// roster that was deleted since must get the same answer as one holding a
+// stale version, which the console turns into "reload and try again". The
+// failed save must not write anything, and the reload reseeds the roster.
+func TestSavingADeletedRosterAsksForAReload(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := storage.NewFilesystemStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.CameraConfig{Provider: "object", ObjectKey: "_transmux/rosters/test.json",
+		RequestTimeout: config.Duration{Duration: time.Second},
+		Static:         []config.StaticCamera{{CenterID: "c1", CameraID: "cam1", RTSPURL: "rtsp://camera/live"}}}
+	p, err := NewObjectProvider(cfg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roster, version, err := p.Load(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, filepath.FromSlash(cfg.ObjectKey))); err != nil {
+		t.Fatal(err)
+	}
+
+	roster[0].Name = "edited"
+	if _, err := p.Save(ctx, roster, version); !errors.Is(err, storage.ErrPreconditionFailed) {
+		t.Fatalf("err = %v, want ErrPreconditionFailed", err)
+	}
+	if _, _, err := store.Get(ctx, cfg.ObjectKey); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a refused save recreated the roster: %v", err)
+	}
+	reloaded, _, err := p.Load(ctx)
+	if err != nil || len(reloaded) != 1 || reloaded[0].Name == "edited" {
+		t.Fatalf("reload after deletion: %#v %v", reloaded, err)
 	}
 }
