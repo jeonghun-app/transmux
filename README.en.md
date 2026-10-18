@@ -167,6 +167,7 @@ Key playback settings (`configs/solution-playback.json`):
 
 | Key | Meaning | Notes |
 |---|---|---|
+| `metrics_listen` | Internal metrics address of the playback server (`GET /metrics`) | Defaults to `127.0.0.1:8091`. It is unauthenticated, so it cannot share an address with `http_listen`. The container example sets `:8091` explicitly and does not publish it on the host |
 | `auth.trusted_proxies` | Array of proxy CIDR strings trusted for `X-Forwarded-For` | Defaults to `[]`, with at most 64 entries. An empty array uses only `RemoteAddr`. Deployments behind a TLS reverse proxy must specify the actual proxy CIDRs |
 | `export.min_free_bytes` | Minimum free bytes to retain on the export volume | Defaults to `1073741824` (1GiB), with an allowed range of 128MiB–1TiB. Each job reserves `3 × (sum of segment bytes + distinct initialization file count × 1MiB) + (file count + 2) × 64KiB`. File count is the sum of segments and distinct initialization files; running jobs contribute only their remaining unwritten reservations. Insufficient space returns `507 export_storage_full` (`Retry-After: 60`) before the job starts |
 
@@ -371,6 +372,50 @@ The HTTP camera roster follows the `StaticCamera` JSON array contract. Unknown
 fields, responses over 8MiB, responses with another document appended, and
 `null` are errors; existing channels are retained. To release all cameras,
 return an explicit `[]`.
+
+## Playback server monitoring
+
+`playbackd` serves `GET /metrics` in Prometheus text format on an internal
+listener separate from the public API (`metrics_listen`, default
+`127.0.0.1:8091`). The public listener (`http_listen`) has no `/metrics` and
+returns `404` whether or not the caller is signed in. The metrics listener is
+unauthenticated, so bind it to an internal interface or place it behind a
+security group / service mesh. If `playbackd` cannot bind this address, it does
+not start.
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `transmux_playback_http_requests_total` | counter | `route`, `status_class` | Requests on the public listener. `status_class` is `2xx` to `5xx` |
+| `transmux_playback_http_errors_total` | counter | `route`, `status`, `error` | API error responses. `error` is the response error code (`playback_capacity`, `camera_offline`, `temporarily_unavailable`, `login_rate_limit` and so on) |
+| `transmux_playback_http_request_duration_seconds` | histogram | `route` | Handling time, including writing the response body |
+| `transmux_playback_media_requests_active` | gauge | | Media requests holding a `max_streams` slot |
+| `transmux_playback_max_streams` | gauge | | Configured `max_streams` |
+| `transmux_playback_exports_active` | gauge | | Running export jobs |
+| `transmux_playback_export_workers` | gauge | | Configured `export.workers` |
+| `transmux_playback_index_failures_total` | counter | | Recording indexer failures since start |
+| `transmux_playback_retention_errors_total` | counter | | Retention errors since start |
+| `transmux_playback_build_info` | gauge | `version` | Always 1 |
+
+`route` is the registered path pattern (for example
+`GET /media/{token}/{center}/{camera}/{resource...}`). Requests that match no
+pattern (unknown paths, disallowed methods, CORS preflights) are grouped as
+`unmatched`. Capability tokens, center and camera identifiers and user names
+never become labels. A raw-path label would grow the series count with every
+viewing session and leave working playback URLs in scrape output. The active
+request and export gauges and the indexer and retention counters read the same
+values as `GET /v1/admin/status` at scrape time. Live playback sessions are
+signed tokens with no server-side state, so media request concurrency is
+exposed instead of a session count. Handling time for media segments and
+export downloads depends on how fast the client receives.
+
+| Situation | Signal |
+|---|---|
+| Playback server error rate | Rate of `transmux_playback_http_requests_total{status_class="5xx"}` divided by the total rate |
+| Playback capacity exhausted | `transmux_playback_http_errors_total{error="playback_capacity"}` increases; `media_requests_active` approaches `max_streams` |
+| No live video | `error="camera_offline"` increases. Read it together with the ingest server's `transmux_channel_state` |
+| Storage or catalog failure | `error="temporarily_unavailable"` or `error="catalog_unavailable"` increases |
+| Login limit exhausted | `error="login_rate_limit"` increases |
+| Index or retention failures | `transmux_playback_index_failures_total` or `transmux_playback_retention_errors_total` increases |
 
 ## Known limitations and unimplemented features
 

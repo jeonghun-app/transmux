@@ -61,6 +61,7 @@ S3 호환 서버는 조건부 PUT(`If-None-Match: *`, `If-Match`)을 지원해�
 
 | 키 | 기본값 | 의미·제한 |
 |---|---|---|
+| `metrics_listen` | `127.0.0.1:8091` | 인증 없는 내부 메트릭 리스너 주소. `http_listen`과 같은 주소는 거부한다 |
 | `auth.trusted_proxies` | `[]` | `X-Forwarded-For`를 신뢰할 프록시의 CIDR 문자열 배열. 최대 64개 |
 | `export.min_free_bytes` | `1073741824` (1GiB) | 내보내기 볼륨에 남겨 둘 최소 여유 바이트. 허용 범위 128MiB∼1TiB |
 
@@ -197,6 +198,9 @@ JSON 요청은 `Content-Type: application/json`, 관리·조회 요청은
 | `GET /media/{capability}/...` | 인증된 HLS 매니페스트·미디어 |
 | `GET /exports/{capability}/clip.mp4` | 완료된 파일 다운로드, Range 지원 |
 | `GET /healthz`, `GET /readyz` | 일반적인 생존·카탈로그 준비 상태 |
+
+`GET /metrics`는 이 API의 경로가 아니다. 공개 리스너에서는 `404`를 반환하고,
+별도의 `metrics_listen` 리스너에서만 제공한다([재생 서버 모니터링](#재생-서버-모니터링)).
 
 `POST /v1/exports`가 작업 시작 전에 즉시 응답하는 주요 오류는 다음과 같다.
 
@@ -367,6 +371,27 @@ Lifecycle 예시의 접두사·기간은 실제 구성에 맞추고, 기존의 �
 작업 목록은 재생 프로세스 메모리에 있다. 브라우저 새로고침 후에는 목록을
 재조회할 수 있지만, 프로세스 재시작 후에는 작업을 다시 요청해야 한다.
 재시작 시 잠긴 인덱스의 고유 ID에 속하는 미완료 임시 디렉터리를 정리한다.
+
+## 재생 서버 모니터링
+
+`playbackd`는 `metrics_listen`(기본 `127.0.0.1:8091`)에서만 Prometheus 메트릭을
+제공한다. 공개 리스너는 인증된 사용자 API이고, 메트릭에는 인증이 없어 같은
+리스너에 두면 용량·오류율이 인터넷에 노출된다. 그래서 수집 서버의 모니터링 API처럼
+별도 리스너로 분리하고 기본값을 loopback으로 둔다. 로컬 Compose는 `:8091`을
+명시해 같은 Compose 네트워크의 수집기가 읽을 수 있게 하되 호스트에는 공개하지
+않는다. 로컬 스택에서 확인할 때는 컨테이너 안에서 조회한다.
+
+```sh
+docker compose --env-file .env.solution -f deploy/docker-compose.solution.yml \
+  exec playbackd wget -q -O- http://127.0.0.1:8091/metrics
+```
+
+요청 수는 경로 패턴과 상태 등급, 오류 응답은 경로 패턴·상태·오류 코드별로 센다.
+`503 playback_capacity`, `503 camera_offline`, `503 temporarily_unavailable`,
+`429 login_rate_limit`처럼 앞단 프록시에서 구분할 수 없던 거절 사유를 오류 코드
+라벨로 구분한다. 활성 미디어 요청·내보내기 수와 인덱서·보존 실패 수는
+`GET /v1/admin/status`와 같은 값이다. 메트릭 목록과 알람 신호는
+[README의 재생 서버 모니터링](../README.md#재생-서버-모니터링)을 따른다.
 
 ## 운영 배치
 

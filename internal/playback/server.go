@@ -18,6 +18,7 @@ import (
 
 	"github.com/jeonghun-app/transmux/internal/camera"
 	"github.com/jeonghun-app/transmux/internal/config"
+	"github.com/jeonghun-app/transmux/internal/metrics"
 	"github.com/jeonghun-app/transmux/internal/recording"
 	"github.com/jeonghun-app/transmux/internal/storage"
 )
@@ -32,6 +33,7 @@ type Server struct {
 	provider camera.Provider
 	managed  *camera.ObjectProvider
 	scanner  *recording.Scanner
+	metrics  *metrics.Registry
 
 	mediaSlots     chan struct{}
 	exportSlots    chan struct{}
@@ -112,6 +114,8 @@ func NewServer(cfg Config, ingest config.Config, store storage.MediaStore, index
 		Prefix: ingest.Storage.KeyPrefix, ManifestName: ingest.Storage.ManifestName,
 		Days: cfg.Index.Days, Workers: cfg.Index.Workers,
 		Interval: cfg.Index.PollInterval.Duration, Log: log}
+	s.metrics = metrics.NewRegistry()
+	s.registerMetrics()
 	return s, nil
 }
 
@@ -141,7 +145,7 @@ func (s *Server) RunBackground(ctx context.Context) {
 }
 
 func (s *Server) Routes() http.Handler {
-	mux := http.NewServeMux()
+	mux := newPatternMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -178,7 +182,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/admin/retention", s.protect(s.retentionPreview))
 	mux.HandleFunc("GET /media/{token}/{center}/{camera}/{resource...}", s.media)
 	s.console(mux)
-	return s.headers(mux)
+	return s.observe(mux, s.headers(mux))
 }
 
 type actorHandler func(http.ResponseWriter, *http.Request, *Claims)
@@ -374,6 +378,9 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func fail(w http.ResponseWriter, status int, code, message string) {
+	if rec, ok := w.(*statusRecorder); ok {
+		rec.errorCode = code
+	}
 	writeJSON(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
 }
 

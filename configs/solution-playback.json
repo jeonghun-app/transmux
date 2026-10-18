@@ -1,5 +1,6 @@
 {
   "http_listen": ":8090",
+  "metrics_listen": ":8091",
   "public_url": "http://localhost:8090",
   "ingest_config": "/etc/transmux/config.json",
   "index_path": "/var/lib/transmux/playback/recordings.db",

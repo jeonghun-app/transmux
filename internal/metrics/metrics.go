@@ -2,7 +2,8 @@
 //
 // A hand-rolled registry is used instead of the official client library to
 // keep the dependency surface at the AWS SDK only. The exposition format is
-// simple and stable, and the daemon needs just counters and gauges.
+// simple and stable, and the daemons need just counters, gauges and a
+// fixed-bucket histogram for request latency.
 //
 // Label cardinality is intentionally bounded: camera_id is acceptable
 // because a shard runs at most a few hundred channels, but RTSP URLs, error
@@ -21,8 +22,9 @@ import (
 type kind string
 
 const (
-	kindCounter kind = "counter"
-	kindGauge   kind = "gauge"
+	kindCounter   kind = "counter"
+	kindGauge     kind = "gauge"
+	kindHistogram kind = "histogram"
 )
 
 // Label is one metric dimension.
@@ -39,10 +41,17 @@ type Label struct {
 // wall-clock time: a stored "seconds since the last segment" is only correct
 // while something keeps writing it, and goes stale exactly when the channel
 // stops working, which is when it matters.
+//
+// A histogram series keeps one count per bucket rather than cumulative counts,
+// so a scrape derives every le bucket and _count from a single read of each
+// bucket and they always agree. _sum is read separately and may lag by the
+// observations that race the scrape, which rate() tolerates.
 type Metric struct {
 	labels  []Label
-	bits    atomic.Uint64 // float64 bits
+	bits    atomic.Uint64 // float64 bits; the running sum for a histogram
 	collect func() float64
+	upper   []float64       // histogram upper bounds, ascending
+	counts  []atomic.Uint64 // per bucket, plus a final overflow bucket
 }
 
 // Add increments a counter.
@@ -61,6 +70,12 @@ func (m *Metric) Inc() { m.Add(1) }
 
 // Set replaces a gauge value.
 func (m *Metric) Set(v float64) { m.bits.Store(floatBits(v)) }
+
+// Observe records one histogram sample.
+func (m *Metric) Observe(v float64) {
+	m.counts[sort.SearchFloat64s(m.upper, v)].Add(1)
+	m.Add(v)
+}
 
 // Value reads the current value.
 func (m *Metric) Value() float64 {
@@ -91,12 +106,26 @@ func NewRegistry() *Registry {
 // Counter returns the counter series for the given name and labels,
 // creating it if needed.
 func (r *Registry) Counter(name, help string, labels ...Label) *Metric {
-	return r.metric(kindCounter, name, help, labels, nil)
+	return r.metric(kindCounter, name, help, labels, nil, nil)
 }
 
 // Gauge returns the gauge series for the given name and labels.
 func (r *Registry) Gauge(name, help string, labels ...Label) *Metric {
-	return r.metric(kindGauge, name, help, labels, nil)
+	return r.metric(kindGauge, name, help, labels, nil, nil)
+}
+
+// CounterFunc registers a counter whose value is read from its owner when the
+// registry is rendered. Use it when another component already keeps the
+// count, so the exported value cannot drift from the one it reports
+// elsewhere. The same locking rules as GaugeFunc apply to collect.
+func (r *Registry) CounterFunc(name, help string, collect func() float64, labels ...Label) *Metric {
+	return r.metric(kindCounter, name, help, labels, collect, nil)
+}
+
+// Histogram returns the histogram series for the given name, bucket upper
+// bounds and labels. Every series of a family must use the same buckets.
+func (r *Registry) Histogram(name, help string, buckets []float64, labels ...Label) *Metric {
+	return r.metric(kindHistogram, name, help, labels, nil, buckets)
 }
 
 // GaugeFunc registers a gauge whose value is computed when the registry is
@@ -107,7 +136,7 @@ func (r *Registry) Gauge(name, help string, labels ...Label) *Metric {
 // is called while the registry read lock is held, so it must not block or
 // register new metrics.
 func (r *Registry) GaugeFunc(name, help string, collect func() float64, labels ...Label) *Metric {
-	return r.metric(kindGauge, name, help, labels, collect)
+	return r.metric(kindGauge, name, help, labels, collect, nil)
 }
 
 // DropSeries removes every series carrying all of the given labels. Used when
@@ -147,7 +176,7 @@ func hasAllLabels(have, want []Label) bool {
 	return true
 }
 
-func (r *Registry) metric(k kind, name, help string, labels []Label, collect func() float64) *Metric {
+func (r *Registry) metric(k kind, name, help string, labels []Label, collect func() float64, buckets []float64) *Metric {
 	sorted := make([]Label, len(labels))
 	copy(sorted, labels)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
@@ -174,9 +203,14 @@ func (r *Registry) metric(k kind, name, help string, labels []Label, collect fun
 	if m, ok := f.series[key]; ok {
 		return m
 	}
-	// collect is assigned under the lock so a concurrent render cannot
-	// observe a half-initialised series.
+	// collect and the buckets are assigned under the lock so a concurrent
+	// render cannot observe a half-initialised series.
 	m := &Metric{labels: sorted, collect: collect}
+	if k == kindHistogram {
+		m.upper = append([]float64(nil), buckets...)
+		sort.Float64s(m.upper)
+		m.counts = make([]atomic.Uint64, len(m.upper)+1)
+	}
 	f.series[key] = m
 	return m
 }
@@ -199,20 +233,42 @@ func (r *Registry) WriteTo(sb *strings.Builder) {
 		sort.Strings(keys)
 		for _, k := range keys {
 			m := f.series[k]
-			sb.WriteString(f.name)
-			if len(m.labels) > 0 {
-				sb.WriteByte('{')
-				for i, l := range m.labels {
-					if i > 0 {
-						sb.WriteByte(',')
-					}
-					fmt.Fprintf(sb, "%s=\"%s\"", l.Name, escapeLabel.Replace(l.Value))
-				}
-				sb.WriteByte('}')
+			if f.kind == kindHistogram {
+				writeHistogram(sb, f.name, m)
+				continue
 			}
-			fmt.Fprintf(sb, " %g\n", m.Value())
+			writeSample(sb, f.name, m.labels, m.Value())
 		}
 	}
+}
+
+func writeHistogram(sb *strings.Builder, name string, m *Metric) {
+	var cumulative uint64
+	for i, upper := range m.upper {
+		cumulative += m.counts[i].Load()
+		writeSample(sb, name+"_bucket", append(m.labels[:len(m.labels):len(m.labels)],
+			Label{Name: "le", Value: fmt.Sprintf("%g", upper)}), float64(cumulative))
+	}
+	cumulative += m.counts[len(m.upper)].Load()
+	writeSample(sb, name+"_bucket", append(m.labels[:len(m.labels):len(m.labels)],
+		Label{Name: "le", Value: "+Inf"}), float64(cumulative))
+	writeSample(sb, name+"_sum", m.labels, bitsFloat(m.bits.Load()))
+	writeSample(sb, name+"_count", m.labels, float64(cumulative))
+}
+
+func writeSample(sb *strings.Builder, name string, labels []Label, value float64) {
+	sb.WriteString(name)
+	if len(labels) > 0 {
+		sb.WriteByte('{')
+		for i, l := range labels {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			fmt.Fprintf(sb, "%s=\"%s\"", l.Name, escapeLabel.Replace(l.Value))
+		}
+		sb.WriteByte('}')
+	}
+	fmt.Fprintf(sb, " %g\n", value)
 }
 
 // Prometheus accepts only backslash, quote and newline escapes in labels.

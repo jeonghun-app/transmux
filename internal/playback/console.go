@@ -12,7 +12,7 @@ import (
 //go:embed web/*
 var web embed.FS
 
-func (s *Server) console(mux *http.ServeMux) {
+func (s *Server) console(mux *patternMux) {
 	assets, _ := fs.Sub(web, "web")
 	mux.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServerFS(assets)))
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
