@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/jeonghun-app/transmux/actions/workflows/ci.yml/badge.svg)](https://github.com/jeonghun-app/transmux/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Go 1.26.8](https://img.shields.io/badge/Go-1.26.8-00ADD8.svg)](go.mod)
+[![Go 1.26.9](https://img.shields.io/badge/Go-1.26.9-00ADD8.svg)](go.mod)
 
 [한국어](README.md)
 
@@ -56,7 +56,7 @@ and expected load.
 ## Quick start
 
 Docker/Compose v2 and Python 3 are required. Go and ffmpeg do not need to be
-installed on the host. Builds and checks use Go 1.26.8 / Alpine 3.23; the
+installed on the host. Builds and checks use Go 1.26.9 / Alpine 3.23; the
 runtime uses Alpine 3.23.
 
 ```bash

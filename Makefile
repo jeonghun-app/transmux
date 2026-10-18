@@ -6,7 +6,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 IMAGE   ?= transmux
-GOIMAGE ?= golang:1.26.8-alpine3.23
+GOIMAGE ?= golang:1.26.9-alpine3.23
 DOCKER  ?= docker
 ACTIONLINT_IMAGE ?= rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
 
