@@ -156,8 +156,11 @@ func isPreconditionFailed(err error) bool {
 //
 // Callers must only ask this of an If-Match write. A 404 to any other write
 // says nothing about another writer. A missing bucket is also a 404, but it
-// is a configuration fault that no reload can fix, so it stays an error. A
-// bare 404 with no error code is treated as a missing key, because some
+// is a configuration fault that no reload can fix, so this write reports it
+// as an error rather than a conflict. That holds for the write alone: the
+// read path still maps a missing bucket to ErrNotFound, so the lease and the
+// manifest conclude they lost ownership on their next attempt anyway (#36).
+// A bare 404 with no error code is treated as a missing key, because some
 // gateways send no body.
 func isMissingKey(err error) bool {
 	var respErr *awshttp.ResponseError

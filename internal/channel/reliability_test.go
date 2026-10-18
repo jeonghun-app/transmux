@@ -330,9 +330,13 @@ func TestRenewalAgainstADeletedLeaseIsTerminal(t *testing.T) {
 	if w.lease.held || w.lease.pending != nil {
 		t.Error("a refused renewal must clear ownership and leave nothing to confirm")
 	}
-	// The restarted ownership loop recreates the lease rather than waiting.
-	if err := w.claim(context.Background()); err != nil {
-		t.Fatalf("reclaiming a deleted lease: %v", err)
+	// This worker stays failed until it is stopped; it never reclaims on its
+	// own. A new worker, built after a process restart or when a roster change
+	// re-adds the camera or changes its source, recreates the lease with a
+	// create-only write instead of waiting out a TTL.
+	next := newUnownedWorker(t, store, "restarted-session")
+	if err := next.claim(context.Background()); err != nil {
+		t.Fatalf("a new worker reclaiming a deleted lease: %v", err)
 	}
 }
 

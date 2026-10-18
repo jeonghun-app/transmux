@@ -160,9 +160,11 @@ func TestS3CompareAndSwapOnAMissingKeyIsAPreconditionFailure(t *testing.T) {
 
 // TestS3NotFoundIsNotAConflictWithoutAMissingKey keeps the mapping narrow. A
 // 404 to a write that did not swap against a version says nothing about
-// another writer, and a missing bucket is a configuration fault. Reporting
-// either as a lost race would stop a channel, or tell an operator to reload a
-// roster, for a problem that reloading cannot fix.
+// another writer, and a missing bucket is a configuration fault that
+// reloading cannot fix, so this write must not report either as a lost race.
+// It pins the single Put only: the read path still maps a missing bucket to
+// ErrNotFound, so a lease renewal reaches ErrLeaseLost on its next attempt
+// regardless (#36).
 func TestS3NotFoundIsNotAConflictWithoutAMissingKey(t *testing.T) {
 	for _, tc := range []struct {
 		name string
