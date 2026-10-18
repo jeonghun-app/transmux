@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path"
 	"path/filepath"
 	"strconv"
@@ -438,5 +439,39 @@ func TestRetentionDiscoversImportedMediaAndNeverDeletesControlObjects(t *testing
 		if _, err := f.store.Head(context.Background(), key); err != nil {
 			t.Fatalf("retention deleted protected or recent object %s: %v", key, err)
 		}
+	}
+}
+
+// TestSavingADeletedRosterAsksForAReload: deleting the shared roster under an
+// editor must produce the same 412 as a concurrent edit, not a 503. The store
+// is healthy; only the editor's version is gone, and reloading fixes it.
+//
+// The roster is edited before it is deleted so that the reseeded roster can
+// never carry the editor's ETag, whichever of the cached or reloaded version
+// the save is checked against.
+func TestSavingADeletedRosterAsksForAReload(t *testing.T) {
+	f := newFixture(t)
+	token := f.token(t, allPermissions())
+	resp, _ := f.request(t, "GET", "/v1/admin/cameras", token, nil, nil)
+	first := config.StaticCamera{CenterID: "c1", CameraID: "first", RTSPURL: "rtsp://camera/live", Name: "First"}
+	resp, body := f.request(t, "POST", "/v1/admin/cameras", token, first, map[string]string{"If-Match": resp.Header.Get("ETag")})
+	version := resp.Header.Get("ETag")
+	if resp.StatusCode != 201 || version == "" {
+		t.Fatalf("camera create: %d %s", resp.StatusCode, body)
+	}
+	rosterPath := filepath.Join(f.app.ingest.Storage.Root, filepath.FromSlash(f.app.ingest.Cameras.ObjectKey))
+	if err := os.Remove(rosterPath); err != nil {
+		t.Fatal(err)
+	}
+
+	second := config.StaticCamera{CenterID: "c1", CameraID: "second", RTSPURL: "rtsp://camera/live", Name: "Second"}
+	resp, body = f.request(t, "POST", "/v1/admin/cameras", token, second, map[string]string{"If-Match": version})
+	if resp.StatusCode != 412 || !bytes.Contains(body, []byte("camera_list_changed")) {
+		t.Fatalf("save against a deleted roster: %d %s", resp.StatusCode, body)
+	}
+	resp, _ = f.request(t, "GET", "/v1/admin/cameras", token, nil, nil)
+	resp, body = f.request(t, "POST", "/v1/admin/cameras", token, second, map[string]string{"If-Match": resp.Header.Get("ETag")})
+	if resp.StatusCode != 201 {
+		t.Fatalf("save after reload: %d %s", resp.StatusCode, body)
 	}
 }

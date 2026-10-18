@@ -304,3 +304,108 @@ func TestLeaseNeverFallsBackToAnUnconditionalWrite(t *testing.T) {
 		t.Fatal("missing compare-and-swap token caused a write")
 	}
 }
+
+// removeObject deletes a key behind the worker's back, the way an operator or
+// a misdirected lifecycle rule would.
+func removeObject(store *fakeStore, key string) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	delete(store.objects, key)
+}
+
+// The tests below fix what the ownership protocol does when the object it
+// holds a version of has been deleted. Every store answers that
+// compare-and-swap with ErrPreconditionFailed (see
+// storage.TestCompareAndSwapOnAMissingObjectIsRefusedByEveryStore), and each
+// caller must read it as a definite answer rather than an ambiguous fault.
+
+func TestRenewalAgainstADeletedLeaseIsTerminal(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	removeObject(store, w.objectKey(LeaseObjectName))
+
+	if err := w.lease.Renew(context.Background()); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("err = %v, want ErrLeaseLost on the first renewal", err)
+	}
+	if w.lease.held || w.lease.pending != nil {
+		t.Error("a refused renewal must clear ownership and leave nothing to confirm")
+	}
+	// The restarted ownership loop recreates the lease rather than waiting.
+	if err := w.claim(context.Background()); err != nil {
+		t.Fatalf("reclaiming a deleted lease: %v", err)
+	}
+}
+
+func TestAcquireAgainstALeaseDeletedMidSwapIsRetryable(t *testing.T) {
+	store := &fakeStore{}
+	first := newTestWorker(t, store)
+	releaseOwnership(t, first)
+	second := newUnownedWorker(t, store, "successor")
+	leaseKey := second.objectKey(LeaseObjectName)
+	var fired bool
+	armFailure(store, func(key string) error {
+		if key == leaseKey && !fired {
+			fired = true
+			delete(store.objects, key) // between the read and the swap
+		}
+		return nil
+	})
+
+	if err := second.claim(context.Background()); !errors.Is(err, ErrLeaseUnavailable) {
+		t.Fatalf("err = %v, want a retryable ownership error", err)
+	}
+	if second.lease.pending != nil {
+		t.Error("a refused swap is not ambiguous and must not be replayed")
+	}
+	if err := second.claim(context.Background()); err != nil {
+		t.Fatalf("the retry must claim the now absent lease: %v", err)
+	}
+}
+
+func TestPublishAgainstADeletedManifestStops(t *testing.T) {
+	store := &fakeStore{}
+	w := newTestWorker(t, store)
+	removeObject(store, w.objectKey(w.cfg.Storage.ManifestName))
+	writeSpool(t, w.spoolDir, []spoolEntry{
+		{name: "seg-000000.ts", duration: 4 * time.Second, pdt: basePDT, body: []byte("a")},
+	})
+
+	if _, err := w.drain(context.Background(), newDrainState()); !errors.Is(err, ErrLeaseLost) {
+		t.Fatalf("err = %v, want ErrLeaseLost on the first publish", err)
+	}
+	if got := w.mManifestConflict.Value(); got != 1 {
+		t.Errorf("manifest conflicts = %v, want 1", got)
+	}
+	if w.pendingManifest != nil {
+		t.Error("a refused swap is not ambiguous and must not be replayed")
+	}
+}
+
+func TestFenceAgainstAManifestDeletedAfterRecoveryRereads(t *testing.T) {
+	store := &fakeStore{}
+	first := newTestWorker(t, store)
+	releaseOwnership(t, first)
+	second := newUnownedWorker(t, store, "successor")
+	manifestKey := second.objectKey(second.cfg.Storage.ManifestName)
+	var fired bool
+	armFailure(store, func(key string) error {
+		if key == manifestKey && !fired {
+			fired = true
+			delete(store.objects, key) // after recovery read it, before the fence
+		}
+		return nil
+	})
+
+	if err := second.claim(context.Background()); !errors.Is(err, ErrLeaseUnavailable) {
+		t.Fatalf("err = %v, want a retryable ownership error", err)
+	}
+	if !second.needsRecovery {
+		t.Fatal("the fence must recover again instead of swapping against the deleted version")
+	}
+	if err := second.claim(context.Background()); err != nil {
+		t.Fatalf("the retry must fence the now absent manifest: %v", err)
+	}
+	if _, _, err := store.Get(context.Background(), manifestKey); err != nil {
+		t.Fatalf("fence did not recreate the manifest: %v", err)
+	}
+}

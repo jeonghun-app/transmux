@@ -112,7 +112,8 @@ func (s *S3Store) Put(ctx context.Context, obj Object) (string, error) {
 	}
 	out, err := s.client.PutObject(ctx, in)
 	if err != nil {
-		if isPreconditionFailed(err) {
+		if isPreconditionFailed(err) ||
+			(obj.Preconditions.IfMatch != "" && isMissingKey(err)) {
 			return "", fmt.Errorf("%w: %s", ErrPreconditionFailed, obj.Key)
 		}
 		return "", fmt.Errorf("s3 put %s: %w", obj.Key, redactRequestID(err))
@@ -139,6 +140,34 @@ func isPreconditionFailed(err error) bool {
 		}
 	}
 	return false
+}
+
+// isMissingKey recognises the answer S3 and RustFS give an If-Match write
+// against a key that does not exist: 404 NoSuchKey rather than 412.
+//
+// To a compare-and-swap that is the same refusal as a stale ETag: the version
+// the caller holds is no longer current, because another writer or an
+// operator removed it. The filesystem store already reports it as
+// ErrPreconditionFailed, and the lease, the manifest fence and the shared
+// roster depend on that to give up ownership or ask for a reload at once.
+// Left as a generic error, the lease and the manifest treat it as an
+// ambiguous fault and only reach the same conclusion on their next attempt,
+// and a roster save is reported to the editor as the store being unavailable.
+//
+// Callers must only ask this of an If-Match write. A 404 to any other write
+// says nothing about another writer. A missing bucket is also a 404, but it
+// is a configuration fault that no reload can fix, so it stays an error. A
+// bare 404 with no error code is treated as a missing key, because some
+// gateways send no body.
+func isMissingKey(err error) bool {
+	var respErr *awshttp.ResponseError
+	if !errors.As(err, &respErr) || respErr.HTTPStatusCode() != 404 {
+		return false
+	}
+	// The SDK models no typed 404 errors for PutObject, so the code comes from
+	// the generic API error it decodes from the response body.
+	var apiErr interface{ ErrorCode() string }
+	return !errors.As(err, &apiErr) || apiErr.ErrorCode() != "NoSuchBucket"
 }
 
 // Get reads an object, mapping a missing key to ErrNotFound.
