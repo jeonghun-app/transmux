@@ -398,7 +398,7 @@ lease·매니페스트·공유 목록에 DeleteObject를 허용할 이유는 없
 ## 검증 도구
 
 ```sh
-make fmt-check vet test race build vuln
+make fmt-check vet test cover race build vuln
 make test-ffmpeg
 make solution-verify
 ```

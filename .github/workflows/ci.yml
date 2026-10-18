@@ -29,6 +29,17 @@ jobs:
       - run: make fmt-check
       - run: make vet
       - run: make test
+      # Fails below COVER_MIN in the Makefile. The job name stays as it is
+      # because branch protection requires the check by that name.
+      - run: make cover
+      # The per-package table is published even when the floor is missed, so
+      # the run shows which package lost coverage.
+      - name: coverage summary
+        if: ${{ !cancelled() }}
+        run: |
+          if [ -f tmp/coverage/summary.md ]; then
+            cat tmp/coverage/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
       # The race detector needs cgo, which the target arranges itself.
       - run: make race
       - run: make build

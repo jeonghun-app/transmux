@@ -27,6 +27,17 @@ CHECK_VERSION = case "$$VERSION" in ''|[.-]*|*[!0-9A-Za-z._+-]*) \
 	  echo "invalid VERSION: must be [0-9A-Za-z._+-] and not start with . or -" >&2; \
 	  exit 1;; esac
 
+# make cover fails when total unit-test statement coverage is below COVER_MIN.
+# The floor is the coverage measured when the gate was added (69.9% on
+# 2026-10-18, #28) rounded down. That leaves under a point of slack for run to
+# run variation in timing-dependent paths, not room to merge untested code.
+# Raise it as coverage grows; lowering it needs its own justification in a PR.
+COVER_MIN ?= 69
+# The profile and the Markdown summary land under tmp/ for the same reason as
+# DISTDIR.
+COVERDIR ?= tmp/coverage
+export COVER_MIN
+
 # Expanded by the shell inside the build container, not by make.
 LDFLAGS := -s -w -X main.version=$$VERSION
 
@@ -100,6 +111,14 @@ lint-actions: ## Lint GitHub Actions workflows with actionlint
 .PHONY: test
 test: ## Unit tests
 	$(RUNGO) $(GOIMAGE) go test ./... -count=1
+
+# The container runs as root, so ownership of the output is handed back to the
+# caller even when the floor is missed and the script exits non-zero.
+.PHONY: cover
+cover: ## Unit-test coverage per package; fails below COVER_MIN
+	rm -rf $(COVERDIR) && mkdir -p $(COVERDIR)
+	$(RUNGO) -e COVER_MIN $(GOIMAGE) sh -c \
+	  'trap "chown -R $(shell id -u):$(shell id -g) /src/$(COVERDIR)" EXIT; sh scripts/coverage.sh $(COVERDIR)'
 
 .PHONY: race
 race: ## Unit tests under the race detector
