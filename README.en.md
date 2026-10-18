@@ -33,7 +33,9 @@ The [solution guide](docs/solution.md) documents the runtime, API, and deploymen
 contracts. [Migration from an existing media server](docs/wowza-coverage.md)
 describes feature coverage and migration conditions, and
 [ADR 0003](docs/adr/0003-camera-solution.md) records the current delivery
-architecture. This is not a product that offers every broadcast server feature,
+architecture. Alert criteria and incident procedures are in the
+[operations runbook](docs/runbook.md). This is not a product that offers
+every broadcast server feature,
 such as WebRTC, RTMP, SRT, and ABR.
 
 ## Project status and supported platforms
@@ -351,7 +353,9 @@ network.
 
 The last comparison matters: if ffmpeg keeps producing segments while only the
 publication timestamp stops, the object store is failing. If both stop, the
-camera is failing.
+camera is failing. Example alert conditions with thresholds, and the response
+procedure for each signal, are in the
+[runbook's alert criteria](docs/runbook.md#알람-기준).
 
 `segments_published_total` rises on **successful storage of a segment object**.
 For the player to see that segment, the manifest must also be updated; its
