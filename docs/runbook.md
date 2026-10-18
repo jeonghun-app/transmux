@@ -326,9 +326,11 @@ increase(transmux_channel_lease_lost_total[10m]) > 0
 
 increase(transmux_channel_lease_renew_failures_total[5m]) > 0
 
-# 갱신이 한 번 이상 빠졌다. 정상이면 ttl - max_clock_skew - renew_interval 아래로
-# 내려가지 않는다. 30은 코드 기본값(33초) 기준이다. 참조 솔루션 설정(13초)이면 10으로 둔다.
-transmux_channel_lease_held == 1 and transmux_channel_lease_seconds_remaining < 30
+# 갱신이 실패했거나 operation_timeout보다 오래 걸렸다. 기한은 갱신이 끝날 때 늘어나므로
+# 정상이면 ttl - max_clock_skew - renew_interval - operation_timeout 아래로 내려가지 않는다.
+# 28은 코드 기본값(45 - 2 - 10 - 5) 기준이다. 참조 솔루션 설정이면 10(20 - 2 - 5 - 3)으로 둔다.
+# for를 길게 두면 기한보다 늦게 울리므로 붙이지 않는다.
+transmux_channel_lease_held == 1 and transmux_channel_lease_seconds_remaining < 28
 
 # TransmuxDualWriter: 두 프로세스가 한 카메라를 발행하려 했다. 즉시 조사한다.
 increase(transmux_channel_manifest_conflicts_total[10m]) > 0
@@ -351,7 +353,17 @@ increase(transmux_channel_segment_conflicts_total[10m]) > 0
 curl -fsS "$TRANSMUX/metrics" | grep -E '^transmux_channel_(lease_held|lease_seconds_remaining|state)\{'
 curl -fsS "$TRANSMUX/channels" | jq -r '.channels[] | select(.state == "waiting_ownership" or .state == "failed")
   | [.center_id, .camera_id, .state, (.last_error // "")] | @tsv'
+# 수집 서버의 JSON 로그에서 대기 중인 카메라의 소유자와 만료 시각을 본다(INFO 레벨이다).
+jq -r 'select(.msg == "camera owned by another shard, waiting")
+  | [.time[0:19], .center_id, .camera_id, .error] | @tsv' transmuxd.log | tail -20
 ```
+
+`waiting_ownership`의 소유자와 만료 시각은 `/channels`의 `last_error`가 아니라
+`camera owned by another shard, waiting` 로그의 `error` 필드에서 본다. 이 대기 경로는
+`last_error`를 기록하지 않는다. 또 `last_error`는 한 번 기록되면 지워지지 않는다. 그래서
+기동 직후의 S3 오류(`camera ownership could not be determined: ...`)처럼 지난 오류가 남아
+있을 수 있다. 처음부터 대기한 채널이면 비어 있다. `last_error_at`이 최근인지 함께 본다.
+이 로그는 INFO 레벨이므로 경고 이상만 모으는 로그 수집에서는 빠진다.
 
 로그 메시지와 뜻은 다음과 같다.
 
@@ -368,7 +380,7 @@ curl -fsS "$TRANSMUX/channels" | jq -r '.channels[] | select(.state == "waiting_
 
 **판단 기준**
 
-- `waiting_ownership`이면 `error`의 `shard_id`와 만료 시각을 본다. 다른 샤드면 그 샤드가 아직
+- `waiting_ownership`이면 위 로그 `error`의 `shard_id`와 만료 시각을 본다. 다른 샤드면 그 샤드가 아직
   소유 중이다. 롤링 배포 중이면 정상이다. 자기와 같은 `shard_id`면 강제 종료된 이전 프로세스의
   lease다. 만료 시각 + 2 × `max_clock_skew` 뒤에 인수된다. 그 뒤에도 계속되면 이전 프로세스가
   아직 살아 있는지 확인한다.
@@ -719,11 +731,51 @@ transmux_channel_state == 7
 
 - **카메라 단위**(공유 목록 `object` 공급자): 운영자 화면 **카메라 관리**에서 **수집 중지**를
   누르고, 수집 서버 `/channels`에서 해당 채널이 사라진 것을 확인한 뒤(`cameras.poll_interval`
-  이내), **편집**에서 **영상 수집 사용**을 다시 켠다. API로 할 때 `PUT /v1/admin/cameras/{center}/{camera}`는
-  보낸 필드로 설정을 교체한다. `name`, `audio`, `format`, `video_codec`을 빠뜨리면 기본값이
-  되므로 `GET /v1/admin/cameras`의 항목 전체를 보낸다.
+  이내), **편집**에서 **영상 수집 사용**을 다시 켠다. API로 할 때는 아래 명령을 쓴다.
 - **샤드 단위**: [샤드 재시작·교체](#샤드-재시작교체)를 따른다. 그 샤드의 모든 채널이 다시
   시작된다. `static` 공급자는 이 방법만 쓸 수 있다.
+
+카메라 단위 복구를 API로 할 때는 다음을 지킨다.
+
+- 변경 요청마다 직전 `GET /v1/admin/cameras` 응답의 `ETag`를 `If-Match`로 보낸다. 없으면
+  `428 version_required`, 그 사이 목록이 바뀌었으면 `412 camera_list_changed`다. 412면 다시
+  GET해서 새 `ETag`로 보낸다.
+- `PUT /v1/admin/cameras/{center}/{camera}`는 보낸 필드로 설정을 교체한다. `name`, `audio`,
+  `format`, `video_codec`을 빠뜨리면 기본값이 된다.
+- GET 항목을 그대로 보내면 안 된다. 요청 본문은 알 수 없는 필드를 거절하므로 `permissions`,
+  `source`, `last_recorded_at`이 들어 있으면 `400 invalid_json`이다. 본문은
+  `{name, enabled, audio, format, video_codec, shard_id}`만 보낸다. `rtsp_url`을 빼면 저장된
+  주소가 유지된다.
+
+```sh
+CENTER=center-01 CAMERA=cam-01
+# 편집용 목록을 받고 ETag 헤더와 본문을 나눈다.
+admin_get() {
+  RESP=$(curl -fsS -D - -H "Authorization: Bearer $TOKEN" "$PLAYBACK/v1/admin/cameras" | tr -d '\r')
+  ETAG=$(printf '%s\n' "$RESP" | sed -n 's/^[Ee][Tt][Aa][Gg]: //p' | head -n 1)
+  BODY=$(printf '%s\n' "$RESP" | sed '1,/^$/d')
+}
+
+# 1. 수집을 멈춘다.
+admin_get
+curl -fsS -X DELETE -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
+  "$PLAYBACK/v1/admin/cameras/$CENTER/$CAMERA" | jq '{enabled: .camera.enabled, apply_within_seconds}'
+
+# 2. 수집 서버에서 채널이 사라질 때까지 기다린다(사라지면 404).
+while curl -fsS -o /dev/null "$TRANSMUX/channels/$CENTER/$CAMERA" 2>/dev/null; do sleep 2; done
+
+# 3. 허용된 필드만 골라 다시 켠다.
+admin_get
+printf '%s\n' "$BODY" | jq --arg c "$CENTER" --arg i "$CAMERA" '.cameras[]
+  | select(.center_id == $c and .camera_id == $i)
+  | {name, enabled: true, audio, format, video_codec, shard_id}' |
+  curl -fsS -X PUT -H "Authorization: Bearer $TOKEN" -H "If-Match: $ETAG" \
+    -H 'Content-Type: application/json' --data @- \
+    "$PLAYBACK/v1/admin/cameras/$CENTER/$CAMERA" | jq '{enabled: .camera.enabled, apply_within_seconds}'
+```
+
+같은 프로세스가 다시 시작한 채널은 자기 lease를 바로 다시 얻는다. 수집 서버의
+`/channels/$CENTER/$CAMERA`가 `receiving`이 될 때까지 본다.
 
 **복구 확인**: 해당 채널이 `receiving`, `healthy: true`이고 `transmux_channel_lease_held` = 1이다.
 
@@ -753,7 +805,8 @@ curl -fsS -G -H "Authorization: Bearer $TOKEN" "$PLAYBACK/v1/recordings" \
 - `index_complete: false`면 그 날짜의 S3 목록을 아직 다 읽지 않았다. 백필이 진행 중이므로
   기다린다.
 - 외부에서 지운 녹화는 다음 일일 대조에서 빠진다. 최대 약 24시간 걸린다
-  ([솔루션 가이드](solution.md#api)).
+  ([솔루션 가이드](solution.md#api)). 단, 인덱스 형식이 다른 버전 사이를 오간 인덱스는 대조로
+  고쳐지지 않으므로 재구축한다([롤백](#롤백) 3단계).
 - 조회 구간이 `index.days`보다 오래됐으면 S3에 있어도 조회되지 않는다. 정상 동작이다.
 - `playbackd`가 `open recording index (one process per file): timeout`으로 기동하지 않으면
   다른 프로세스가 같은 파일을 열고 있다. 손상이 아니다. 같은 인덱스 파일을 쓰는 두 번째
@@ -828,9 +881,18 @@ curl -fsS -G -H "Authorization: Bearer $TOKEN" "$PLAYBACK/v1/recordings" \
      ghcr.io/jeonghun-app/transmux:<previous-version> -validate
    ```
 
-3. 재생 서버를 되돌리기 전에 `playbackd`를 정지하고 인덱스 파일을 복사해 둔다. 이전 버전이
-   새 버전의 인덱스를 제대로 쓰지 못하면 [녹화 인덱스 불일치와 재구축](#녹화-인덱스-불일치와-재구축)으로
-   다시 만든다.
+3. 재생 서버의 녹화 인덱스는 버전 사이의 호환을 보장하지 않는다. 오류 없이 열리는지가 아니라
+   CHANGELOG와 [솔루션 가이드](solution.md#api)의 인덱스 형식 변경으로 판단하고, 확실하지 않으면
+   형식이 다르다고 본다. v0.1.0과 v0.2.0은 형식이 다르다. v0.2.0이 객체 이름 버킷을 추가했다.
+   - 형식이 다른 버전으로 되돌릴 때는 `playbackd`를 정지하고 인덱스 파일을 옮겨 둔 뒤 이전 버전을
+     **새 인덱스로** 시작한다. 절차는 [녹화 인덱스 불일치와 재구축](#녹화-인덱스-불일치와-재구축)의
+     1∼4단계와 같다.
+   - 다시 새 버전으로 올릴 때도 롤백 기간에 쓴 인덱스를 쓰지 않고 같은 방법으로 재구축한다.
+   - 이유: v0.1.0은 v0.2.0의 인덱스를 오류 없이 열지만 세그먼트 레코드만 기록하고 객체 이름
+     항목은 기록하지 않는다. 다시 v0.2.0으로 올리면 이미 이름 버킷이 있는 카메라·날짜는 변환
+     대상이 되지 않는다. 롤백 기간에 인덱싱된 세그먼트는 삭제 대조에서 빠진다. 그래서 그 객체가
+     지워져도 `index.days` 동안 조회 결과에 남고 재생하면 404가 난다. 일일 대조를 기다려도
+     해소되지 않는다.
 4. 수집 서버는 [샤드 재시작·교체](#샤드-재시작교체) 절차로 샤드마다 교체한다. lease를 지원하는
    버전끼리는 롤링 교체해도 이중 기록이 생기지 않는다. lease를 모르는 구버전으로는 롤링 교체하지
    않는다. 이전 프로세스를 모두 멈춘 뒤 시작한다.
