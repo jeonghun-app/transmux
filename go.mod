@@ -1,6 +1,6 @@
 module github.com/jeonghun-app/transmux
 
-go 1.26.8
+go 1.26.9
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.5

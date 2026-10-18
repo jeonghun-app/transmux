@@ -167,7 +167,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ### Go 런타임과 표준 라이브러리
 
 바이너리에 포함되는 Go 런타임·표준 라이브러리는 BSD-3-Clause를 따른다.
-Go 1.26.8 빌드 이미지의 `/usr/local/go/LICENSE` 전문이다.
+Go 1.26.9 빌드 이미지의 `/usr/local/go/LICENSE` 전문이다.
 
 ```text
 Copyright 2009 The Go Authors.

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/jeonghun-app/transmux/actions/workflows/ci.yml/badge.svg)](https://github.com/jeonghun-app/transmux/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
-[![Go 1.26.8](https://img.shields.io/badge/Go-1.26.8-00ADD8.svg)](go.mod)
+[![Go 1.26.9](https://img.shields.io/badge/Go-1.26.9-00ADD8.svg)](go.mod)
 
 [English](README.en.md)
 
@@ -50,7 +50,7 @@ WebRTC·RTMP·SRT·ABR 등 방송 서버의 모든 기능을 제공하는 제품
 ## 빠른 시작
 
 Docker/Compose v2와 Python 3가 필요하다. 호스트에 Go나 ffmpeg을 설치할 필요는 없다.
-빌드·검사는 Go 1.26.8 / Alpine 3.23, 런타임은 Alpine 3.23을 사용한다.
+빌드·검사는 Go 1.26.9 / Alpine 3.23, 런타임은 Alpine 3.23을 사용한다.
 
 ```bash
 make solution-up      # 비공개 저장소 + 수집·재생 서버 + 모의 카메라 3대
