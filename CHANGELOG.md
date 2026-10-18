@@ -21,6 +21,9 @@
   바인딩하지 못하면 기동하지 않는다. `http_listen`이 이미 8091 포트를 쓰거나 같은
   호스트에서 다른 프로세스가 8091을 쓰면 `metrics_listen`에 다른 주소를 지정한다.
   `configs/solution-playback.json`은 Compose 네트워크용으로 `:8091`을 명시한다.
+  이전 버전(v0.2.0 이하)으로 되돌릴 때는 설정에서 `metrics_listen` 키를 지운다.
+  이전 버전은 알 수 없는 설정 키를 거부(`DisallowUnknownFields`)하므로 키가 남아
+  있으면 기동하지 않는다.
 
 ## [0.2.0] - 2026-10-04
 
