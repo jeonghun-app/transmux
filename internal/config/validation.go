@@ -74,6 +74,56 @@ func (c StaticCamera) Validate() error {
 	return nil
 }
 
+// secretQueryKeys are lower-case fragments of query parameter names that
+// cameras and relays use for credentials. Matching is by substring so that
+// access_token, ApiKey and X-Amz-Signature are caught along with the plain
+// names; a false match only refuses a URL, it never lets one through.
+var secretQueryKeys = []string{"pass", "pwd", "token", "key", "secret", "auth", "signature", "credential"}
+
+// CheckCredentialFreeURL reports an error when rtsp_url carries credentials:
+// any userinfo (a user name alone included, so there is no partial form to
+// argue about) or a query parameter whose name looks like a secret. It is
+// enforced only when cameras.require_credential_free_urls is on.
+//
+// The error names the camera but never quotes the URL or the parameter
+// name, because a bare query key can itself be the secret.
+func (c StaticCamera) CheckCredentialFreeURL() error {
+	key := c.CenterID + "/" + c.CameraID
+	u, err := url.Parse(c.RTSPURL)
+	if err != nil {
+		return fmt.Errorf("camera %s: invalid rtsp_url", key)
+	}
+	if u.User != nil {
+		return fmt.Errorf("camera %s: rtsp_url must not carry userinfo while "+
+			"cameras.require_credential_free_urls is on", key)
+	}
+	if querySecret(u.RawQuery) {
+		return fmt.Errorf("camera %s: rtsp_url must not carry credentials in its query while "+
+			"cameras.require_credential_free_urls is on", key)
+	}
+	return nil
+}
+
+// querySecret reports whether a raw query has a parameter name that looks
+// like a credential. It splits on both & and ; because cameras use either,
+// and treats a name it cannot unescape as a secret: it cannot tell.
+func querySecret(raw string) bool {
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == '&' || r == ';' }) {
+		name, _, _ := strings.Cut(part, "=")
+		name, err := url.QueryUnescape(name)
+		if err != nil {
+			return true
+		}
+		name = strings.ToLower(name)
+		for _, secret := range secretQueryKeys {
+			if strings.Contains(name, secret) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ValidateHTTPURL checks endpoints without exposing query tokens or userinfo
 // in configuration errors. Network access is not needed for -validate.
 func ValidateHTTPURL(raw, field string) error {

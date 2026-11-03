@@ -415,6 +415,48 @@ func TestCameraManagementChecksVersionScopeAndKeepsDisabledArchive(t *testing.T)
 	}
 }
 
+// TestCameraManagementRefusesCredentialURLsWhenRequired covers #43: with
+// cameras.require_credential_free_urls on, the management API must not store
+// an enabled camera whose URL would put a password on ffmpeg's command line,
+// including one that keeps a stored credential URL by sending an empty
+// rtsp_url. Disabling such a camera stays possible.
+func TestCameraManagementRefusesCredentialURLsWhenRequired(t *testing.T) {
+	f := newFixture(t)
+	f.app.ingest.Cameras.RequireCredentialFreeURLs = true
+	token := f.token(t, allPermissions())
+	version := func() string {
+		resp, _ := f.request(t, "GET", "/v1/admin/cameras", token, nil, nil)
+		return resp.Header.Get("ETag")
+	}
+	refused := func(method, path string, body any) {
+		t.Helper()
+		resp, out := f.request(t, method, path, token, body, map[string]string{"If-Match": version()})
+		if resp.StatusCode != 400 || !bytes.Contains(out, []byte("credential_url")) {
+			t.Fatalf("%s %s: %d %s, want 400 credential_url", method, path, resp.StatusCode, out)
+		}
+		if bytes.Contains(out, []byte("argv-test-secret")) || bytes.Contains(out, []byte("private-camera-password")) {
+			t.Fatalf("%s %s: refusal quoted the secret: %s", method, path, out)
+		}
+	}
+	refused("POST", "/v1/admin/cameras", config.StaticCamera{CenterID: "c1", CameraID: "newcam",
+		RTSPURL: "rtsp://operator:argv-test-secret@relay/live"})
+	refused("POST", "/v1/admin/cameras", config.StaticCamera{CenterID: "c1", CameraID: "newcam",
+		RTSPURL: "rtsp://relay/live?token=argv-test-secret"})
+	// cam1 in the fixture stores a URL with a password; an empty rtsp_url keeps it.
+	refused("PUT", "/v1/admin/cameras/c1/cam1", config.StaticCamera{Name: "Renamed"})
+
+	resp, body := f.request(t, "POST", "/v1/admin/cameras", token,
+		config.StaticCamera{CenterID: "c1", CameraID: "newcam", RTSPURL: "rtsp://relay/live"},
+		map[string]string{"If-Match": version()})
+	if resp.StatusCode != 201 {
+		t.Fatalf("credential-free camera refused: %d %s", resp.StatusCode, body)
+	}
+	resp, body = f.request(t, "DELETE", "/v1/admin/cameras/c1/cam1", token, nil, map[string]string{"If-Match": version()})
+	if resp.StatusCode != 200 {
+		t.Fatalf("disabling a credential camera refused: %d %s", resp.StatusCode, body)
+	}
+}
+
 func TestRetentionDiscoversImportedMediaAndNeverDeletesControlObjects(t *testing.T) {
 	f := newFixture(t)
 	f.app.cfg.Retention.Days = 2

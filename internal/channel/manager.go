@@ -3,6 +3,7 @@ package channel
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -37,11 +38,16 @@ type Manager struct {
 	ready            bool
 	lastReconcile    time.Time
 	lastReconcileErr string
+	// credentialRejected lists, sorted, the cameras left out by the last
+	// reconcile because cameras.require_credential_free_urls is on and their
+	// rtsp_url carries credentials.
+	credentialRejected []string
 
-	mChannels     *metrics.Metric
-	mReconcile    *metrics.Metric
-	mReconcileErr *metrics.Metric
-	mRejected     *metrics.Metric
+	mChannels      *metrics.Metric
+	mReconcile     *metrics.Metric
+	mReconcileErr  *metrics.Metric
+	mRejected      *metrics.Metric
+	mCredentialURL *metrics.Metric
 }
 
 type entry struct {
@@ -68,6 +74,9 @@ func NewManager(cfg config.Config, provider camera.Provider, up ObjectClient, re
 			"Camera roster loads that failed.", shard),
 		mRejected: reg.Counter("transmux_roster_rejected_total",
 			"Cameras rejected because the shard channel cap was reached.", shard),
+		mCredentialURL: reg.Gauge("transmux_roster_credential_rejected",
+			"Cameras left out because their rtsp_url carries credentials while "+
+				"cameras.require_credential_free_urls is on.", shard),
 	}
 }
 
@@ -106,6 +115,10 @@ func (m *Manager) reconcile(ctx context.Context) {
 		// channels that are streaming fine. The previous roster stands.
 		m.log.Error("camera roster load failed, keeping current channels", "error", err)
 		return
+	}
+
+	if m.cfg.Cameras.RequireCredentialFreeURLs {
+		desired = m.dropCredentialURLs(desired)
 	}
 
 	// Apply the shard cap deterministically so a repeated partial roster
@@ -175,6 +188,36 @@ func (m *Manager) reconcile(ctx context.Context) {
 	m.mu.Unlock()
 	m.mChannels.Set(float64(n))
 	m.mReconcile.Inc()
+}
+
+// dropCredentialURLs leaves out the cameras whose rtsp_url carries
+// credentials. Starting one would put its password on ffmpeg's command line,
+// which every user of the host can read (#43). Only those cameras are left
+// out, before the shard cap so they take no channel slot; a running channel
+// whose URL gained credentials is stopped like a removed camera. The refusal
+// is logged when the set changes rather than on every poll, and the log names
+// cameras, never their URLs.
+func (m *Manager) dropCredentialURLs(desired []camera.Camera) []camera.Camera {
+	kept := make([]camera.Camera, 0, len(desired))
+	var rejected []string
+	for _, c := range desired {
+		if c.CheckCredentialFreeURL() != nil {
+			rejected = append(rejected, c.Key())
+			continue
+		}
+		kept = append(kept, c)
+	}
+	sort.Strings(rejected)
+	m.mu.Lock()
+	changed := !slices.Equal(rejected, m.credentialRejected)
+	m.credentialRejected = rejected
+	m.mu.Unlock()
+	m.mCredentialURL.Set(float64(len(rejected)))
+	if changed && len(rejected) > 0 {
+		m.log.Error("cameras left out: rtsp_url carries credentials while "+
+			"cameras.require_credential_free_urls is on", "cameras", rejected)
+	}
+	return kept
 }
 
 func (m *Manager) start(parent context.Context, c camera.Camera) {
@@ -269,6 +312,9 @@ type Status struct {
 	MaxChannels      int       `json:"max_channels"`
 	LastReconcile    time.Time `json:"last_reconcile"`
 	LastReconcileErr string    `json:"last_reconcile_error,omitempty"`
+	// CredentialRejected names the cameras left out because their rtsp_url
+	// carries credentials (cameras.require_credential_free_urls).
+	CredentialRejected []string `json:"credential_rejected,omitempty"`
 }
 
 func (m *Manager) Status() Status {
@@ -281,6 +327,8 @@ func (m *Manager) Status() Status {
 		MaxChannels:      m.cfg.MaxChannels,
 		LastReconcile:    m.lastReconcile,
 		LastReconcileErr: m.lastReconcileErr,
+		// Copied: the slice is replaced, never edited, but callers may sort.
+		CredentialRejected: slices.Clone(m.credentialRejected),
 	}
 	m.mu.RUnlock()
 	st.ChannelsTotal = len(snaps)

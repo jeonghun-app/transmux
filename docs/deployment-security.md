@@ -50,7 +50,16 @@ RTSP URL에 담겨 전달되며, ffmpeg의 argv로 들어간다. ffmpeg의 RTSP 
 2. 중계 서버는 그 고정 주소 하나(`/32`)에만, 필요한 경로의 읽기만 비밀번호 없이
    허용한다. transmuxd는 그 내부 네트워크에만 있는 별칭(아래 예의
    `mediamtx-transmux`)으로 접속해 연결이 그 주소에서 나가게 한다.
-3. 이미 비밀번호가 든 URL을 쓰던 배포는 URL을 바꾼 뒤 그 계정을 지우거나 비밀번호를
+3. 수집 설정에서 `cameras.require_credential_free_urls`를 켠다. 그러면 누가 다시
+   자격증명이 든 URL을 넣어도 ffmpeg가 그 URL로 시작하지 않는다.
+   - 설정 검증과 관리 API(`400 credential_url`)가 거절한다.
+   - 공유 목록에서는 그 카메라만 빼고, `/healthz`의 `shard.credential_rejected`와
+     `transmux_roster_credential_rejected` 지표로 알린다.
+   - 거절 범위는 userinfo 전체(사용자 이름만 있어도)와, 이름에 `pass`·`pwd`·`token`·
+     `key`·`secret`·`auth`·`signature`·`credential`이 든 쿼리 파라미터다(대소문자
+     무시).
+   - 경로에 넣는 자격증명(예: `/user=…&password=…`)은 걸러내지 않는다.
+4. 이미 비밀번호가 든 URL을 쓰던 배포는 URL을 바꾼 뒤 그 계정을 지우거나 비밀번호를
    교체한다. argv에 있던 동안 호스트 사용자가 읽었을 수 있다.
 
 MediaMTX 예시(transmuxd의 내부 네트워크 주소가 `172.31.243.10`일 때):

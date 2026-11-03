@@ -127,6 +127,12 @@ func (c Camera) Validate() error {
 	}).Validate()
 }
 
+// CheckCredentialFreeURL applies config.StaticCamera.CheckCredentialFreeURL
+// to a roster camera.
+func (c Camera) CheckCredentialFreeURL() error {
+	return (config.StaticCamera{CenterID: c.CenterID, CameraID: c.CameraID, RTSPURL: c.RTSPURL}).CheckCredentialFreeURL()
+}
+
 // Provider returns the desired camera roster. Implementations must be safe
 // for concurrent use.
 type Provider interface {

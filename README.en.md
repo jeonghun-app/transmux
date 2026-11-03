@@ -155,6 +155,7 @@ Key ingest settings (`configs/solution-ingest.json`):
 | `storage.tag_media` | `transmux-kind` object tag for retention | Off by default. Enabling it requires `s3:PutObjectTagging`; control objects are not tagged |
 | `cameras.provider` | `static`, `http`, `object` | `object` uses a conditionally updated shared roster and management API. Disabled `http` cameras are excluded from ingest but retained in the playback catalog and retention processing within the shard filter |
 | `cameras.shard_filter` | Responsible ingest server ID | Ingest only cameras whose roster `shard_id` matches |
+| `cameras.require_credential_free_urls` | Refuse an `rtsp_url` that carries credentials | Defaults to `false`. When on, enabled cameras with userinfo (a user name alone included) or a query parameter named like a password, token or key are not ingested. Configuration validation fails, the management API returns `400 credential_url`, and a shared roster leaves out only that camera, reported as `shard.credential_rejected` in `/healthz` and by `transmux_roster_credential_rejected`. It keeps passwords off the ffmpeg command line ([deployment security guide](docs/deployment-security.md#카메라-자격증명)) |
 | `cameras.static[].format` | `mpegts` or `fmp4` | Defaults to `mpegts`; `fmp4` is recommended for HEVC |
 | `cameras.static[].video_codec` | `auto`, `h264`, `hevc` | With `fmp4`, HEVC gets an Apple-compatible `hvc1` designation |
 | `cameras.static[].audio` | `none`, `copy`, `aac` | Defaults to `none`; transcode G.711 and similar audio to `aac` |

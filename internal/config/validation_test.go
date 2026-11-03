@@ -94,3 +94,80 @@ func TestLeaseBudgetIncludesTheConfirmationRead(t *testing.T) {
 		t.Fatal("lease expires before the second renewal's confirmation can finish")
 	}
 }
+
+// argvTestSecret stands in for a camera password. A credential check must
+// refuse every URL that carries it without ever quoting it back.
+const argvTestSecret = "argv-test-secret"
+
+func TestCredentialFreeURLCheckRefusesUserinfoAndSecretQueryKeys(t *testing.T) {
+	for name, raw := range map[string]string{
+		"user and password": "rtsp://operator:" + argvTestSecret + "@relay/cam",
+		"user only":         "rtsp://" + argvTestSecret + "@relay/cam",
+		"empty userinfo":    "rtsp://@relay/cam",
+		"query password":    "rtsp://relay/cam?channel=1&password=" + argvTestSecret,
+		"mixed case key":    "rtsp://relay/cam?PassWord=" + argvTestSecret,
+		"passwd":            "rtsp://relay/cam?passwd=" + argvTestSecret,
+		"pwd":               "rtsp://relay/cam?pwd=" + argvTestSecret,
+		"token":             "rtsp://relay/cam?access_token=" + argvTestSecret,
+		"key":               "rtsp://relay/cam?ApiKey=" + argvTestSecret,
+		"secret":            "rtsp://relay/cam?client_secret=" + argvTestSecret,
+		"auth":              "rtsp://relay/cam?auth=" + argvTestSecret,
+		"signature":         "rtsp://relay/cam?X-Amz-Signature=" + argvTestSecret,
+		"credential":        "rtsp://relay/cam?X-Amz-Credential=" + argvTestSecret,
+		"escaped key":       "rtsp://relay/cam?pass%77ord=" + argvTestSecret,
+		"semicolon":         "rtsp://relay/cam?channel=1;token=" + argvTestSecret,
+		"bare key":          "rtsp://relay/cam?token" + argvTestSecret,
+		"unreadable key":    "rtsp://relay/cam?%zz" + argvTestSecret + "=1",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cam := StaticCamera{CenterID: "c", CameraID: "cam", RTSPURL: raw}
+			err := cam.CheckCredentialFreeURL()
+			if err == nil {
+				t.Fatal("URL with credentials passed the credential-free check")
+			}
+			if strings.Contains(err.Error(), argvTestSecret) {
+				t.Fatalf("credential check quoted the secret: %v", err)
+			}
+		})
+	}
+}
+
+func TestCredentialFreeURLCheckKeepsPlainSourceURLs(t *testing.T) {
+	for _, raw := range []string{
+		"rtsp://relay:8554/cam01",
+		"rtsps://relay/cam",
+		"rtsp://relay/cam?channel=1&subtype=0",
+		"rtsp://relay/cam?",
+	} {
+		cam := StaticCamera{CenterID: "c", CameraID: "cam", RTSPURL: raw}
+		if err := cam.CheckCredentialFreeURL(); err != nil {
+			t.Errorf("%s: %v", raw, err)
+		}
+	}
+}
+
+func TestValidateRequiresCredentialFreeStaticURLsOnlyWhenAsked(t *testing.T) {
+	c := valid()
+	c.Cameras.Static = []StaticCamera{
+		{CenterID: "c", CameraID: "cam", RTSPURL: "rtsp://operator:" + argvTestSecret + "@relay/cam"},
+	}
+	// Off by default: existing deployments that pass credentials keep working.
+	if err := c.Validate(); err != nil {
+		t.Fatalf("credential URL refused with the option off: %v", err)
+	}
+	c.Cameras.RequireCredentialFreeURLs = true
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("credential URL accepted with cameras.require_credential_free_urls on")
+	}
+	if strings.Contains(err.Error(), argvTestSecret) {
+		t.Fatalf("validation quoted the secret: %v", err)
+	}
+	// A disabled camera never starts ffmpeg, so its URL never reaches argv.
+	disabled := false
+	c.Cameras.Static[0].Enabled = &disabled
+	c.Cameras.Static = append(c.Cameras.Static, StaticCamera{CenterID: "c", CameraID: "cam2", RTSPURL: "rtsp://relay/cam2"})
+	if err := c.Validate(); err != nil {
+		t.Fatalf("disabled credential camera refused: %v", err)
+	}
+}

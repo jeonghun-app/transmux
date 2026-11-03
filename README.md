@@ -143,6 +143,7 @@ playbackd -config /etc/transmux/playback.json -validate
 | `storage.tag_media` | 보존용 `transmux-kind` 객체 태그 | 기본 꺼짐. 켜면 `s3:PutObjectTagging` 필요; 제어 객체에는 태그를 붙이지 않는다 |
 | `cameras.provider` | `static`, `http`, `object` | `object`는 조건부 갱신되는 공유 목록과 관리 API를 사용. `http`의 비활성 카메라는 수집에서 제외하되 샤드 필터 범위의 재생 카탈로그·보존 작업에는 유지 |
 | `cameras.shard_filter` | 담당 수집 서버 ID | 목록의 `shard_id`가 일치하는 카메라만 수집 |
+| `cameras.require_credential_free_urls` | 자격증명이 든 `rtsp_url` 거절 | 기본 `false`. 켜면 userinfo(사용자 이름만 있어도)나 비밀번호·토큰·키 같은 이름의 쿼리 파라미터가 있는 활성 카메라를 수집하지 않는다. 설정 검증 실패, 관리 API `400 credential_url`, 공유 목록에서는 그 카메라만 빼고 `/healthz`의 `shard.credential_rejected`와 `transmux_roster_credential_rejected`로 알린다. ffmpeg 명령줄에 비밀번호가 나오지 않게 하려는 설정이다([배포 보안 가이드](docs/deployment-security.md#카메라-자격증명)) |
 | `cameras.static[].format` | `mpegts` 또는 `fmp4` | 기본 `mpegts`; HEVC에는 `fmp4` 권장 |
 | `cameras.static[].video_codec` | `auto`, `h264`, `hevc` | HEVC는 `fmp4`와 함께 지정하면 Apple 호환 `hvc1` 표시 적용 |
 | `cameras.static[].audio` | `none`, `copy`, `aac` | 기본 `none`; G.711 등은 `aac`로 변환 |

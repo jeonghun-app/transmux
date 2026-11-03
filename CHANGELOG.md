@@ -8,6 +8,15 @@
 
 ## [Unreleased]
 
+### Added
+
+- `cameras.require_credential_free_urls`(기본 `false`): 켜면 자격증명이 든 `rtsp_url`
+  (userinfo 전체, 비밀번호·토큰·키 같은 이름의 쿼리 파라미터)을 가진 활성 카메라로
+  ffmpeg를 시작하지 않는다.
+  - 설정 검증이 실패하고, 관리 API는 `400 credential_url`을 돌려준다.
+  - 공유 목록에서는 그 카메라만 빼고 `/healthz`의 `shard.credential_rejected`와
+    `transmux_roster_credential_rejected` 지표로 알린다(#43).
+
 ### Security
 
 - `docs/deployment-security.md`: 카메라 자격증명이 ffmpeg argv로 호스트 사용자에게
