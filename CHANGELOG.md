@@ -8,6 +8,12 @@
 
 ## [Unreleased]
 
+### Security
+
+- `docs/deployment-security.md`: 카메라 자격증명이 ffmpeg argv로 호스트 사용자에게
+  보이는 문제와, 자격증명 없는 URL로 중계 서버에서 읽는 권장 구성(전용 내부
+  네트워크, 고정 주소 하나만 비밀번호 없이 허용)을 적었다(#43).
+
 ## [0.2.0] - 2026-10-04
 
 ### Added
