@@ -114,10 +114,12 @@ func TestCredentialFreeURLCheckRefusesUserinfoAndSecretQueryKeys(t *testing.T) {
 		"auth":              "rtsp://relay/cam?auth=" + argvTestSecret,
 		"signature":         "rtsp://relay/cam?X-Amz-Signature=" + argvTestSecret,
 		"credential":        "rtsp://relay/cam?X-Amz-Credential=" + argvTestSecret,
-		"escaped key":       "rtsp://relay/cam?pass%77ord=" + argvTestSecret,
-		"semicolon":         "rtsp://relay/cam?channel=1;token=" + argvTestSecret,
-		"bare key":          "rtsp://relay/cam?token" + argvTestSecret,
-		"unreadable key":    "rtsp://relay/cam?%zz" + argvTestSecret + "=1",
+		// Only the unescaped name matches: "%74oken" is "token".
+		"escaped key": "rtsp://relay/cam?%74oken=" + argvTestSecret,
+		"semicolon":   "rtsp://relay/cam?channel=1;token=" + argvTestSecret,
+		"bare key":    "rtsp://relay/cam?token" + argvTestSecret,
+		// A name that cannot be unescaped is refused: it cannot be read.
+		"unreadable key": "rtsp://relay/cam?%zzq=" + argvTestSecret,
 	} {
 		t.Run(name, func(t *testing.T) {
 			cam := StaticCamera{CenterID: "c", CameraID: "cam", RTSPURL: raw}
