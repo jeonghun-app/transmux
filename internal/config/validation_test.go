@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -171,5 +172,33 @@ func TestValidateRequiresCredentialFreeStaticURLsOnlyWhenAsked(t *testing.T) {
 	c.Cameras.Static = append(c.Cameras.Static, StaticCamera{CenterID: "c", CameraID: "cam2", RTSPURL: "rtsp://relay/cam2"})
 	if err := c.Validate(); err != nil {
 		t.Fatalf("disabled credential camera refused: %v", err)
+	}
+}
+
+// TestCredentialFreeURLCheckNamesTheMatchedPatternOnly covers the review of
+// #45: a refusal must say which fixed pattern matched, so an operator can
+// tell a false match (Axis videokeyframeinterval) from a real credential, but
+// must not quote the camera's own parameter name, which can be the secret.
+func TestCredentialFreeURLCheckNamesTheMatchedPatternOnly(t *testing.T) {
+	for raw, want := range map[string]struct{ reason, absent string }{
+		"rtsp://relay/axis-media/media.amp?videokeyframeinterval=8": {`query parameter matches credential pattern "key"`, "videokeyframeinterval"},
+		"rtsp://relay/cam?access_token=1":                           {`query parameter matches credential pattern "token"`, "access_token"},
+		"rtsp://relay/cam?bypass=1":                                 {`query parameter matches credential pattern "pass"`, "bypass"},
+		"rtsp://relay/cam?%74oken=1":                                {`query parameter matches credential pattern "token"`, "%74oken"},
+		"rtsp://relay/cam?%zzq=1":                                   {"query parameter name cannot be read", "%zzq"},
+		"rtsp://operator@relay/cam":                                 {"userinfo", "operator"},
+	} {
+		cam := StaticCamera{CenterID: "c", CameraID: "cam", RTSPURL: raw}
+		err := cam.CheckCredentialFreeURL()
+		var cerr *CredentialURLError
+		if !errors.As(err, &cerr) {
+			t.Fatalf("%s: got %v, want a *CredentialURLError", raw, err)
+		}
+		if !strings.Contains(err.Error(), want.reason) || !strings.Contains(cerr.Reason, strings.TrimPrefix(want.reason, "query parameter ")) {
+			t.Errorf("%s: error %q / reason %q does not name %q", raw, err, cerr.Reason, want.reason)
+		}
+		if strings.Contains(err.Error(), want.absent) || strings.Contains(cerr.Reason, want.absent) {
+			t.Errorf("%s: refusal quoted the camera's own text %q: %v", raw, want.absent, err)
+		}
 	}
 }

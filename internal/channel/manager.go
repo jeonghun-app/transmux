@@ -2,6 +2,7 @@ package channel
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"slices"
 	"sort"
@@ -38,10 +39,10 @@ type Manager struct {
 	ready            bool
 	lastReconcile    time.Time
 	lastReconcileErr string
-	// credentialRejected lists, sorted, the cameras left out by the last
-	// reconcile because cameras.require_credential_free_urls is on and their
-	// rtsp_url carries credentials.
-	credentialRejected []string
+	// credentialRejected lists, sorted by camera, the cameras left out by the
+	// last reconcile because cameras.require_credential_free_urls is on and
+	// their rtsp_url carries credentials.
+	credentialRejected []CredentialRejection
 
 	mChannels      *metrics.Metric
 	mReconcile     *metrics.Metric
@@ -199,15 +200,22 @@ func (m *Manager) reconcile(ctx context.Context) {
 // cameras, never their URLs.
 func (m *Manager) dropCredentialURLs(desired []camera.Camera) []camera.Camera {
 	kept := make([]camera.Camera, 0, len(desired))
-	var rejected []string
+	var rejected []CredentialRejection
 	for _, c := range desired {
-		if c.CheckCredentialFreeURL() != nil {
-			rejected = append(rejected, c.Key())
+		if err := c.CheckCredentialFreeURL(); err != nil {
+			// The reason is fixed wording from config (rule, matched pattern);
+			// anything else is reported generically rather than echoed.
+			reason := "invalid rtsp_url"
+			var cerr *config.CredentialURLError
+			if errors.As(err, &cerr) {
+				reason = cerr.Reason
+			}
+			rejected = append(rejected, CredentialRejection{Camera: c.Key(), Reason: reason})
 			continue
 		}
 		kept = append(kept, c)
 	}
-	sort.Strings(rejected)
+	sort.Slice(rejected, func(i, j int) bool { return rejected[i].Camera < rejected[j].Camera })
 	m.mu.Lock()
 	changed := !slices.Equal(rejected, m.credentialRejected)
 	m.credentialRejected = rejected
@@ -314,7 +322,16 @@ type Status struct {
 	LastReconcileErr string    `json:"last_reconcile_error,omitempty"`
 	// CredentialRejected names the cameras left out because their rtsp_url
 	// carries credentials (cameras.require_credential_free_urls).
-	CredentialRejected []string `json:"credential_rejected,omitempty"`
+	CredentialRejected []CredentialRejection `json:"credential_rejected,omitempty"`
+}
+
+// CredentialRejection is one camera left out by
+// cameras.require_credential_free_urls. Reason is fixed wording that names
+// the rule or the matched pattern, never the URL or the camera's own
+// parameter name.
+type CredentialRejection struct {
+	Camera string `json:"camera"`
+	Reason string `json:"reason"`
 }
 
 func (m *Manager) Status() Status {

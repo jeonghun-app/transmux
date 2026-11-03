@@ -428,22 +428,22 @@ func TestCameraManagementRefusesCredentialURLsWhenRequired(t *testing.T) {
 		resp, _ := f.request(t, "GET", "/v1/admin/cameras", token, nil, nil)
 		return resp.Header.Get("ETag")
 	}
-	refused := func(method, path string, body any) {
+	refused := func(method, path string, body any, reason string) {
 		t.Helper()
 		resp, out := f.request(t, method, path, token, body, map[string]string{"If-Match": version()})
-		if resp.StatusCode != 400 || !bytes.Contains(out, []byte("credential_url")) {
-			t.Fatalf("%s %s: %d %s, want 400 credential_url", method, path, resp.StatusCode, out)
+		if resp.StatusCode != 400 || !bytes.Contains(out, []byte("credential_url")) || !bytes.Contains(out, []byte(reason)) {
+			t.Fatalf("%s %s: %d %s, want 400 credential_url naming %s", method, path, resp.StatusCode, out, reason)
 		}
 		if bytes.Contains(out, []byte("argv-test-secret")) || bytes.Contains(out, []byte("private-camera-password")) {
 			t.Fatalf("%s %s: refusal quoted the secret: %s", method, path, out)
 		}
 	}
 	refused("POST", "/v1/admin/cameras", config.StaticCamera{CenterID: "c1", CameraID: "newcam",
-		RTSPURL: "rtsp://operator:argv-test-secret@relay/live"})
+		RTSPURL: "rtsp://operator:argv-test-secret@relay/live"}, "userinfo")
 	refused("POST", "/v1/admin/cameras", config.StaticCamera{CenterID: "c1", CameraID: "newcam",
-		RTSPURL: "rtsp://relay/live?token=argv-test-secret"})
+		RTSPURL: "rtsp://relay/live?access_token=argv-test-secret"}, `credential pattern \"token\"`)
 	// cam1 in the fixture stores a URL with a password; an empty rtsp_url keeps it.
-	refused("PUT", "/v1/admin/cameras/c1/cam1", config.StaticCamera{Name: "Renamed"})
+	refused("PUT", "/v1/admin/cameras/c1/cam1", config.StaticCamera{Name: "Renamed"}, "userinfo")
 
 	resp, body := f.request(t, "POST", "/v1/admin/cameras", token,
 		config.StaticCamera{CenterID: "c1", CameraID: "newcam", RTSPURL: "rtsp://relay/live"},

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -118,6 +119,9 @@ func TestCredentialFreeURLsKeepPasswordsOffTheFFmpegCommandLine(t *testing.T) {
 	const secret = "argv-test-secret"
 	clean := camera.Camera{CenterID: "c1", CameraID: "clean", RTSPURL: "rtsp://relay:8554/clean"}
 	withPassword := camera.Camera{CenterID: "c1", CameraID: "cred", RTSPURL: "rtsp://operator:" + secret + "@relay:8554/cred"}
+	// A false match (Axis keyframe interval matches "key") is left out too,
+	// and the status says which pattern matched so the operator can tell.
+	axis := camera.Camera{CenterID: "c1", CameraID: "axis", RTSPURL: "rtsp://relay:8554/axis?videokeyframeinterval=8"}
 	for _, on := range []bool{true, false} {
 		t.Run(map[bool]string{true: "on", false: "off"}[on], func(t *testing.T) {
 			dir := t.TempDir()
@@ -128,13 +132,13 @@ func TestCredentialFreeURLsKeepPasswordsOffTheFFmpegCommandLine(t *testing.T) {
 			var logs strings.Builder
 			var logMu sync.Mutex
 			log := slog.New(slog.NewTextHandler(&lockedWriter{w: &logs, mu: &logMu}, nil))
-			m := NewManager(cfg, listProvider{cams: []camera.Camera{withPassword, clean}}, &fakeStore{}, reg, log)
+			m := NewManager(cfg, listProvider{cams: []camera.Camera{withPassword, clean, axis}}, &fakeStore{}, reg, log)
 			ctx, cancel := context.WithCancel(context.Background())
 			m.reconcile(ctx)
 			defer func() { cancel(); m.shutdown() }()
 
 			if !on {
-				argv := recordedArgv(t, dir, 2)
+				argv := recordedArgv(t, dir, 3)
 				if !strings.Contains(strings.Join(argv, "\n"), "\n"+withPassword.RTSPURL+"\n") {
 					t.Fatal("with the option off the configured URL did not reach ffmpeg unchanged")
 				}
@@ -150,18 +154,23 @@ func TestCredentialFreeURLsKeepPasswordsOffTheFFmpegCommandLine(t *testing.T) {
 			if _, running := m.Snapshot("c1", "cred"); running {
 				t.Fatal("a camera whose URL carries a password was started")
 			}
-			if st := m.Status(); len(st.CredentialRejected) != 1 || st.CredentialRejected[0] != "c1/cred" {
-				t.Fatalf("status does not name the camera left out: %v", st.CredentialRejected)
+			want := []CredentialRejection{
+				{Camera: "c1/axis", Reason: `query parameter matches credential pattern "key"`},
+				{Camera: "c1/cred", Reason: "userinfo"},
+			}
+			if st := m.Status(); !slices.Equal(st.CredentialRejected, want) {
+				t.Fatalf("status = %v, want %v", st.CredentialRejected, want)
 			}
 			body := string(reg.Render())
-			if !strings.Contains(body, "transmux_roster_credential_rejected{shard_id=\"shard-0\"} 1") {
+			if !strings.Contains(body, "transmux_roster_credential_rejected{shard_id=\"shard-0\"} 2") {
 				t.Fatalf("metric does not count the camera left out:\n%s", body)
 			}
 			logMu.Lock()
 			text := logs.String()
 			logMu.Unlock()
-			if !strings.Contains(text, "c1/cred") || strings.Contains(text, secret) {
-				t.Fatalf("log must name the camera without its password:\n%s", text)
+			if !strings.Contains(text, "c1/cred") || !strings.Contains(text, "credential pattern") ||
+				strings.Contains(text, secret) || strings.Contains(text, "videokeyframeinterval") {
+				t.Fatalf("log must name the camera and the matched pattern, not the URL:\n%s", text)
 			}
 			// A second poll with the same roster does not log the same refusal again.
 			before := strings.Count(text, "require_credential_free_urls")
