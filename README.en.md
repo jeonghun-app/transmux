@@ -164,6 +164,10 @@ Key ingest settings (`configs/solution-ingest.json`):
 | `lease.operation_timeout` | Limit for one lease request | Separate from `upload.put_timeout`. Lease records are hundreds of bytes while segments are several MB, so one shared timeout would necessarily be wrong for one of them |
 | `lease.max_clock_skew` | Assumed maximum clock skew between shards | The taker waits this much longer after expiry; the owner stops this much earlier. Hosts need NTP |
 
+`cameras.require_credential_free_urls` looks for fixed name fragments (`pass`, `pwd`, `token`, `key`, `secret`, `auth`, `signature`, `credential`) as substrings.
+- **False matches**: a name that is not a credential is refused when it matches (the safe side). Examples are Axis VAPIX `videokeyframeinterval` (`key`), `bypass` (`pass`) and `author` (`auth`). The refusal names only the matched fragment (for example `query parameter matches credential pattern "key"`), never the camera's own parameter name. For such a camera, turn the option off, or read it through a relay (MediaMTX) and give transmuxd a URL without the query.
+- **Not caught**: names outside the list (`u`, `p`, `pw`, `sig`, `jwt`, `sid` and so on), a query with a value and no name, path parameters such as `;password=`, and fragments (`#…`). Do not use such URLs.
+
 Key playback settings (`configs/solution-playback.json`):
 
 | Key | Meaning | Notes |

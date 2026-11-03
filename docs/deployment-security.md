@@ -58,7 +58,10 @@ RTSP URL에 담겨 전달되며, ffmpeg의 argv로 들어간다. ffmpeg의 RTSP 
    - 거절 범위는 userinfo 전체(사용자 이름만 있어도)와, 이름에 `pass`·`pwd`·`token`·
      `key`·`secret`·`auth`·`signature`·`credential`이 든 쿼리 파라미터다(대소문자
      무시).
-   - 경로에 넣는 자격증명(예: `/user=…&password=…`)은 걸러내지 않는다.
+   - 거절 사유에는 맞은 조각만 나온다(`userinfo`, `query parameter matches credential
+     pattern "key"`). 오탐(Axis `videokeyframeinterval`, `bypass`, `author`)과 거르지
+     않는 형태(목록 밖 이름, 값만 있는 쿼리, 경로의 `/user=…&password=…`·`;password=`,
+     프래그먼트)는 [README](../README.md)의 설정 표 아래에 정리했다.
 4. 이미 비밀번호가 든 URL을 쓰던 배포는 URL을 바꾼 뒤 그 계정을 지우거나 비밀번호를
    교체한다. argv에 있던 동안 호스트 사용자가 읽었을 수 있다.
 
@@ -99,6 +102,10 @@ networks:
 이 구성에서는 고정 주소에서만 비밀번호 없이 읽을 수 있다. 다른 내부 주소, 기본
 네트워크, 호스트(게이트웨이 경유)에서 오는 요청은 MediaMTX 1.21.0이 `401`로
 거절했다(2026-11-04 확인).
+
+`docker` 그룹 사용자는 이 경계 밖에 있다. 컨테이너를 그 내부 네트워크에 붙이고
+고정 주소(`172.31.243.10`)를 가져가면 비밀번호 없이 읽을 수 있다. argv를 읽는 것과
+같은 권한이므로 `docker` 그룹은 root처럼 다룬다.
 
 중계 서버를 둘 수 없으면 호스트의 `/proc`을 `hidepid=invisible`로 마운트해 다른
 사용자의 프로세스 정보를 숨긴다. 컨테이너 런타임과 호스트 접근 권한도 통제한다.

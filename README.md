@@ -152,6 +152,10 @@ playbackd -config /etc/transmux/playback.json -validate
 | `lease.operation_timeout` | lease 요청 하나의 상한 | `upload.put_timeout`과 분리한다. lease 레코드는 수백 바이트, 세그먼트는 수 MB라 같이 묶으면 한쪽이 반드시 잘못 잡힌다 |
 | `lease.max_clock_skew` | 샤드 간 시계 오차 상한 가정 | 인수자는 만료 후 이만큼 더 기다리고, 소유자는 이만큼 먼저 멈춘다. 호스트에 NTP가 필요하다 |
 
+`cameras.require_credential_free_urls`는 고정된 이름 조각(`pass`·`pwd`·`token`·`key`·`secret`·`auth`·`signature`·`credential`)을 부분 문자열로 찾는다.
+- **오탐**: 자격증명이 아닌 이름도 맞으면 거절한다(안전한 쪽). 예는 Axis VAPIX `videokeyframeinterval`(`key`), `bypass`(`pass`), `author`(`auth`)다. 거절 사유에는 맞은 조각(예: `query parameter matches credential pattern "key"`)만 나오고, 카메라의 실제 파라미터 이름은 나오지 않는다. 그런 카메라는 이 설정을 끄거나, 중계 서버(MediaMTX) 경로로 받아 transmuxd에는 쿼리 없는 URL을 준다.
+- **거르지 않는 것**: 목록 밖 이름(`u`·`p`·`pw`·`sig`·`jwt`·`sid` 등), 이름 없이 값만 있는 쿼리, `;password=` 같은 경로 매개변수, 프래그먼트(`#…`)는 거르지 않는다. 그런 URL은 쓰지 않는다.
+
 주요 재생 설정(`configs/solution-playback.json`):
 
 | 키 | 의미 | 주의 |
