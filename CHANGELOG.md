@@ -8,6 +8,22 @@
 
 ## [Unreleased]
 
+### Added
+
+- `cameras.require_credential_free_urls`(기본 `false`): 켜면 자격증명이 든 `rtsp_url`
+  (userinfo 전체, 비밀번호·토큰·키 같은 이름의 쿼리 파라미터)을 가진 활성 카메라로
+  ffmpeg를 시작하지 않는다(#43).
+  - 설정 검증이 실패하고, 관리 API는 `400 credential_url`을 돌려준다.
+  - 공유 목록에서는 그 카메라만 뺀다. 그리고 `transmux_roster_credential_rejected`
+    지표와 shard 상태(`/healthz`·`/readyz`·`/channels`의 `shard`) 새 필드
+    `credential_rejected`로 알린다. 이 필드는 `{"camera", "reason"}` 객체 목록이다.
+    `reason`은 맞은 규칙이나 고정 조각(`userinfo`, `query parameter matches credential
+    pattern "key"`)만 담고 URL이나 카메라의 실제 파라미터 이름은 담지 않는다.
+  - 설정이 꺼져 있거나 빠진 카메라가 없으면 이 필드는 응답에 없다(`omitempty`).
+    그래서 기본 설정의 상태 응답은 전과 같다.
+  - 이름 조각을 부분 문자열로 찾으므로 Axis `videokeyframeinterval`(`key`) 같은
+    오탐이 있다. 오탐과 거르지 않는 형태는 README 설정 표 아래에 적었다.
+
 ### Changed
 
 - 빌드·검사·릴리스 이미지의 Go 툴체인을 1.26.8에서 1.26.10으로 올렸다
@@ -24,6 +40,9 @@
     `net/textproto`(GO-2026-6608), `crypto/tls`(GO-2026-6607), `os`(GO-2026-6604)
   - 1.26.10에서 고친 1건: `crypto/x509`(GO-2026-6809, 침해된 중간 인증서를 믿지
     않는다)
+- `docs/deployment-security.md`: 카메라 자격증명이 ffmpeg argv로 호스트 사용자에게
+  보이는 문제와, 자격증명 없는 URL로 중계 서버에서 읽는 권장 구성(전용 내부
+  네트워크, 고정 주소 하나만 비밀번호 없이 허용)을 적었다(#43).
 
 ## [0.2.0] - 2026-10-04
 

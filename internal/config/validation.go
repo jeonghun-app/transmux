@@ -74,6 +74,68 @@ func (c StaticCamera) Validate() error {
 	return nil
 }
 
+// secretQueryKeys are lower-case fragments of query parameter names that
+// cameras and relays use for credentials. Matching is by substring so that
+// access_token, ApiKey and X-Amz-Signature are caught along with the plain
+// names; a false match only refuses a URL, it never lets one through.
+var secretQueryKeys = []string{"pass", "pwd", "token", "key", "secret", "auth", "signature", "credential"}
+
+// CredentialURLError is a refusal by CheckCredentialFreeURL. Reason says
+// which rule matched in fixed words, "userinfo" or the matched entry of
+// secretQueryKeys, so an operator can tell a false match (Axis
+// videokeyframeinterval matches "key") from a real credential. It never holds
+// the URL or the camera's own parameter name: a bare query key can itself be
+// the secret.
+type CredentialURLError struct {
+	Camera string
+	Reason string
+}
+
+func (e *CredentialURLError) Error() string {
+	return fmt.Sprintf("camera %s: rtsp_url refused (%s) while cameras.require_credential_free_urls is on",
+		e.Camera, e.Reason)
+}
+
+// CheckCredentialFreeURL reports a *CredentialURLError when rtsp_url carries
+// credentials: any userinfo (a user name alone included, so there is no
+// partial form to argue about) or a query parameter whose name looks like a
+// secret. It is enforced only when cameras.require_credential_free_urls is on.
+func (c StaticCamera) CheckCredentialFreeURL() error {
+	key := c.CenterID + "/" + c.CameraID
+	u, err := url.Parse(c.RTSPURL)
+	if err != nil {
+		return fmt.Errorf("camera %s: invalid rtsp_url", key)
+	}
+	if u.User != nil {
+		return &CredentialURLError{Camera: key, Reason: "userinfo"}
+	}
+	if reason := querySecret(u.RawQuery); reason != "" {
+		return &CredentialURLError{Camera: key, Reason: reason}
+	}
+	return nil
+}
+
+// querySecret returns why a raw query has a parameter name that looks like a
+// credential, or "" when none does. It splits on both & and ; because cameras
+// use either, and treats a name it cannot unescape as a secret: it cannot
+// tell.
+func querySecret(raw string) string {
+	for _, part := range strings.FieldsFunc(raw, func(r rune) bool { return r == '&' || r == ';' }) {
+		name, _, _ := strings.Cut(part, "=")
+		name, err := url.QueryUnescape(name)
+		if err != nil {
+			return "query parameter name cannot be read"
+		}
+		name = strings.ToLower(name)
+		for _, secret := range secretQueryKeys {
+			if strings.Contains(name, secret) {
+				return fmt.Sprintf("query parameter matches credential pattern %q", secret)
+			}
+		}
+	}
+	return ""
+}
+
 // ValidateHTTPURL checks endpoints without exposing query tokens or userinfo
 // in configuration errors. Network access is not needed for -validate.
 func ValidateHTTPURL(raw, field string) error {

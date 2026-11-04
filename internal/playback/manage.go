@@ -120,6 +120,9 @@ func (s *Server) createCamera(w http.ResponseWriter, r *http.Request, actor *Cla
 		fail(w, http.StatusBadRequest, "invalid_camera", err.Error())
 		return
 	}
+	if !s.credentialFree(w, cam) {
+		return
+	}
 	roster, ok := s.editRoster(w, r)
 	if !ok {
 		return
@@ -195,9 +198,30 @@ func (s *Server) changeCamera(w http.ResponseWriter, r *http.Request, actor *Cla
 			fail(w, http.StatusBadRequest, "invalid_camera", err.Error())
 			return
 		}
+		// Checked after the merge: an empty rtsp_url keeps the stored URL,
+		// which may be the one carrying credentials.
+		if !s.credentialFree(w, cam) {
+			return
+		}
 		roster[i] = cam
 		s.saveRoster(w, r, actor, roster, cam, http.StatusOK, action)
 		return
 	}
 	fail(w, http.StatusNotFound, "camera_not_found", "Camera not found.")
+}
+
+// credentialFree refuses an enabled camera whose rtsp_url carries
+// credentials while cameras.require_credential_free_urls is on, and reports
+// whether the request may go on. ffmpeg would put that URL on its command
+// line, readable by every user of the ingest host (#43). A disabled camera
+// never starts ffmpeg, so disabling one stays possible.
+func (s *Server) credentialFree(w http.ResponseWriter, cam config.StaticCamera) bool {
+	if !s.ingest.Cameras.RequireCredentialFreeURLs || cam.Enabled != nil && !*cam.Enabled {
+		return true
+	}
+	if err := cam.CheckCredentialFreeURL(); err != nil {
+		fail(w, http.StatusBadRequest, "credential_url", err.Error())
+		return false
+	}
+	return true
 }

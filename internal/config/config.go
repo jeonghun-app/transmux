@@ -216,6 +216,14 @@ type CameraConfig struct {
 	PollInterval Duration `json:"poll_interval"`
 	// RequestTimeout bounds a single provider request.
 	RequestTimeout Duration `json:"request_timeout"`
+	// RequireCredentialFreeURLs refuses enabled cameras whose rtsp_url
+	// carries credentials (any userinfo, or a query key that looks like a
+	// secret). ffmpeg takes RTSP credentials only inside its input URL and
+	// its command line is readable by every user of the host, so a
+	// deployment that reads through a relay turns this on to keep a
+	// password from ever reaching that command line. Off by default so
+	// cameras that need credentials in the URL keep working.
+	RequireCredentialFreeURLs bool `json:"require_credential_free_urls"`
 }
 
 type StaticCamera struct {
@@ -514,6 +522,11 @@ func (c *Config) Validate() error {
 			}
 			if err := cam.Validate(); err != nil {
 				return fmt.Errorf("camera entry %d: %w", i, err)
+			}
+			if c.Cameras.RequireCredentialFreeURLs {
+				if err := cam.CheckCredentialFreeURL(); err != nil {
+					return fmt.Errorf("camera entry %d: %w", i, err)
+				}
 			}
 			key := cam.CenterID + "/" + cam.CameraID
 			if seen[key] {

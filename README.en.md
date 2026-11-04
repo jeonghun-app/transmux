@@ -155,6 +155,7 @@ Key ingest settings (`configs/solution-ingest.json`):
 | `storage.tag_media` | `transmux-kind` object tag for retention | Off by default. Enabling it requires `s3:PutObjectTagging`; control objects are not tagged |
 | `cameras.provider` | `static`, `http`, `object` | `object` uses a conditionally updated shared roster and management API. Disabled `http` cameras are excluded from ingest but retained in the playback catalog and retention processing within the shard filter |
 | `cameras.shard_filter` | Responsible ingest server ID | Ingest only cameras whose roster `shard_id` matches |
+| `cameras.require_credential_free_urls` | Refuse an `rtsp_url` that carries credentials | Defaults to `false`. When on, enabled cameras with userinfo (a user name alone included) or a query parameter named like a password, token or key are not ingested. Configuration validation fails, the management API returns `400 credential_url`, and a shared roster leaves out only that camera, reported as `shard.credential_rejected` in `/healthz` and by `transmux_roster_credential_rejected`. It keeps passwords off the ffmpeg command line ([deployment security guide](docs/deployment-security.md#카메라-자격증명)) |
 | `cameras.static[].format` | `mpegts` or `fmp4` | Defaults to `mpegts`; `fmp4` is recommended for HEVC |
 | `cameras.static[].video_codec` | `auto`, `h264`, `hevc` | With `fmp4`, HEVC gets an Apple-compatible `hvc1` designation |
 | `cameras.static[].audio` | `none`, `copy`, `aac` | Defaults to `none`; transcode G.711 and similar audio to `aac` |
@@ -162,6 +163,10 @@ Key ingest settings (`configs/solution-ingest.json`):
 | `lease.renew_interval` | Renewal interval | Enforces `ttl > 2×renew_interval + 2×operation_timeout + max_clock_skew`. Even after one missed renewal, the next write and lost-response check must finish before the owner's own deadline |
 | `lease.operation_timeout` | Limit for one lease request | Separate from `upload.put_timeout`. Lease records are hundreds of bytes while segments are several MB, so one shared timeout would necessarily be wrong for one of them |
 | `lease.max_clock_skew` | Assumed maximum clock skew between shards | The taker waits this much longer after expiry; the owner stops this much earlier. Hosts need NTP |
+
+`cameras.require_credential_free_urls` looks for fixed name fragments (`pass`, `pwd`, `token`, `key`, `secret`, `auth`, `signature`, `credential`) as substrings.
+- **False matches**: a name that is not a credential is refused when it matches (the safe side). Examples are Axis VAPIX `videokeyframeinterval` (`key`), `bypass` (`pass`) and `author` (`auth`). The refusal names only the matched fragment (for example `query parameter matches credential pattern "key"`), never the camera's own parameter name. For such a camera, turn the option off, or read it through a relay (MediaMTX) and give transmuxd a URL without the query.
+- **Not caught**: names outside the list (`u`, `p`, `pw`, `sig`, `jwt`, `sid` and so on), a query with a value and no name, path parameters such as `;password=`, and fragments (`#…`). Do not use such URLs.
 
 Key playback settings (`configs/solution-playback.json`):
 

@@ -26,11 +26,90 @@ liveness가 카메라·오브젝트 스토어 상태를 반영하지 않는 것�
 
 ## 카메라 자격증명
 
-RTSP URL에 담겨 전달되며, ffmpeg의 argv로 들어간다. 같은 PID 네임스페이스에
-접근할 수 있는 프로세스는 `/proc`을 통해 이를 볼 수 있다. 컨테이너의 PID
-네임스페이스와 호스트 접근 권한을 그에 맞게 통제해야 한다.
+RTSP URL에 담겨 전달되며, ffmpeg의 argv로 들어간다. ffmpeg의 RTSP 입력은
+자격증명을 URL로만 받는다(ffmpeg 8.0 기준, 별도 옵션이나 파일 입력이 없다).
+그래서 같은 PID 네임스페이스의 프로세스뿐 아니라 호스트에서 `ps`나
+`/proc/<pid>/cmdline`을 읽을 수 있는 모든 사용자가 컨테이너 밖에서 비밀번호를 볼
+수 있다(#43).
 
-로그·메트릭 라벨·API 응답·ffmpeg stderr에서는 마스킹된다.
+로그·메트릭 라벨·API 응답·ffmpeg stderr에서는 마스킹된다. argv는 가릴 수 없다.
+
+### 권장 구성: 자격증명 없는 URL로 중계 서버에서 읽기
+
+카메라 앞에 RTSP 중계 서버(MediaMTX 등)를 두고, transmuxd는 자격증명 없는 URL로
+중계 서버에서 읽는다. 카메라 계정은 중계 서버 설정에만 둔다. MediaMTX가 카메라에서
+가져오는 구성(`source: rtsp://…`)이면 계정은 MediaMTX 프로세스 안에만 있고 argv에
+나오지 않는다.
+
+1. 중계 서버와 transmuxd만 붙는 내부 네트워크를 따로 만들고 transmuxd에 고정 주소를
+   준다.
+   - 다른 컨테이너도 붙는 네트워크의 주소를 허용하면 그 컨테이너도 비밀번호 없이 읽는다.
+   - 컨테이너 주소는 다시 만들 때 바뀔 수 있다.
+   - 호스트 포트를 거친 연결(docker-proxy)은 브리지 게이트웨이 주소로 보인다. 그러므로
+     게이트웨이 주소나 브리지 대역 전체를 허용하면 안 된다.
+2. 중계 서버는 그 고정 주소 하나(`/32`)에만, 필요한 경로의 읽기만 비밀번호 없이
+   허용한다. transmuxd는 그 내부 네트워크에만 있는 별칭(아래 예의
+   `mediamtx-transmux`)으로 접속해 연결이 그 주소에서 나가게 한다.
+3. 수집 설정에서 `cameras.require_credential_free_urls`를 켠다. 그러면 누가 다시
+   자격증명이 든 URL을 넣어도 ffmpeg가 그 URL로 시작하지 않는다.
+   - 설정 검증과 관리 API(`400 credential_url`)가 거절한다.
+   - 공유 목록에서는 그 카메라만 빼고, `/healthz`의 `shard.credential_rejected`와
+     `transmux_roster_credential_rejected` 지표로 알린다.
+   - 거절 범위는 userinfo 전체(사용자 이름만 있어도)와, 이름에 `pass`·`pwd`·`token`·
+     `key`·`secret`·`auth`·`signature`·`credential`이 든 쿼리 파라미터다(대소문자
+     무시).
+   - 거절 사유에는 맞은 조각만 나온다(`userinfo`, `query parameter matches credential
+     pattern "key"`). 오탐(Axis `videokeyframeinterval`, `bypass`, `author`)과 거르지
+     않는 형태(목록 밖 이름, 값만 있는 쿼리, 경로의 `/user=…&password=…`·`;password=`,
+     프래그먼트)는 [README](../README.md)의 설정 표 아래에 정리했다.
+4. 이미 비밀번호가 든 URL을 쓰던 배포는 URL을 바꾼 뒤 그 계정을 지우거나 비밀번호를
+   교체한다. argv에 있던 동안 호스트 사용자가 읽었을 수 있다.
+
+MediaMTX 예시(transmuxd의 내부 네트워크 주소가 `172.31.243.10`일 때):
+
+```yaml
+authInternalUsers:
+  - user: any
+    pass:
+    ips: ['172.31.243.10/32']
+    permissions:
+      - action: read
+        path: ~^cam0[1-5]$
+```
+
+Compose 예시:
+
+```yaml
+services:
+  mediamtx:
+    networks:
+      default: {}
+      rtsp-internal:
+        aliases: [mediamtx-transmux]
+  transmuxd:
+    networks:
+      default: {}
+      rtsp-internal:
+        ipv4_address: 172.31.243.10
+networks:
+  rtsp-internal:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.243.0/28
+```
+
+이 구성에서는 고정 주소에서만 비밀번호 없이 읽을 수 있다. 다른 내부 주소, 기본
+네트워크, 호스트(게이트웨이 경유)에서 오는 요청은 MediaMTX 1.21.0이 `401`로
+거절했다(2026-11-04 확인).
+
+`docker` 그룹 사용자는 이 경계 밖에 있다. 컨테이너를 그 내부 네트워크에 붙이고
+고정 주소(`172.31.243.10`)를 가져가면 비밀번호 없이 읽을 수 있다. argv를 읽는 것과
+같은 권한이므로 `docker` 그룹은 root처럼 다룬다.
+
+중계 서버를 둘 수 없으면 호스트의 `/proc`을 `hidepid=invisible`로 마운트해 다른
+사용자의 프로세스 정보를 숨긴다. 컨테이너 런타임과 호스트 접근 권한도 통제한다.
+root와 `docker` 그룹 사용자는 어느 구성에서도 argv를 읽을 수 있다.
 
 ## AWS 자격증명
 
