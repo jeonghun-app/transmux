@@ -31,7 +31,7 @@ COPY . .
 CMD ["go", "test", "./...", "-count=1"]
 
 # ---- runtime --------------------------------------------------------------
-FROM alpine:3.23 AS runtime
+FROM alpine:3.24 AS runtime
 
 ARG VERSION=dev
 ARG REVISION=unknown
